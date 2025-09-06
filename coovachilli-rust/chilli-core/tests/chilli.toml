@@ -1,0 +1,35 @@
+foreground = true
+debug = true
+logfacility = 1
+loglevel = 7
+interval = 3600
+pidfile = "/var/run/chilli.pid"
+statedir = "/var/lib/chilli"
+
+net = "192.168.182.0"
+mask = "255.255.255.0"
+tundev = "tun0"
+dynip = "192.168.182.0/24"
+statip = "10.1.0.0/16"
+
+dns1 = "8.8.8.8"
+dns2 = "8.8.4.4"
+domain = "coova.org"
+
+radiuslisten = "127.0.0.1"
+radiusserver1 = "127.0.0.1"
+radiusserver2 = "127.0.0.1"
+radiussecret = "testing123"
+radiusauthport = 1812
+radiusacctport = 1813
+
+dhcpif = "eth1"
+dhcplisten = "192.168.182.1"
+lease = 86400
+
+uamsecret = "uamsecret"
+uamurl = "http://127.0.0.1/uam"
+uamlisten = "192.168.182.1"
+uamport = 3990
+
+max_clients = 256

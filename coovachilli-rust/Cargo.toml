@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "chilli-core",
+    "chilli-net",
+    "chilli-http",
+    "chilli-bin",
+]

@@ -1,0 +1,10 @@
+[package]
+name = "chilli-http"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chilli-core = { path = "../chilli-core" }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
