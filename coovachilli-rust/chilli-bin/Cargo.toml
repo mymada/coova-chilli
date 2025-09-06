@@ -1,0 +1,13 @@
+[package]
+name = "chilli-bin"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chilli-core = { path = "../chilli-core" }
+chilli-net = { path = "../chilli-net" }
+chilli-http = { path = "../chilli-http" }
+clap = { version = "4.0", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+toml = "0.8"
