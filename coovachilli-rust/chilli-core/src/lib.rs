@@ -9,9 +9,16 @@ pub use session::{RedirState, Session, SessionManager, SessionParams, SessionSta
 use tokio::sync::oneshot;
 
 #[derive(Debug)]
+pub enum AuthType {
+    Pap,
+    Eap,
+}
+
+#[derive(Debug)]
 pub struct AuthRequest {
+    pub auth_type: AuthType,
     pub ip: Ipv4Addr,
     pub username: String,
-    pub password: String,
+    pub password: Option<String>,
     pub tx: oneshot::Sender<bool>,
 }

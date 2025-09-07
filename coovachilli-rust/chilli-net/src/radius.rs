@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Result};
 use chilli_core::Config;
+use num_derive::FromPrimitive;
+use num_traits::FromPrimitive;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -41,11 +43,17 @@ impl RadiusCode {
 }
 
 // RADIUS Attributes
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, FromPrimitive)]
 #[repr(u8)]
 pub enum RadiusAttributeType {
     UserName = 1,
     UserPassword = 2,
+    FramedIpAddress = 8,
+    State = 24,
+    SessionTimeout = 27,
+    IdleTimeout = 28,
+    EapMessage = 79,
+    MessageAuthenticator = 80,
     AcctStatusType = 40,
     AcctDelayTime = 41,
     AcctInputOctets = 42,
@@ -58,13 +66,15 @@ pub enum RadiusAttributeType {
     AcctTerminateCause = 49,
     AcctInputGigawords = 52,
     AcctOutputGigawords = 53,
-    FramedIpAddress = 8,
 }
 
 // Acct-Status-Type values
 pub const ACCT_STATUS_TYPE_START: u32 = 1;
 pub const ACCT_STATUS_TYPE_STOP: u32 = 2;
 pub const ACCT_STATUS_TYPE_INTERIM_UPDATE: u32 = 3;
+
+// Acct-Terminate-Cause values
+pub const ACCT_TERMINATE_CAUSE_SESSION_TIMEOUT: u32 = 5;
 
 pub const RADIUS_HDR_LEN: usize = 20;
 pub const RADIUS_MAX_LEN: usize = 4096;
@@ -93,12 +103,42 @@ impl RadiusPacket {
     }
 }
 
-pub struct RadiusAttributeValue<'a> {
-    pub type_code: RadiusAttributeType,
-    pub value: &'a [u8],
+pub fn parse_attributes(payload: &[u8]) -> HashMap<RadiusAttributeType, Vec<u8>> {
+    let mut attributes = HashMap::new();
+    let mut offset = 0;
+    while offset < payload.len() {
+        let type_code = payload[offset];
+        let Some(type_code) = FromPrimitive::from_u8(type_code) else {
+            warn!("Unknown RADIUS attribute type: {}", type_code);
+            let length = payload[offset + 1] as usize;
+            offset += length;
+            continue;
+        };
+        let length = payload[offset + 1] as usize;
+        if offset + length > payload.len() {
+            warn!("RADIUS attribute length exceeds payload length");
+            break;
+        }
+        let value = &payload[offset + 2..offset + length];
+        attributes.insert(type_code, value.to_vec());
+        offset += length;
+    }
+    attributes
 }
 
-type PendingRequest = oneshot::Sender<bool>;
+pub struct RadiusAttributeValue {
+    pub type_code: RadiusAttributeType,
+    pub value: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub enum AuthResult {
+    Success(HashMap<RadiusAttributeType, Vec<u8>>),
+    Challenge(Vec<u8>, Option<Vec<u8>>), // EAP Message, State
+    Failure,
+}
+
+type PendingRequest = oneshot::Sender<AuthResult>;
 
 pub struct RadiusClient {
     socket: Arc<UdpSocket>,
@@ -108,6 +148,10 @@ pub struct RadiusClient {
 }
 
 impl RadiusClient {
+    pub fn config(&self) -> &Arc<Config> {
+        &self.config
+    }
+
     pub async fn new(config: Arc<Config>) -> Result<Self> {
         let addr = format!("{}:0", config.radiuslisten);
         let socket = UdpSocket::bind(&addr).await?;
@@ -129,7 +173,24 @@ impl RadiusClient {
                         if let Some(code) = RadiusCode::from_u8(packet.code) {
                             let mut pending = self.pending_requests.lock().unwrap();
                             if let Some(sender) = pending.remove(&packet.id) {
-                                let result = code == RadiusCode::AccessAccept;
+                                let result = match code {
+                                    RadiusCode::AccessAccept => {
+                                        let payload_len = (u16::from_be(packet.length) as usize) - RADIUS_HDR_LEN;
+                                        let attributes = parse_attributes(&packet.payload[..payload_len]);
+                                        AuthResult::Success(attributes)
+                                    }
+                                    RadiusCode::AccessChallenge => {
+                                        let payload_len = (u16::from_be(packet.length) as usize) - RADIUS_HDR_LEN;
+                                        let attributes = parse_attributes(&packet.payload[..payload_len]);
+                                        let eap_message = attributes.get(&RadiusAttributeType::EapMessage).cloned();
+                                        let state = attributes.get(&RadiusAttributeType::State).cloned();
+                                        match eap_message {
+                                            Some(eap) => AuthResult::Challenge(eap, state),
+                                            None => AuthResult::Failure,
+                                        }
+                                    }
+                                    _ => AuthResult::Failure,
+                                };
                                 if let Err(_) = sender.send(result) {
                                     warn!("Failed to send RADIUS response to waiting task");
                                 }
@@ -146,7 +207,11 @@ impl RadiusClient {
         }
     }
 
-    pub async fn send_access_request(&self, username: &str, password: &str) -> Result<bool> {
+    pub async fn send_access_request(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<Option<HashMap<RadiusAttributeType, Vec<u8>>>> {
         let packet_id = {
             let mut id = self.next_id.lock().unwrap();
             let packet_id = *id;
@@ -164,18 +229,18 @@ impl RadiusClient {
         let mut attributes = Vec::new();
         attributes.push(RadiusAttributeValue {
             type_code: RadiusAttributeType::UserName,
-            value: username.as_bytes(),
+            value: username.as_bytes().to_vec(),
         });
         attributes.push(RadiusAttributeValue {
             type_code: RadiusAttributeType::UserPassword,
-            value: password.as_bytes(),
+            value: password.as_bytes().to_vec(),
         });
 
         let mut payload = Vec::new();
         for attr in attributes {
             payload.push(attr.type_code as u8);
             payload.push((attr.value.len() + 2) as u8);
-            payload.extend_from_slice(attr.value);
+            payload.extend_from_slice(&attr.value);
         }
 
         let length = (RADIUS_HDR_LEN + payload.len()) as u16;
@@ -193,6 +258,66 @@ impl RadiusClient {
         info!("Sent Access-Request for user '{}' to {}", username, server_addr);
 
         match tokio::time::timeout(Duration::from_secs(5), rx).await {
+            Ok(Ok(AuthResult::Success(attrs))) => Ok(Some(attrs)),
+            Ok(Ok(_)) => Ok(None),
+            Ok(Err(_)) => Err(anyhow!("RADIUS request channel closed unexpectedly")),
+            Err(_) => Err(anyhow!("RADIUS request timed out")),
+        }
+    }
+
+    pub async fn send_eap_response(
+        &self,
+        eap_message: &[u8],
+        state: Option<&[u8]>,
+    ) -> Result<AuthResult> {
+        let packet_id = {
+            let mut id = self.next_id.lock().unwrap();
+            let packet_id = *id;
+            *id = id.wrapping_add(1);
+            packet_id
+        };
+
+        let (tx, rx) = oneshot::channel();
+        self.pending_requests.lock().unwrap().insert(packet_id, tx);
+
+        let mut authenticator = [0u8; RADIUS_AUTH_LEN];
+        getrandom::getrandom(&mut authenticator)
+            .map_err(|e| anyhow::anyhow!("getrandom failed: {}", e))?;
+
+        let mut attributes = Vec::new();
+        attributes.push(RadiusAttributeValue {
+            type_code: RadiusAttributeType::EapMessage,
+            value: eap_message.to_vec(),
+        });
+        if let Some(s) = state {
+            attributes.push(RadiusAttributeValue {
+                type_code: RadiusAttributeType::State,
+                value: s.to_vec(),
+            });
+        }
+
+        let mut payload = Vec::new();
+        for attr in attributes {
+            payload.push(attr.type_code as u8);
+            payload.push((attr.value.len() + 2) as u8);
+            payload.extend_from_slice(&attr.value);
+        }
+
+        let length = (RADIUS_HDR_LEN + payload.len()) as u16;
+
+        let mut packet_bytes = Vec::with_capacity(length as usize);
+        packet_bytes.push(RadiusCode::AccessRequest as u8);
+        packet_bytes.push(packet_id);
+        packet_bytes.extend_from_slice(&length.to_be_bytes());
+        packet_bytes.extend_from_slice(&authenticator);
+        packet_bytes.extend_from_slice(&payload);
+
+        let server_addr = format!("{}:{}", self.config.radiusserver1, self.config.radiusauthport);
+        self.socket.send_to(&packet_bytes, &server_addr).await?;
+
+        info!("Sent EAP-Response to {}", server_addr);
+
+        match tokio::time::timeout(Duration::from_secs(5), rx).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) => Err(anyhow!("RADIUS request channel closed unexpectedly")),
             Err(_) => Err(anyhow!("RADIUS request timed out")),
@@ -200,16 +325,21 @@ impl RadiusClient {
     }
 
     pub async fn send_acct_start(&self, session: &chilli_core::Session) -> Result<()> {
-        self.send_acct_packet(session, ACCT_STATUS_TYPE_START)
+        self.send_acct_packet(session, ACCT_STATUS_TYPE_START, None)
             .await
     }
 
-    pub async fn send_acct_stop(&self, session: &chilli_core::Session) -> Result<()> {
-        self.send_acct_packet(session, ACCT_STATUS_TYPE_STOP).await
+    pub async fn send_acct_stop(
+        &self,
+        session: &chilli_core::Session,
+        terminate_cause: Option<u32>,
+    ) -> Result<()> {
+        self.send_acct_packet(session, ACCT_STATUS_TYPE_STOP, terminate_cause)
+            .await
     }
 
     pub async fn send_acct_interim_update(&self, session: &chilli_core::Session) -> Result<()> {
-        self.send_acct_packet(session, ACCT_STATUS_TYPE_INTERIM_UPDATE)
+        self.send_acct_packet(session, ACCT_STATUS_TYPE_INTERIM_UPDATE, None)
             .await
     }
 
@@ -217,6 +347,7 @@ impl RadiusClient {
         &self,
         session: &chilli_core::Session,
         status_type: u32,
+        terminate_cause: Option<u32>,
     ) -> Result<()> {
         let packet_id = {
             let mut id = self.next_id.lock().unwrap();
@@ -230,32 +361,39 @@ impl RadiusClient {
         let status_type_bytes = status_type.to_be_bytes();
         attributes.push(RadiusAttributeValue {
             type_code: RadiusAttributeType::AcctStatusType,
-            value: &status_type_bytes,
+            value: status_type_bytes.to_vec(),
         });
+        if let Some(cause) = terminate_cause {
+            let cause_bytes = cause.to_be_bytes();
+            attributes.push(RadiusAttributeValue {
+                type_code: RadiusAttributeType::AcctTerminateCause,
+                value: cause_bytes.to_vec(),
+            });
+        }
         attributes.push(RadiusAttributeValue {
             type_code: RadiusAttributeType::AcctSessionId,
-            value: session.state.sessionid.as_bytes(),
+            value: session.state.sessionid.as_bytes().to_vec(),
         });
         let framed_ip_bytes = session.hisip.octets();
         attributes.push(RadiusAttributeValue {
             type_code: RadiusAttributeType::FramedIpAddress,
-            value: &framed_ip_bytes,
+            value: framed_ip_bytes.to_vec(),
         });
         if let Some(username) = &session.state.redir.username {
             attributes.push(RadiusAttributeValue {
                 type_code: RadiusAttributeType::UserName,
-                value: username.as_bytes(),
+                value: username.as_bytes().to_vec(),
             });
         }
         let input_octets_bytes = (session.state.input_octets as u32).to_be_bytes();
         attributes.push(RadiusAttributeValue {
             type_code: RadiusAttributeType::AcctInputOctets,
-            value: &input_octets_bytes,
+            value: input_octets_bytes.to_vec(),
         });
         let output_octets_bytes = (session.state.output_octets as u32).to_be_bytes();
         attributes.push(RadiusAttributeValue {
             type_code: RadiusAttributeType::AcctOutputOctets,
-            value: &output_octets_bytes,
+            value: output_octets_bytes.to_vec(),
         });
         let session_time_bytes = ((SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -265,14 +403,14 @@ impl RadiusClient {
             .to_be_bytes();
         attributes.push(RadiusAttributeValue {
             type_code: RadiusAttributeType::AcctSessionTime,
-            value: &session_time_bytes,
+            value: session_time_bytes.to_vec(),
         });
 
         let mut payload = Vec::new();
         for attr in attributes {
             payload.push(attr.type_code as u8);
             payload.push((attr.value.len() + 2) as u8);
-            payload.extend_from_slice(attr.value);
+            payload.extend_from_slice(&attr.value);
         }
 
         let length = (RADIUS_HDR_LEN + payload.len()) as u16;
@@ -296,5 +434,30 @@ impl RadiusClient {
         self.socket.send_to(&packet_bytes, &server_addr).await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_attributes() {
+        let payload = [
+            27, 6, 0, 0, 14, 16, // Session-Timeout: 3600
+            1, 10, 116, 101, 115, 116, 117, 115, 101, 114, // User-Name: testuser
+        ];
+
+        let attributes = parse_attributes(&payload);
+
+        assert_eq!(attributes.len(), 2);
+
+        let session_timeout = attributes.get(&RadiusAttributeType::SessionTimeout).unwrap();
+        assert_eq!(session_timeout, &vec![0, 0, 14, 16]);
+        let session_timeout_val = u32::from_be_bytes(session_timeout.clone().try_into().unwrap());
+        assert_eq!(session_timeout_val, 3600);
+
+        let user_name = attributes.get(&RadiusAttributeType::UserName).unwrap();
+        assert_eq!(user_name, b"testuser");
     }
 }

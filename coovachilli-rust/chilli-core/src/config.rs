@@ -76,3 +76,41 @@ pub struct Config {
     /// The maximum number of clients to allow.
     pub max_clients: i32,
 }
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            foreground: true,
+            debug: true,
+            logfacility: 3,
+            loglevel: 7,
+            interval: 3600,
+            pidfile: "/var/run/chilli.pid".to_string(),
+            statedir: "/var/run".to_string(),
+            net: "192.168.182.0".parse().unwrap(),
+            mask: "255.255.255.0".parse().unwrap(),
+            tundev: Some("tun0".to_string()),
+            dynip: None,
+            statip: None,
+            dns1: "8.8.8.8".parse().unwrap(),
+            dns2: "8.8.4.4".parse().unwrap(),
+            domain: Some("coova.org".to_string()),
+            radiuslisten: "0.0.0.0".parse().unwrap(),
+            radiusserver1: "127.0.0.1".parse().unwrap(),
+            radiusserver2: "127.0.0.1".parse().unwrap(),
+            radiussecret: "testing123".to_string(),
+            radiusauthport: 1812,
+            radiusacctport: 1813,
+            dhcpif: "eth0".to_string(),
+            dhcplisten: "192.168.182.1".parse().unwrap(),
+            dhcpstart: "192.168.182.10".parse().unwrap(),
+            dhcpend: "192.168.182.254".parse().unwrap(),
+            lease: 3600,
+            uamsecret: Some("uamsecret".to_string()),
+            uamurl: Some("http://127.0.0.1:3990/login".to_string()),
+            uamlisten: "192.168.182.1".parse().unwrap(),
+            uamport: 3990,
+            max_clients: 1024,
+        }
+    }
+}

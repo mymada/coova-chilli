@@ -114,7 +114,7 @@ impl Default for SessionState {
 }
 
 #[derive(Debug, Clone)]
-struct Connection {
+pub struct Connection {
     pub next: Option<Box<Connection>>,
     pub prev: Option<Box<Connection>>,
     pub uplink: (), // Placeholder
@@ -236,7 +236,7 @@ impl SessionManager {
         sessions.values().map(Session::from).collect()
     }
 
-    pub(crate) async fn update_session<F>(&self, ip: &Ipv4Addr, update_fn: F)
+    pub async fn update_session<F>(&self, ip: &Ipv4Addr, update_fn: F)
     where
         F: FnOnce(&mut Connection),
     {
