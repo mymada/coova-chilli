@@ -298,6 +298,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "chilli-ipc"
+version = "0.1.0"
+dependencies = [
+ "chilli-core",
+ "serde",
+]
+
+[[package]]
 name = "chilli-net"
 version = "0.1.0"
 dependencies = [
@@ -310,6 +318,17 @@ dependencies = [
  "tokio",
  "tracing",
  "tun-rs",
+]
+
+[[package]]
+name = "chilli-query"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chilli-ipc",
+ "clap",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

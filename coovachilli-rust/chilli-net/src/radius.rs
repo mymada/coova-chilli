@@ -199,23 +199,23 @@ impl RadiusClient {
         }
     }
 
-    pub async fn send_acct_start(&self, session: &chilli_core::Connection) -> Result<()> {
+    pub async fn send_acct_start(&self, session: &chilli_core::Session) -> Result<()> {
         self.send_acct_packet(session, ACCT_STATUS_TYPE_START)
             .await
     }
 
-    pub async fn send_acct_stop(&self, session: &chilli_core::Connection) -> Result<()> {
+    pub async fn send_acct_stop(&self, session: &chilli_core::Session) -> Result<()> {
         self.send_acct_packet(session, ACCT_STATUS_TYPE_STOP).await
     }
 
-    pub async fn send_acct_interim_update(&self, session: &chilli_core::Connection) -> Result<()> {
+    pub async fn send_acct_interim_update(&self, session: &chilli_core::Session) -> Result<()> {
         self.send_acct_packet(session, ACCT_STATUS_TYPE_INTERIM_UPDATE)
             .await
     }
 
     async fn send_acct_packet(
         &self,
-        session: &chilli_core::Connection,
+        session: &chilli_core::Session,
         status_type: u32,
     ) -> Result<()> {
         let packet_id = {
