@@ -4,7 +4,8 @@ use anyhow::Result;
 use chilli_core::{AuthType, SessionManager};
 use chilli_http::server;
 use chilli_net::dhcp::DhcpServer;
-use chilli_net::eap_mschapv2::EapMschapV2Machine;
+use chilli_net::eap_mschapv2;
+use chilli_net::mschapv2;
 use chilli_net::radius::{
     AuthResult, RadiusAttributeType, RadiusClient, ACCT_TERMINATE_CAUSE_SESSION_TIMEOUT,
 };
@@ -13,6 +14,7 @@ use chilli_net::Firewall;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
+use chilli_net::eap::{EapPacket, EapType};
 use chilli_net::AsyncDevice;
 
 #[tokio::main]
@@ -274,29 +276,41 @@ async fn handle_eap_auth(
     firewall: Arc<Firewall>,
 ) {
     info!("Processing EAP auth request for user '{}'", req.username);
-    let mut eap_machine = EapMschapV2Machine::new();
 
-    // 1. Send EAP-Response/Identity
-    let mut eap_data = vec![chilli_net::eap::EapType::Identity as u8];
-    eap_data.extend_from_slice(req.username.as_bytes());
-    let eap_packet = chilli_net::eap::EapPacket {
-        code: chilli_net::eap::EapCode::Response,
-        identifier: 1, // This should come from the EAP-Request/Identity
-        data: &eap_data,
-    };
-    let eap_response = eap_packet.to_bytes();
+    let mut eap_state = None;
 
-    let mut state = None;
-    let mut result = radius_client.send_eap_response(&eap_response, state.as_deref()).await;
+    // 1. Start with an EAP-Response/Identity
+    let eap_packet = eap_mschapv2::create_identity_response(1, &req.username);
+    info!("Sending EAP Identity Response: {:?}", eap_packet);
+    let mut result = radius_client.send_eap_response(&eap_packet.to_bytes(), eap_state.as_deref()).await;
 
     loop {
+        info!("EAP loop, result: {:?}", result);
         match result {
-            Ok(AuthResult::Challenge(eap_message, new_state)) => {
-                state = new_state;
-                let password = req.password.as_deref().unwrap_or_default();
-                if let Some(response) = eap_machine.step(&eap_message, password) {
-                    result = radius_client.send_eap_response(&response, state.as_deref()).await;
+            Ok(AuthResult::Challenge(ref eap_message, ref new_state)) => {
+                eap_state = new_state.clone();
+                if let Some(eap_request) = EapPacket::from_bytes(eap_message) {
+                    info!("Received EAP Challenge: {:?}", eap_request);
+                    if let Some((challenge, identifier)) = eap_mschapv2::parse_challenge_request(&eap_request) {
+                        let password = req.password.as_deref().unwrap_or_default();
+                        let peer_challenge = mschapv2::generate_challenge();
+                        if let Some(nt_response) = mschapv2::verify_response_and_generate_nt_response(&challenge, &peer_challenge, &req.username, password) {
+                            let response_packet = eap_mschapv2::create_challenge_response_packet(identifier, &peer_challenge, &nt_response, &req.username);
+                            info!("Sending EAP Challenge Response: {:?}", response_packet);
+                            result = radius_client.send_eap_response(&response_packet.to_bytes(), eap_state.as_deref()).await;
+                        } else {
+                            info!("Password verification failed");
+                            break;
+                        }
+                    } else if let Some(_auth_response) = eap_mschapv2::parse_success_request(&eap_request) {
+                        info!("Received EAP Success Request");
+                        // Success case is handled by Access-Accept
+                    } else {
+                        info!("Unknown EAP packet in Challenge");
+                        break;
+                    }
                 } else {
+                    info!("Failed to parse EAP packet from Challenge");
                     break;
                 }
             }
@@ -347,6 +361,7 @@ async fn handle_eap_auth(
     req.tx.send(false).ok();
 }
 
+
 async fn auth_loop(
     mut rx: tokio::sync::mpsc::Receiver<chilli_core::AuthRequest>,
     radius_client: Arc<RadiusClient>,
@@ -356,22 +371,20 @@ async fn auth_loop(
     while let Some(req) = rx.recv().await {
         match req.auth_type {
             AuthType::Pap => {
-                handle_pap_auth(
+                tokio::spawn(handle_pap_auth(
                     req,
                     radius_client.clone(),
                     session_manager.clone(),
                     firewall.clone(),
-                )
-                .await;
+                ));
             }
             AuthType::Eap => {
-                handle_eap_auth(
+                tokio::spawn(handle_eap_auth(
                     req,
                     radius_client.clone(),
                     session_manager.clone(),
                     firewall.clone(),
-                )
-                .await;
+                ));
             }
         }
     }
@@ -461,5 +474,114 @@ async fn packet_loop(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chilli_core::{AuthRequest, Config};
+    use chilli_net::radius::{RadiusAttributeValue, RadiusCode, RadiusPacket};
+    use std::net::Ipv4Addr;
+    use tokio::net::UdpSocket;
+    use tokio::sync::oneshot;
+
+    async fn mock_radius_server(socket: UdpSocket, _secret: String) {
+        let mut buf = [0u8; 1504];
+
+        // 1. Receive Identity Response, send Challenge
+        let (_len, src) = socket.recv_from(&mut buf).await.unwrap();
+        info!("Mock RADIUS: Received Identity Response: {:?}", &buf[.._len]);
+        let req_packet = RadiusPacket::from_bytes(&buf[.._len]).unwrap();
+
+        let mut eap_data = vec![EapType::MsChapV2 as u8, 0x01, 1, 16];
+        eap_data.extend_from_slice(&[0; 16]);
+
+        let mut attributes = Vec::new();
+        attributes.push(RadiusAttributeValue {
+            type_code: RadiusAttributeType::EapMessage,
+            value: eap_data,
+        });
+
+        let mut payload = Vec::new();
+        for attr in attributes {
+            payload.push(attr.type_code as u8);
+            payload.push((attr.value.len() + 2) as u8);
+            payload.extend_from_slice(&attr.value);
+        }
+
+        let mut response_buf = vec![RadiusCode::AccessChallenge as u8, req_packet.id, 0, 0];
+        response_buf.extend_from_slice(&req_packet.authenticator);
+        response_buf.extend_from_slice(&payload);
+        let len = response_buf.len() as u16;
+        response_buf[2..4].copy_from_slice(&len.to_be_bytes());
+
+        socket.send_to(&response_buf, src).await.unwrap();
+        info!("Mock RADIUS: Sent Challenge");
+
+        // 2. Receive Challenge Response, send Success
+        let (_len, src) = socket.recv_from(&mut buf).await.unwrap();
+        info!("Mock RADIUS: Received Challenge Response: {:?}", &buf[.._len]);
+        let req_packet = RadiusPacket::from_bytes(&buf[.._len]).unwrap();
+
+        let mut response_buf = vec![RadiusCode::AccessAccept as u8, req_packet.id, 0, 0];
+        response_buf.extend_from_slice(&req_packet.authenticator);
+        let len = response_buf.len() as u16;
+        response_buf[2..4].copy_from_slice(&len.to_be_bytes());
+
+        socket.send_to(&response_buf, src).await.unwrap();
+        info!("Mock RADIUS: Sent Access-Accept");
+    }
+
+    #[tokio::test]
+    async fn test_eap_flow() {
+        tracing_subscriber::fmt::init();
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        let mut config = Config::default();
+        if let std::net::IpAddr::V4(ip) = server_addr.ip() {
+            config.radiusserver1 = ip;
+        }
+        config.radiusauthport = server_addr.port();
+        let secret = config.radiussecret.clone();
+        let arc_config = Arc::new(config);
+
+        let mock_server_handle = tokio::spawn(mock_radius_server(server_socket, secret));
+
+        let radius_client = Arc::new(RadiusClient::new(arc_config.clone()).await.unwrap());
+        let session_manager = Arc::new(SessionManager::new());
+        let firewall = Arc::new(Firewall::new((**radius_client.config()).clone()));
+
+        let (tx, rx) = oneshot::channel();
+        let auth_request = chilli_core::AuthRequest {
+            auth_type: AuthType::Eap,
+            ip: Ipv4Addr::new(10, 0, 0, 1),
+            username: "testuser".to_string(),
+            password: Some("password".to_string()),
+            tx,
+        };
+
+        let handle = tokio::spawn(handle_eap_auth(
+            auth_request,
+            radius_client.clone(),
+            session_manager.clone(),
+            firewall.clone(),
+        ));
+
+        let client_run = tokio::spawn(async move {
+            radius_client.run().await;
+        });
+
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(10), rx).await;
+
+        assert!(result.is_ok(), "Test timed out");
+        let auth_result = result.unwrap();
+        assert!(auth_result.is_ok(), "Authentication channel closed");
+        assert!(auth_result.unwrap(), "Authentication failed");
+
+        handle.await.unwrap();
+        mock_server_handle.await.unwrap();
+        client_run.abort();
     }
 }

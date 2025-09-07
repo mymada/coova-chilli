@@ -17,14 +17,15 @@ pub enum EapType {
     MsChapV2 = 26,
 }
 
-pub struct EapPacket<'a> {
+#[derive(Debug, Clone)]
+pub struct EapPacket {
     pub code: EapCode,
     pub identifier: u8,
-    pub data: &'a [u8],
+    pub data: Vec<u8>,
 }
 
-impl<'a> EapPacket<'a> {
-    pub fn from_bytes(data: &'a [u8]) -> Option<Self> {
+impl EapPacket {
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < 4 {
             return None;
         }
@@ -41,7 +42,7 @@ impl<'a> EapPacket<'a> {
         if data.len() < length {
             return None;
         }
-        let packet_data = &data[4..length];
+        let packet_data = data[4..length].to_vec();
         Some(EapPacket {
             code,
             identifier,
@@ -55,7 +56,7 @@ impl<'a> EapPacket<'a> {
         bytes.push(self.code as u8);
         bytes.push(self.identifier);
         bytes.extend_from_slice(&length.to_be_bytes());
-        bytes.extend_from_slice(self.data);
+        bytes.extend_from_slice(&self.data);
         bytes
     }
 }

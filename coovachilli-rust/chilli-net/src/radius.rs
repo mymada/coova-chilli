@@ -131,6 +131,7 @@ pub struct RadiusAttributeValue {
     pub value: Vec<u8>,
 }
 
+#[derive(Debug)]
 pub enum AuthResult {
     Success(HashMap<RadiusAttributeType, Vec<u8>>),
     Challenge(Vec<u8>, Option<Vec<u8>>), // EAP Message, State
@@ -147,6 +148,10 @@ pub struct RadiusClient {
 }
 
 impl RadiusClient {
+    pub fn config(&self) -> &Arc<Config> {
+        &self.config
+    }
+
     pub async fn new(config: Arc<Config>) -> Result<Self> {
         let addr = format!("{}:0", config.radiuslisten);
         let socket = UdpSocket::bind(&addr).await?;
