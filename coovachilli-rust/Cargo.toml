@@ -3,5 +3,5 @@ members = [
     "chilli-core",
     "chilli-net",
     "chilli-http",
-    "chilli-bin",
+    "chilli-bin", "chilli-query", "chilli-ipc",
 ]

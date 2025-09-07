@@ -1,10 +1,11 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SessionParams {
     pub url: Option<String>,
     pub filterid: Option<String>,
@@ -41,7 +42,7 @@ impl Default for SessionParams {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RedirState {
     pub username: Option<String>,
     pub userurl: Option<String>,
@@ -68,7 +69,7 @@ impl Default for RedirState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SessionState {
     pub redir: RedirState,
     pub authenticated: bool,
@@ -113,7 +114,7 @@ impl Default for SessionState {
 }
 
 #[derive(Debug, Clone)]
-pub struct Connection {
+struct Connection {
     pub next: Option<Box<Connection>>,
     pub prev: Option<Box<Connection>>,
     pub uplink: (), // Placeholder
@@ -136,6 +137,53 @@ pub struct Connection {
     pub mask: Ipv4Addr,
     pub dns1: Ipv4Addr,
     pub dns2: Ipv4Addr,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Session {
+    pub inuse: bool,
+    pub is_adminsession: bool,
+    pub uamabort: bool,
+    pub uamexit: bool,
+    pub unit: i32,
+    pub dnprot: i32,
+    pub rt: i64,
+    pub params: SessionParams,
+    pub state: SessionState,
+    pub hismac: [u8; 6],
+    pub ourip: Ipv4Addr,
+    pub hisip: Ipv4Addr,
+    pub hismask: Ipv4Addr,
+    pub reqip: Ipv4Addr,
+    pub net: Ipv4Addr,
+    pub mask: Ipv4Addr,
+    pub dns1: Ipv4Addr,
+    pub dns2: Ipv4Addr,
+}
+
+impl From<&Connection> for Session {
+    fn from(conn: &Connection) -> Self {
+        Self {
+            inuse: conn.inuse,
+            is_adminsession: conn.is_adminsession,
+            uamabort: conn.uamabort,
+            uamexit: conn.uamexit,
+            unit: conn.unit,
+            dnprot: conn.dnprot,
+            rt: conn.rt,
+            params: conn.params.clone(),
+            state: conn.state.clone(),
+            hismac: conn.hismac,
+            ourip: conn.ourip,
+            hisip: conn.hisip,
+            hismask: conn.hismask,
+            reqip: conn.reqip,
+            net: conn.net,
+            mask: conn.mask,
+            dns1: conn.dns1,
+            dns2: conn.dns2,
+        }
+    }
 }
 
 pub struct SessionManager {
@@ -178,17 +226,17 @@ impl SessionManager {
         sessions.insert(ip, connection);
     }
 
-    pub async fn get_session(&self, ip: &Ipv4Addr) -> Option<Connection> {
+    pub async fn get_session(&self, ip: &Ipv4Addr) -> Option<Session> {
         let sessions = self.sessions.lock().await;
-        sessions.get(ip).cloned()
+        sessions.get(ip).map(Session::from)
     }
 
-    pub async fn get_all_sessions(&self) -> Vec<Connection> {
+    pub async fn get_all_sessions(&self) -> Vec<Session> {
         let sessions = self.sessions.lock().await;
-        sessions.values().cloned().collect()
+        sessions.values().map(Session::from).collect()
     }
 
-    pub async fn update_session<F>(&self, ip: &Ipv4Addr, update_fn: F)
+    pub(crate) async fn update_session<F>(&self, ip: &Ipv4Addr, update_fn: F)
     where
         F: FnOnce(&mut Connection),
     {
@@ -208,14 +256,9 @@ impl SessionManager {
         }
     }
 
-    pub async fn terminate_session(&self, ip: &Ipv4Addr) -> bool {
+    pub async fn remove_session(&self, ip: &Ipv4Addr) -> Option<Session> {
         let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.get_mut(ip) {
-            session.state.authenticated = false;
-            true
-        } else {
-            false
-        }
+        sessions.remove(ip).map(|conn| Session::from(&conn))
     }
 
     pub async fn update_counters(
