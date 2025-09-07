@@ -25,6 +25,8 @@ radiusacctport = 1813
 
 dhcpif = "eth1"
 dhcplisten = "192.168.182.1"
+dhcpstart = "192.168.182.100"
+dhcpend = "192.168.182.200"
 lease = 86400
 
 uamsecret = "uamsecret"

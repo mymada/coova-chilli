@@ -11,3 +11,7 @@ clap = { version = "4.0", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 toml = "0.8"
+anyhow = "1.0"
+etherparse = "0.19"
+trust-dns-proto = "0.22"
+tracing-subscriber = "0.3"

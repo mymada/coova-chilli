@@ -1,5 +1,6 @@
+use anyhow::Result;
 use chilli_core::Config;
-use tun_tap::{Iface, Mode};
+use tun_rs::{DeviceBuilder, AsyncDevice};
 
 /// Creates and configures a new TUN interface.
 ///
@@ -9,19 +10,16 @@ use tun_tap::{Iface, Mode};
 ///
 /// # Returns
 ///
-/// A `Result` containing the new `Iface` instance, or a `tun_tap::Error` if an
-/// error occurred.
-pub fn create_tun(config: &Config) -> Result<Iface, tun_tap::Error> {
-    let iface = Iface::new("", Mode::Tun)?;
+/// A `Result` containing the new `AsyncDevice` instance.
+pub async fn create_tun(config: &Config) -> Result<AsyncDevice> {
+    let mut builder = DeviceBuilder::new()
+        .name(config.tundev.as_deref().unwrap_or("tun0").to_string())
+        .mtu(1500); // A standard MTU
 
-    if let Some(tundev) = &config.tundev {
-        iface.set_name(tundev)?;
-    }
+    let mask_prefix = u32::from(config.mask).leading_ones();
+    builder = builder.ipv4(config.net, mask_prefix as u8, None);
 
-    iface.set_ip(config.net)?;
-    iface.set_netmask(config.mask)?;
+    let dev = builder.build_async()?;
 
-    iface.up()?;
-
-    Ok(iface)
+    Ok(dev)
 }
