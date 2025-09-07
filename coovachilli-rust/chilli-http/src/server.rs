@@ -4,7 +4,7 @@ use axum::{
     routing::{get, post},
     Form, Router,
 };
-use chilli_core::{AuthRequest, Config};
+use chilli_core::{AuthRequest, AuthType, Config};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
@@ -50,9 +50,10 @@ async fn login(
     if let std::net::IpAddr::V4(ipv4_addr) = addr.ip() {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
         let auth_request = AuthRequest {
+            auth_type: AuthType::Pap,
             ip: ipv4_addr,
             username: form.username,
-            password: form.password,
+            password: Some(form.password),
             tx: oneshot_tx,
         };
 
