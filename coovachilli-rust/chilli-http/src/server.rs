@@ -39,25 +39,36 @@ async fn login_form() -> Html<&'static str> {
     )
 }
 
+use tokio::sync::oneshot;
+
 async fn login(
     State(tx): State<mpsc::Sender<AuthRequest>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Form(form): Form<LoginForm>,
-) -> &'static str {
+) -> Html<&'static str> {
     info!("Login attempt from {} for user '{}'", addr.ip(), form.username);
     if let std::net::IpAddr::V4(ipv4_addr) = addr.ip() {
+        let (oneshot_tx, oneshot_rx) = oneshot::channel();
         let auth_request = AuthRequest {
             ip: ipv4_addr,
             username: form.username,
             password: form.password,
+            tx: oneshot_tx,
         };
-        if let Err(e) = tx.send(auth_request).await {
-            warn!("Failed to send auth request: {}", e);
-            return "Login failed: internal server error.";
+
+        if tx.send(auth_request).await.is_err() {
+            warn!("Failed to send auth request to main task");
+            return Html("<h1>Login Failed</h1><p>Internal server error.</p>");
         }
-        "Login request submitted. Please wait."
+
+        match tokio::time::timeout(tokio::time::Duration::from_secs(10), oneshot_rx).await {
+            Ok(Ok(true)) => Html("<h1>Success!</h1><p>You are now authenticated.</p>"),
+            Ok(Ok(false)) => Html("<h1>Login Failed</h1><p>Invalid credentials.</p>"),
+            Ok(Err(_)) => Html("<h1>Login Failed</h1><p>Internal server error (channel closed).</p>"),
+            Err(_) => Html("<h1>Login Failed</h1><p>Internal server error (timeout).</p>"),
+        }
     } else {
-        "Login failed: IPv6 not supported."
+        Html("<h1>Login Failed</h1><p>IPv6 is not supported.</p>")
     }
 }
 

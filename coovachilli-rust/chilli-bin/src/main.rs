@@ -194,12 +194,15 @@ async fn auth_loop(
                         warn!("Failed to send Acct-Start for user '{}': {}", req.username, e);
                     }
                 }
+                req.tx.send(true).ok();
             }
             Ok(false) => {
                 info!("Authentication failed for user '{}'", req.username);
+                req.tx.send(false).ok();
             }
             Err(e) => {
                 warn!("RADIUS request failed for user '{}': {}", req.username, e);
+                req.tx.send(false).ok();
             }
         }
     }
