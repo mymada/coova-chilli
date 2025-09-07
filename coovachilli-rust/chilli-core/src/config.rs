@@ -57,6 +57,10 @@ pub struct Config {
     pub dhcpif: String,
     /// The IP address to listen on for DHCP requests.
     pub dhcplisten: Ipv4Addr,
+    /// The starting IP address of the DHCP pool.
+    pub dhcpstart: Ipv4Addr,
+    /// The ending IP address of the DHCP pool.
+    pub dhcpend: Ipv4Addr,
     /// The DHCP lease time in seconds.
     pub lease: i32,
 

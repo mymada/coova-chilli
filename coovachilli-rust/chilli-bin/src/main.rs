@@ -1,13 +1,15 @@
 mod config;
 
 use anyhow::Result;
-use chilli_core::Config;
+use chilli_core::SessionManager;
 use chilli_http::server;
 use chilli_net::dhcp::DhcpServer;
 use chilli_net::radius::RadiusClient;
 use chilli_net::tun;
-use tokio::io::AsyncReadExt;
-use tracing::{error, info};
+use chilli_net::Firewall;
+use std::sync::Arc;
+use tracing::{error, info, warn};
+use chilli_net::AsyncDevice;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -16,7 +18,7 @@ async fn main() -> Result<()> {
     info!("Starting CoovaChilli-Rust");
 
     let config = match config::load_config() {
-        Ok(config) => config,
+        Ok(config) => Arc::new(config),
         Err(e) => {
             eprintln!("Error loading config: {}", e);
             std::process::exit(1);
@@ -25,39 +27,267 @@ async fn main() -> Result<()> {
 
     info!("Config loaded: {:?}", config);
 
-    let mut iface = match tun::create_tun(&config) {
+    let firewall = Arc::new(Firewall::new((*config).clone()));
+    if let Err(e) = firewall.initialize() {
+        error!("Error initializing firewall: {}", e);
+        std::process::exit(1);
+    }
+
+    let iface = match tun::create_tun(&config).await {
         Ok(iface) => iface,
         Err(e) => {
             error!("Error creating TUN interface: {}", e);
+            firewall.cleanup().ok();
             std::process::exit(1);
         }
     };
 
+    let session_manager = Arc::new(SessionManager::new());
+
+    let (auth_tx, auth_rx) = tokio::sync::mpsc::channel(100);
+
     let config_clone_http = config.clone();
-    let http_server_handle = tokio::spawn(async move {
-        if let Err(e) = server::run_server(&config_clone_http).await {
+    let _http_server_handle = tokio::spawn(async move {
+        if let Err(e) = server::run_server(&config_clone_http, auth_tx).await {
             error!("HTTP server error: {}", e);
         }
     });
 
-    let dhcp_server = DhcpServer::new(config.clone()).await?;
-    let dhcp_server_handle = tokio::spawn(async move {
-        if let Err(e) = dhcp_server.run().await {
+    let dhcp_server = Arc::new(DhcpServer::new(config.clone(), session_manager.clone()).await?);
+    let dhcp_server_run = dhcp_server.clone();
+    let _dhcp_server_handle = tokio::spawn(async move {
+        if let Err(e) = dhcp_server_run.run().await {
             error!("DHCP server error: {}", e);
         }
     });
 
-    let radius_client = RadiusClient::new(config.clone()).await?;
-    let radius_client_handle = tokio::spawn(async move {
-        if let Err(e) = radius_client.run().await {
-            error!("RADIUS client error: {}", e);
-        }
+    let dhcp_reaper_handle = tokio::spawn(dhcp_reaper_loop(dhcp_server.clone()));
+
+    let radius_client = Arc::new(RadiusClient::new(config.clone()).await?);
+    let radius_run_client = radius_client.clone();
+    let _radius_client_handle = tokio::spawn(async move {
+        radius_run_client.run().await;
     });
 
+    let packet_loop_handle = tokio::spawn(packet_loop(
+        iface,
+        session_manager.clone(),
+        config.clone(),
+    ));
+
+    let auth_loop_handle = tokio::spawn(auth_loop(
+        auth_rx,
+        radius_client.clone(),
+        session_manager.clone(),
+        firewall.clone(),
+    ));
+
+    let interim_update_handle = tokio::spawn(interim_update_loop(
+        radius_client.clone(),
+        session_manager.clone(),
+        config.clone(),
+    ));
+
+    tokio::select! {
+        res = packet_loop_handle => {
+            if let Err(e) = res.unwrap() {
+                error!("Packet loop failed: {}", e);
+            }
+        }
+        _ = auth_loop_handle => {
+            info!("Auth loop finished.");
+        }
+        _ = interim_update_handle => {
+            info!("Interim update loop finished.");
+        }
+        _ = dhcp_reaper_handle => {
+            info!("DHCP reaper loop finished.");
+        }
+        _ = _http_server_handle => {
+            info!("HTTP server finished.");
+        }
+        _ = _dhcp_server_handle => {
+            info!("DHCP server finished.");
+        }
+        _ = _radius_client_handle => {
+            info!("RADIUS client finished.");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received Ctrl-C, shutting down.");
+        }
+    }
+
+    firewall.cleanup().ok();
+
+    info!("Sending Acct-Stop for all active sessions...");
+    for session in session_manager.get_all_sessions().await {
+        if session.state.authenticated {
+            if let Err(e) = radius_client.send_acct_stop(&session).await {
+                warn!(
+                    "Failed to send Acct-Stop for session {}: {}",
+                    session.state.sessionid, e
+                );
+            }
+        }
+    }
+
+    info!("Shutdown complete.");
+
+    Ok(())
+}
+
+async fn dhcp_reaper_loop(dhcp_server: Arc<DhcpServer>) {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+    loop {
+        interval.tick().await;
+        dhcp_server.reap_leases().await;
+    }
+}
+
+async fn interim_update_loop(
+    radius_client: Arc<RadiusClient>,
+    session_manager: Arc<SessionManager>,
+    config: Arc<chilli_core::Config>,
+) {
+    let interval_secs = config.interval as u64;
+    if interval_secs == 0 {
+        info!("Interim updates disabled.");
+        return;
+    }
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+    loop {
+        interval.tick().await;
+        info!("Sending interim updates for all active sessions...");
+        for session in session_manager.get_all_sessions().await {
+            if session.state.authenticated {
+                if let Err(e) = radius_client.send_acct_interim_update(&session).await {
+                    warn!(
+                        "Failed to send Acct-Interim-Update for session {}: {}",
+                        session.state.sessionid, e
+                    );
+                }
+            }
+        }
+    }
+}
+
+async fn auth_loop(
+    mut rx: tokio::sync::mpsc::Receiver<chilli_core::AuthRequest>,
+    radius_client: Arc<RadiusClient>,
+    session_manager: Arc<SessionManager>,
+    firewall: Arc<Firewall>,
+) {
+    while let Some(req) = rx.recv().await {
+        info!("Processing auth request for user '{}'", req.username);
+        match radius_client
+            .send_access_request(&req.username, &req.password)
+            .await
+        {
+            Ok(true) => {
+                info!("Authentication successful for user '{}'", req.username);
+                session_manager.authenticate_session(&req.ip).await;
+                if let Err(e) = firewall.add_authenticated_ip(req.ip) {
+                    error!("Failed to add authenticated IP to firewall: {}", e);
+                }
+                if let Some(session) = session_manager.get_session(&req.ip).await {
+                    if let Err(e) = radius_client.send_acct_start(&session).await {
+                        warn!("Failed to send Acct-Start for user '{}': {}", req.username, e);
+                    }
+                }
+            }
+            Ok(false) => {
+                info!("Authentication failed for user '{}'", req.username);
+            }
+            Err(e) => {
+                warn!("RADIUS request failed for user '{}': {}", req.username, e);
+            }
+        }
+    }
+}
+
+async fn packet_loop(
+    iface: AsyncDevice,
+    session_manager: Arc<SessionManager>,
+    config: Arc<chilli_core::Config>,
+) -> anyhow::Result<()> {
     let mut buf = [0u8; 1504];
     loop {
-        let n = iface.read(&mut buf).await?;
-        info!("Read {} bytes from TUN interface", n);
-        // Here we would process the packet
+        let n = iface.recv(&mut buf).await?;
+        let packet_slice = &buf[..n];
+
+        if let Ok(packet) = etherparse::SlicedPacket::from_ip(packet_slice) {
+            let (src_addr, dest_addr, len) =
+                if let Some(etherparse::NetSlice::Ipv4(ipv4)) = packet.net {
+                    (
+                        ipv4.header().source_addr(),
+                        ipv4.header().destination_addr(),
+                        ipv4.header().total_len() as u64,
+                    )
+                } else {
+                    continue;
+                };
+
+            let src_session = session_manager.get_session(&src_addr).await;
+            let dest_session = session_manager.get_session(&dest_addr).await;
+
+            if let Some(session) = src_session {
+                // Outgoing packet from a client
+                if session.state.authenticated {
+                    session_manager.update_counters(&src_addr, len, 0).await;
+                    iface.send(packet_slice).await?;
+                    continue;
+                } else {
+                    // Unauthenticated client, try DNS hijack
+                    if let Some(etherparse::TransportSlice::Udp(udp)) = packet.transport {
+                        if udp.destination_port() == 53 {
+                            if let Ok(request) =
+                                trust_dns_proto::op::Message::from_vec(udp.payload())
+                            {
+                                if request.message_type() == trust_dns_proto::op::MessageType::Query {
+                                    info!("Intercepted DNS query from {}", src_addr);
+                                    let mut response = trust_dns_proto::op::Message::new();
+                                    response
+                                        .set_id(request.id())
+                                        .set_message_type(trust_dns_proto::op::MessageType::Response)
+                                        .set_op_code(trust_dns_proto::op::OpCode::Query)
+                                        .set_response_code(trust_dns_proto::op::ResponseCode::NoError)
+                                        .add_queries(request.queries().to_vec());
+                                    for query in request.queries() {
+                                        let record = trust_dns_proto::rr::Record::from_rdata(
+                                            query.name().clone(),
+                                            60,
+                                            trust_dns_proto::rr::RData::A(config.uamlisten),
+                                        );
+                                        response.add_answer(record);
+                                    }
+                                    let mut response_bytes = Vec::new();
+                                    let mut encoder = trust_dns_proto::serialize::binary::BinEncoder::new(&mut response_bytes);
+                                    trust_dns_proto::serialize::binary::BinEncodable::emit(&response, &mut encoder)?;
+                                    let builder = etherparse::PacketBuilder::ipv4(
+                                        dest_addr.octets(),
+                                        src_addr.octets(),
+                                        20,
+                                    )
+                                    .udp(udp.destination_port(), udp.source_port());
+                                    let mut result = Vec::new();
+                                    builder.write(&mut result, &response_bytes)?;
+                                    iface.send(&result).await?;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Some(session) = dest_session {
+                // Incoming packet to a client
+                if session.state.authenticated {
+                    session_manager
+                        .update_counters(&dest_addr, 0, len)
+                        .await;
+                    iface.send(packet_slice).await?;
+                    continue;
+                }
+            }
+        }
     }
 }
