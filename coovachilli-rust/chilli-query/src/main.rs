@@ -1,16 +1,20 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use chilli_core::Config;
 use chilli_ipc::{Command, Response};
+use std::fs;
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-
-const CMDSOCK_PATH: &str = "/tmp/chilli.sock";
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Cli {
-    #[clap(subcommand)]
+    #[clap(short, long, value_parser, default_value = "/etc/chilli/chilli.toml")]
+    pub config_file: PathBuf,
+
+    #[command(subcommand)]
     command: Commands,
 }
 
@@ -25,8 +29,8 @@ enum Commands {
     },
 }
 
-async fn send_command(command: Command) -> Result<Response> {
-    let mut stream = UnixStream::connect(CMDSOCK_PATH).await?;
+async fn send_command(command: Command, socket_path: &str) -> Result<Response> {
+    let mut stream = UnixStream::connect(socket_path).await?;
     let serialized = serde_json::to_vec(&command)?;
 
     stream.write_all(&serialized).await?;
@@ -43,9 +47,13 @@ async fn send_command(command: Command) -> Result<Response> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    let config_contents = fs::read_to_string(&cli.config_file)?;
+    let config: Config = toml::from_str(&config_contents)?;
+    let socket_path = config.cmdsocket.ok_or_else(|| anyhow::anyhow!("cmdsocket path not configured"))?;
+
     match &cli.command {
         Commands::List => {
-            let response = send_command(Command::List).await?;
+            let response = send_command(Command::List, &socket_path).await?;
             match response {
                 Response::List(sessions) => {
                     println!(
@@ -84,7 +92,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Disconnect { ip } => {
-            let response = send_command(Command::Disconnect { ip: *ip }).await?;
+            let response = send_command(Command::Disconnect { ip: *ip }, &socket_path).await?;
             match response {
                 Response::Success => {
                     println!("Successfully disconnected session for IP {}", ip);

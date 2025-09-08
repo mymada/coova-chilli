@@ -45,13 +45,18 @@ pub struct Config {
     /// The IP address of the primary RADIUS server.
     pub radiusserver1: Ipv4Addr,
     /// The IP address of the secondary RADIUS server.
-    pub radiusserver2: Ipv4Addr,
+    pub radiusserver2: Option<Ipv4Addr>,
     /// The shared secret for the RADIUS server.
     pub radiussecret: String,
     /// The UDP port for RADIUS authentication.
     pub radiusauthport: u16,
     /// The UDP port for RADIUS accounting.
     pub radiusacctport: u16,
+    /// The UDP port for RADIUS CoA/Disconnect.
+    pub coaport: u16,
+    /// Do not check the source IP of CoA/Disconnect requests.
+    #[serde(default)]
+    pub coanoipcheck: bool,
 
     /// The network interface to use for DHCP.
     pub dhcpif: String,
@@ -75,6 +80,45 @@ pub struct Config {
 
     /// The maximum number of clients to allow.
     pub max_clients: i32,
+
+    /// A list of domains to allow access to before authentication.
+    #[serde(default)]
+    pub walled_garden: Vec<String>,
+
+    /// Enable MAC authentication.
+    #[serde(default)]
+    pub macauth: bool,
+    /// Deny access if MAC authentication fails.
+    #[serde(default)]
+    pub macauthdeny: bool,
+    /// A list of allowed MAC addresses.
+    #[serde(default)]
+    pub macallowed: Vec<String>,
+    /// The password to use for MAC authentication.
+    pub macpasswd: Option<String>,
+    /// The path to the command socket.
+    pub cmdsocket: Option<String>,
+    /// The path to the status file.
+    pub statusfile: Option<String>,
+
+    /// The path to the connection up script.
+    pub conup: Option<String>,
+    /// The path to the connection down script.
+    pub condown: Option<String>,
+
+    // RADIUS Proxy settings
+    /// The IP address to listen on for proxy requests.
+    #[serde(default)]
+    pub proxylisten: Option<Ipv4Addr>,
+    /// The UDP port to listen on for proxy requests.
+    #[serde(default)]
+    pub proxyport: u16,
+    /// The shared secret for proxy clients.
+    #[serde(default)]
+    pub proxysecret: Option<String>,
+    /// The NAS-Identifier for the proxy.
+    #[serde(default)]
+    pub proxynasid: Option<String>,
 }
 
 impl Default for Config {
@@ -97,10 +141,12 @@ impl Default for Config {
             domain: Some("coova.org".to_string()),
             radiuslisten: "0.0.0.0".parse().unwrap(),
             radiusserver1: "127.0.0.1".parse().unwrap(),
-            radiusserver2: "127.0.0.1".parse().unwrap(),
+            radiusserver2: Some("127.0.0.1".parse().unwrap()),
             radiussecret: "testing123".to_string(),
             radiusauthport: 1812,
             radiusacctport: 1813,
+            coaport: 3799,
+            coanoipcheck: false,
             dhcpif: "eth0".to_string(),
             dhcplisten: "192.168.182.1".parse().unwrap(),
             dhcpstart: "192.168.182.10".parse().unwrap(),
@@ -111,6 +157,19 @@ impl Default for Config {
             uamlisten: "192.168.182.1".parse().unwrap(),
             uamport: 3990,
             max_clients: 1024,
+            walled_garden: Vec::new(),
+            macauth: false,
+            macauthdeny: false,
+            macallowed: Vec::new(),
+            macpasswd: None,
+            cmdsocket: Some("/var/run/chilli.sock".to_string()),
+            statusfile: Some("/var/run/chilli.status".to_string()),
+            conup: None,
+            condown: None,
+            proxylisten: None,
+            proxyport: 1814,
+            proxysecret: None,
+            proxynasid: None,
         }
     }
 }

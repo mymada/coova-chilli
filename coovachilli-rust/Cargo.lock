@@ -273,11 +273,16 @@ name = "chilli-bin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "byteorder",
  "chilli-core",
  "chilli-http",
+ "chilli-ipc",
  "chilli-net",
  "clap",
  "etherparse",
+ "hex",
+ "md5",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",
@@ -324,8 +329,9 @@ dependencies = [
  "des",
  "getrandom",
  "hex",
+ "hmac",
+ "md-5",
  "md4",
- "md5",
  "num",
  "num-derive",
  "num-traits",
@@ -340,10 +346,12 @@ name = "chilli-query"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chilli-core",
  "chilli-ipc",
  "clap",
  "serde_json",
  "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -475,6 +483,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -697,6 +706,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "http"
@@ -1022,6 +1040,16 @@ name = "matchit"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
+
+[[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
+]
 
 [[package]]
 name = "md4"
@@ -1609,6 +1637,12 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "subtle"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "syn"
