@@ -102,7 +102,7 @@ impl Default for SessionState {
             sessionid: "".to_string(),
             start_time: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .expect("System time is before the UNIX epoch, which is not supported.")
                 .as_secs(),
             interim_time: 0,
             last_bw_time: 0,
@@ -220,7 +220,7 @@ impl SessionManager {
             session.state.authenticated = true;
             session.state.last_up_time = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .expect("System time is before the UNIX epoch, which is not supported.")
                 .as_secs();
             true
         } else {
@@ -257,7 +257,7 @@ impl SessionManager {
         if let Some(session) = sessions.get_mut(ip) {
             session.state.last_up_time = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .expect("System time is before the UNIX epoch, which is not supported.")
                 .as_secs();
         }
     }

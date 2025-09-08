@@ -1,4 +1,4 @@
-use chilli_core::Config;
+use chilli_core::{Config, LogLevel};
 use std::fs;
 use std::net::Ipv4Addr;
 
@@ -10,7 +10,7 @@ fn test_load_config() {
     assert_eq!(config.foreground, true);
     assert_eq!(config.debug, true);
     assert_eq!(config.logfacility, 1);
-    assert_eq!(config.loglevel, 7);
+    assert_eq!(config.loglevel, LogLevel::Debug);
     assert_eq!(config.interval, 3600);
     assert_eq!(config.pidfile, "/var/run/chilli.pid");
     assert_eq!(config.statedir, "/var/lib/chilli");
@@ -31,6 +31,7 @@ fn test_load_config() {
     assert_eq!(config.radiussecret, "testing123");
     assert_eq!(config.radiusauthport, 1812);
     assert_eq!(config.radiusacctport, 1813);
+    assert_eq!(config.coaport, 3799);
 
     assert_eq!(config.dhcpif, "eth1");
     assert_eq!(config.dhcplisten, Ipv4Addr::new(192, 168, 182, 1));

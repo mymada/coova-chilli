@@ -1,7 +1,7 @@
 foreground = true
 debug = true
 logfacility = 1
-loglevel = 7
+loglevel = "debug"
 interval = 3600
 pidfile = "/var/run/chilli.pid"
 statedir = "/var/lib/chilli"
@@ -22,6 +22,7 @@ radiusserver2 = "127.0.0.1"
 radiussecret = "testing123"
 radiusauthport = 1812
 radiusacctport = 1813
+coaport = 3799
 
 dhcpif = "eth1"
 dhcplisten = "192.168.182.1"

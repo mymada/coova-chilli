@@ -1,6 +1,28 @@
 use serde::Deserialize;
 use std::net::Ipv4Addr;
 
+/// The log level for the application, corresponding to syslog levels.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    /// System is unusable.
+    Emerg,
+    /// Action must be taken immediately.
+    Alert,
+    /// Critical conditions.
+    Crit,
+    /// Error conditions.
+    Err,
+    /// Warning conditions.
+    Warning,
+    /// Normal but significant condition.
+    Notice,
+    /// Informational messages.
+    Info,
+    /// Debug-level messages.
+    Debug,
+}
+
 /// The main configuration for the CoovaChilli application.
 ///
 /// This struct holds all the configuration options for the application,
@@ -14,7 +36,7 @@ pub struct Config {
     /// The syslog facility to use for logging.
     pub logfacility: i32,
     /// The log level to use.
-    pub loglevel: i32,
+    pub loglevel: LogLevel,
     /// The interval at which to re-read the configuration file.
     pub interval: i32,
     /// The path to the PID file.
@@ -127,7 +149,7 @@ impl Default for Config {
             foreground: true,
             debug: true,
             logfacility: 3,
-            loglevel: 7,
+            loglevel: LogLevel::Info,
             interval: 3600,
             pidfile: "/var/run/chilli.pid".to_string(),
             statedir: "/var/run".to_string(),

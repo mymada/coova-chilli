@@ -3,7 +3,7 @@ pub mod session;
 
 use std::net::Ipv4Addr;
 
-pub use config::Config;
+pub use config::{Config, LogLevel};
 pub use session::{RedirState, Session, SessionManager, SessionParams, SessionState};
 
 use tokio::sync::oneshot;
