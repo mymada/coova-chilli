@@ -730,6 +730,7 @@ async fn packet_loop(
 mod tests {
     use super::*;
     use chilli_core::{AuthRequest, Config};
+    use chilli_net::eap::EapCode;
     use chilli_net::radius::{RadiusAttributeValue, RadiusCode, RadiusPacket, RADIUS_AUTH_LEN};
     use std::net::Ipv4Addr;
     use tokio::net::UdpSocket;
@@ -743,13 +744,24 @@ mod tests {
         info!("Mock RADIUS: Received Identity Response: {:?}", &buf[..len]);
         let req_packet = RadiusPacket::from_bytes(&buf[..len]).unwrap();
 
-        let mut eap_data = vec![EapType::MsChapV2 as u8, 0x01, 1, 16];
-        eap_data.extend_from_slice(&[0; 16]);
+        let eap_payload_data = {
+            let mut data = vec![EapType::MsChapV2 as u8];
+            data.push(0x01); // MS-CHAPv2 Op-Code: Challenge
+            data.push(req_packet.id); // MS-CHAPv2 Identifier
+            data.extend_from_slice(&[0u8; 16]); // The challenge
+            data
+        };
+
+        let eap_challenge_packet = EapPacket {
+            code: EapCode::Request,
+            identifier: req_packet.id,
+            data: eap_payload_data,
+        };
 
         let mut attributes = Vec::new();
         attributes.push(RadiusAttributeValue {
             type_code: RadiusAttributeType::EapMessage,
-            value: eap_data,
+            value: eap_challenge_packet.to_bytes(),
         });
 
         let mut payload = Vec::new();
