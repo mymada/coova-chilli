@@ -33,11 +33,11 @@ impl Firewall {
 
         // Filter table rules
         self.run_command("iptables", &["-t", "filter", "-A", "FORWARD", "-j", "chilli"])?;
-        self.run_command("iptables", &["-t", "filter", "-A", "chilli", "-m", "mark", "--mark", "1", "-j", "ACCEPT"])?;
         self.run_command("iptables", &["-t", "filter", "-A", "chilli", "-p", "udp", "--dport", "53", "-j", "ACCEPT"])?;
         let uam_dest = self.config.uamlisten.to_string();
         let uam_port_str = self.config.uamport.to_string();
         self.run_command("iptables", &["-t", "filter", "-A", "chilli", "-p", "tcp", "--dport", &uam_port_str, "-d", &uam_dest, "-j", "ACCEPT"])?;
+        self.run_command("iptables", &["-t", "filter", "-A", "chilli", "-m", "set", "--match-set", "authenticated_users", "src", "-j", "ACCEPT"])?;
         self.run_command("iptables", &["-t", "filter", "-A", "chilli", "-j", "DROP"])?;
 
         Ok(())
@@ -51,6 +51,46 @@ impl Firewall {
     pub fn remove_authenticated_ip(&self, ip: std::net::Ipv4Addr) -> Result<(), std::io::Error> {
         info!("Removing {} from authenticated users", ip);
         self.run_command("ipset", &["del", "authenticated_users", &ip.to_string()])
+    }
+
+    pub fn apply_user_filter(&self, ip: std::net::Ipv4Addr, filter_id: &str) -> Result<(), std::io::Error> {
+        let chain_name = format!("chilli-user-{}", ip);
+        info!("Applying user filter for {} with chain {}", ip, chain_name);
+
+        // Clean up any old chain first
+        self.remove_user_filter(ip)?;
+
+        // Create new chain
+        self.run_command("iptables", &["-t", "filter", "-N", &chain_name])?;
+
+        // Add jump rule from main chilli chain to user chain
+        self.run_command("iptables", &["-t", "filter", "-I", "chilli", "1", "-s", &ip.to_string(), "-j", &chain_name])?;
+
+        // Parse filter_id and add rules
+        for rule in filter_id.split(';') {
+            let args: Vec<&str> = rule.split_whitespace().collect();
+            if !args.is_empty() {
+                let mut full_args = vec!["-t", "filter", "-A", &chain_name];
+                full_args.extend(args);
+                self.run_command("iptables", &full_args)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn remove_user_filter(&self, ip: std::net::Ipv4Addr) -> Result<(), std::io::Error> {
+        let chain_name = format!("chilli-user-{}", ip);
+        info!("Removing user filter for {} with chain {}", ip, chain_name);
+
+        // Remove jump rule
+        self.run_command("iptables", &["-t", "filter", "-D", "chilli", "-s", &ip.to_string(), "-j", &chain_name]).ok();
+
+        // Flush and delete user chain
+        self.run_command("iptables", &["-t", "filter", "-F", &chain_name]).ok();
+        self.run_command("iptables", &["-t", "filter", "-X", &chain_name]).ok();
+
+        Ok(())
     }
 
     pub fn cleanup(&self) -> Result<(), std::io::Error> {

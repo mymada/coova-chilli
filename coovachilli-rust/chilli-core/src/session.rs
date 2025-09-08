@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 pub struct SessionParams {
     pub url: Option<String>,
     pub filterid: Option<String>,
+    pub class: Option<Vec<u8>>,
     pub routeidx: u8,
     pub bandwidthmaxup: u64,
     pub bandwidthmaxdown: u64,
@@ -27,6 +28,7 @@ impl Default for SessionParams {
         Self {
             url: None,
             filterid: None,
+            class: None,
             routeidx: 0,
             bandwidthmaxup: 0,
             bandwidthmaxdown: 0,
@@ -86,6 +88,10 @@ pub struct SessionState {
     pub output_octets: u64,
     pub terminate_cause: u32,
     pub session_id: u32,
+    pub bucketup: u64,
+    pub bucketdown: u64,
+    pub bucketupsize: u64,
+    pub bucketdownsize: u64,
 }
 
 impl Default for SessionState {
@@ -109,16 +115,16 @@ impl Default for SessionState {
             output_octets: 0,
             terminate_cause: 0,
             session_id: 0,
+            bucketup: 0,
+            bucketdown: 0,
+            bucketupsize: 0,
+            bucketdownsize: 0,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Connection {
-    pub next: Option<Box<Connection>>,
-    pub prev: Option<Box<Connection>>,
-    pub uplink: (), // Placeholder
-    pub dnlink: (), // Placeholder
     pub inuse: bool,
     pub is_adminsession: bool,
     pub uamabort: bool,
@@ -139,52 +145,7 @@ pub struct Connection {
     pub dns2: Ipv4Addr,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Session {
-    pub inuse: bool,
-    pub is_adminsession: bool,
-    pub uamabort: bool,
-    pub uamexit: bool,
-    pub unit: i32,
-    pub dnprot: i32,
-    pub rt: i64,
-    pub params: SessionParams,
-    pub state: SessionState,
-    pub hismac: [u8; 6],
-    pub ourip: Ipv4Addr,
-    pub hisip: Ipv4Addr,
-    pub hismask: Ipv4Addr,
-    pub reqip: Ipv4Addr,
-    pub net: Ipv4Addr,
-    pub mask: Ipv4Addr,
-    pub dns1: Ipv4Addr,
-    pub dns2: Ipv4Addr,
-}
-
-impl From<&Connection> for Session {
-    fn from(conn: &Connection) -> Self {
-        Self {
-            inuse: conn.inuse,
-            is_adminsession: conn.is_adminsession,
-            uamabort: conn.uamabort,
-            uamexit: conn.uamexit,
-            unit: conn.unit,
-            dnprot: conn.dnprot,
-            rt: conn.rt,
-            params: conn.params.clone(),
-            state: conn.state.clone(),
-            hismac: conn.hismac,
-            ourip: conn.ourip,
-            hisip: conn.hisip,
-            hismask: conn.hismask,
-            reqip: conn.reqip,
-            net: conn.net,
-            mask: conn.mask,
-            dns1: conn.dns1,
-            dns2: conn.dns2,
-        }
-    }
-}
+pub type Session = Connection;
 
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<Ipv4Addr, Connection>>>,
@@ -197,13 +158,20 @@ impl SessionManager {
         }
     }
 
+    pub fn load_sessions(&self, sessions_to_load: Vec<Session>) {
+        let mut sessions = self.sessions.blocking_lock();
+        for session in sessions_to_load {
+            sessions.insert(session.hisip, session);
+        }
+    }
+
+    pub fn get_all_sessions_sync(&self) -> Vec<Session> {
+        self.sessions.blocking_lock().values().cloned().collect()
+    }
+
     pub async fn create_session(&self, ip: Ipv4Addr, mac: [u8; 6], config: &super::Config) {
         let mut sessions = self.sessions.lock().await;
         let connection = Connection {
-            next: None,
-            prev: None,
-            uplink: (),
-            dnlink: (),
             inuse: true,
             is_adminsession: false,
             uamabort: false,
@@ -228,12 +196,12 @@ impl SessionManager {
 
     pub async fn get_session(&self, ip: &Ipv4Addr) -> Option<Session> {
         let sessions = self.sessions.lock().await;
-        sessions.get(ip).map(Session::from)
+        sessions.get(ip).cloned()
     }
 
     pub async fn get_all_sessions(&self) -> Vec<Session> {
         let sessions = self.sessions.lock().await;
-        sessions.values().map(Session::from).collect()
+        sessions.values().cloned().collect()
     }
 
     pub async fn update_session<F>(&self, ip: &Ipv4Addr, update_fn: F)
@@ -250,6 +218,10 @@ impl SessionManager {
         let mut sessions = self.sessions.lock().await;
         if let Some(session) = sessions.get_mut(ip) {
             session.state.authenticated = true;
+            session.state.last_up_time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
             true
         } else {
             false
@@ -258,7 +230,7 @@ impl SessionManager {
 
     pub async fn remove_session(&self, ip: &Ipv4Addr) -> Option<Session> {
         let mut sessions = self.sessions.lock().await;
-        sessions.remove(ip).map(|conn| Session::from(&conn))
+        sessions.remove(ip)
     }
 
     pub async fn update_counters(
@@ -277,6 +249,16 @@ impl SessionManager {
                 session.state.output_octets += output_octets_delta;
                 session.state.output_packets += 1;
             }
+        }
+    }
+
+    pub async fn update_last_up_time(&self, ip: &Ipv4Addr) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(ip) {
+            session.state.last_up_time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
         }
     }
 }

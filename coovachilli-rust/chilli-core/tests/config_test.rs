@@ -27,7 +27,7 @@ fn test_load_config() {
 
     assert_eq!(config.radiuslisten, Ipv4Addr::new(127, 0, 0, 1));
     assert_eq!(config.radiusserver1, Ipv4Addr::new(127, 0, 0, 1));
-    assert_eq!(config.radiusserver2, Ipv4Addr::new(127, 0, 0, 1));
+    assert_eq!(config.radiusserver2, Some(Ipv4Addr::new(127, 0, 0, 1)));
     assert_eq!(config.radiussecret, "testing123");
     assert_eq!(config.radiusauthport, 1812);
     assert_eq!(config.radiusacctport, 1813);

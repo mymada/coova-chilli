@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chilli_core::SessionManager;
 use chilli_ipc::{Command, Response};
-use chilli_net::{radius::RadiusClient, Firewall};
+use chilli_net::{radius::{RadiusClient, ACCT_TERMINATE_CAUSE_ADMIN_RESET}, Firewall};
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
@@ -20,7 +20,7 @@ async fn handle_disconnect(
     if let Some(session) = session_manager.get_session(&ip).await {
         if session.state.authenticated {
             // Send Acct-Stop
-            if let Err(e) = radius_client.send_acct_stop(&session).await {
+            if let Err(e) = radius_client.send_acct_stop(&session, Some(ACCT_TERMINATE_CAUSE_ADMIN_RESET)).await {
                 warn!(
                     "Failed to send Acct-Stop for session {}: {}",
                     session.state.sessionid, e
@@ -129,35 +129,10 @@ mod tests {
 
     // Helper to create a default config for testing
     fn default_test_config() -> Config {
-        let toml_str = r#"
-            foreground = true
-            debug = true
-            logfacility = 1
-            loglevel = 7
-            interval = 3600
-            pidfile = "/tmp/chilli.pid"
-            statedir = "/tmp/chilli"
-            net = "192.168.1.0"
-            mask = "255.255.255.0"
-            dns1 = "8.8.8.8"
-            dns2 = "8.8.4.4"
-            radiuslisten = "127.0.0.1"
-            radiusserver1 = "127.0.0.1"
-            radiusserver2 = "127.0.0.1"
-            radiussecret = "secret"
-            radiusauthport = 1812
-            radiusacctport = 1813
-            dhcpif = "eth0"
-            dhcplisten = "192.168.1.1"
-            dhcpstart = "192.168.1.10"
-            dhcpend = "192.168.1.20"
-            lease = 3600
-            uamlisten = "192.168.1.1"
-            uamport = 3990
-            max_clients = 10
-            cmdsocket = "/tmp/chilli-test.sock"
-        "#;
-        toml::from_str(toml_str).unwrap()
+        let mut config = Config::default();
+        config.cmdsocket = Some("/tmp/chilli-test.sock".to_string());
+        config.coaport = 0; // Use a random port for testing
+        config
     }
 
     async fn send_test_command(path: &str, command: Command) -> Result<Response> {

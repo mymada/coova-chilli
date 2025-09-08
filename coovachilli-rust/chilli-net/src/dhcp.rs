@@ -1,10 +1,11 @@
 use anyhow::Result;
-use chilli_core::{Config, SessionManager};
+use chilli_core::{AuthRequest, AuthType, Config, SessionManager};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::net::UdpSocket;
+use tokio::sync::{mpsc, oneshot};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -156,10 +157,15 @@ pub struct DhcpServer {
     ip_pool: Arc<Mutex<Vec<Ipv4Addr>>>,
     leases: Arc<Mutex<HashMap<[u8; 6], Lease>>>,
     session_manager: Arc<SessionManager>,
+    auth_tx: mpsc::Sender<AuthRequest>,
 }
 
 impl DhcpServer {
-    pub async fn new(config: Arc<Config>, session_manager: Arc<SessionManager>) -> Result<Self> {
+    pub async fn new(
+        config: Arc<Config>,
+        session_manager: Arc<SessionManager>,
+        auth_tx: mpsc::Sender<AuthRequest>,
+    ) -> Result<Self> {
         let addr = format!("{}:67", config.dhcplisten);
         let socket = UdpSocket::bind(&addr).await?;
         socket.set_broadcast(true)?;
@@ -178,6 +184,7 @@ impl DhcpServer {
             ip_pool: Arc::new(Mutex::new(ip_pool)),
             leases: Arc::new(Mutex::new(HashMap::new())),
             session_manager,
+            auth_tx,
         })
     }
 
@@ -268,6 +275,7 @@ impl DhcpServer {
 
     async fn handle_request(&self, req_packet: &DhcpPacket) -> Result<()> {
         let mac = req_packet.get_mac();
+        let mac_str = hex::encode(mac);
         let mut leases = self.leases.lock().await;
 
         // Check if it's a renewal
@@ -275,7 +283,7 @@ impl DhcpServer {
         if !client_ip.is_unspecified() {
             if let Some(lease) = leases.get(&mac) {
                 if lease.ip == client_ip {
-                    info!("Renewing lease for IP {} for MAC {}", client_ip, hex::encode(mac));
+                    info!("Renewing lease for IP {} for MAC {}", client_ip, &mac_str);
                     // Renew lease time
                     let lease_duration = Duration::from_secs(self.config.lease as u64);
                     let new_lease = Lease {
@@ -317,7 +325,7 @@ impl DhcpServer {
         let requested_ip = match requested_ip_opt {
             Some(ip) => ip,
             None => {
-                warn!("DHCPREQUEST from {} with no requested IP", hex::encode(mac));
+                warn!("DHCPREQUEST from {} with no requested IP", &mac_str);
                 return Ok(());
             }
         };
@@ -325,8 +333,7 @@ impl DhcpServer {
         // This is simplified. A real server would check if the IP is valid and offered.
         info!(
             "Acknowledging IP {} for MAC {}",
-            requested_ip,
-            hex::encode(mac)
+            requested_ip, &mac_str
         );
 
         let lease_duration = Duration::from_secs(self.config.lease as u64);
@@ -340,6 +347,36 @@ impl DhcpServer {
         self.session_manager
             .create_session(requested_ip, mac, &self.config)
             .await;
+
+        if self.config.macauth {
+            if self.config.macallowed.contains(&mac_str) {
+                info!("MAC {} is in macallowed list, authenticating.", &mac_str);
+                self.session_manager.authenticate_session(&requested_ip).await;
+            } else {
+                let (tx, rx) = oneshot::channel();
+                let auth_req = AuthRequest {
+                    auth_type: AuthType::Pap,
+                    ip: requested_ip,
+                    username: mac_str.clone(),
+                    password: self.config.macpasswd.clone(),
+                    tx,
+                };
+
+                self.auth_tx.send(auth_req).await?;
+                match rx.await {
+                    Ok(true) => {
+                        info!("MAC authentication successful for {}", &mac_str);
+                    }
+                    _ => {
+                        info!("MAC authentication failed for {}", &mac_str);
+                        if self.config.macauthdeny {
+                            // Don't send ACK
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
 
         let response = self.build_response(
             req_packet,
