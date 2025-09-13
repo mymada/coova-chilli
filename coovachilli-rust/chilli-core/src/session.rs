@@ -1,3 +1,4 @@
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -76,6 +77,7 @@ pub struct SessionState {
     pub redir: RedirState,
     pub authenticated: bool,
     pub sessionid: String,
+    pub chilli_sessionid: String,
     pub start_time: u64,
     pub interim_time: u64,
     pub last_bw_time: u64,
@@ -100,6 +102,7 @@ impl Default for SessionState {
             redir: RedirState::default(),
             authenticated: false,
             sessionid: "".to_string(),
+            chilli_sessionid: "".to_string(),
             start_time: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("System time is before the UNIX epoch, which is not supported.")
@@ -171,16 +174,39 @@ impl SessionManager {
 
     pub async fn create_session(&self, ip: Ipv4Addr, mac: [u8; 6], config: &super::Config) {
         let mut sessions = self.sessions.lock().await;
+
+        let rt = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let unit: u32 = rand::thread_rng().gen();
+
+        let sessionid = format!("{:08x}{:08x}", rt, unit);
+
+        // This is a placeholder. In the C code, this is the MAC of the NAS interface.
+        let called_mac = [0u8; 6];
+
+        let chilli_sessionid = format!(
+            "SES-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}-{:08x}{:08x}",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            called_mac[0], called_mac[1], called_mac[2], called_mac[3], called_mac[4], called_mac[5],
+            rt, unit
+        );
+
+        let mut state = SessionState::default();
+        state.sessionid = sessionid;
+        state.chilli_sessionid = chilli_sessionid;
+
         let connection = Connection {
             inuse: true,
             is_adminsession: false,
             uamabort: false,
             uamexit: false,
-            unit: 0,
+            unit: unit as i32,
             dnprot: 0,
-            rt: 0,
+            rt: rt as i64,
             params: SessionParams::default(),
-            state: SessionState::default(),
+            state,
             hismac: mac,
             ourip: config.uamlisten,
             hisip: ip,

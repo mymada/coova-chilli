@@ -125,6 +125,7 @@ mod tests {
     use chilli_core::Config;
     use std::fs;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::watch;
     use tokio::net::UnixStream;
 
     // Helper to create a default config for testing
@@ -150,8 +151,10 @@ mod tests {
         let config = Arc::new(default_test_config());
         let socket_path = config.cmdsocket.as_ref().unwrap().clone();
 
+        let (_config_tx, config_rx) = watch::channel(config.clone());
+
         let session_manager = Arc::new(SessionManager::new());
-        let radius_client = Arc::new(RadiusClient::new(config.clone()).await?);
+        let radius_client = Arc::new(RadiusClient::new(config_rx).await?);
         let firewall = Arc::new(Firewall::new(config.as_ref().clone()));
 
         let listener_task = tokio::spawn(run_cmdsock_listener(

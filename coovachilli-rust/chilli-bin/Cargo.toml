@@ -13,6 +13,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 toml = "0.8"
 anyhow = "1.0"
+libc = "0.2"
 etherparse = "0.19"
 trust-dns-proto = "0.22"
 tracing-subscriber = "0.3"

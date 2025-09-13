@@ -141,6 +141,16 @@ pub struct Config {
     /// The NAS-Identifier for the proxy.
     #[serde(default)]
     pub proxynasid: Option<String>,
+
+    /// The NAS-Identifier for RADIUS requests.
+    #[serde(default)]
+    pub radiusnasid: Option<String>,
+    /// The WISPr Location ID for RADIUS requests.
+    #[serde(default)]
+    pub radiuslocationid: Option<String>,
+    /// The WISPr Location Name for RADIUS requests.
+    #[serde(default)]
+    pub radiuslocationname: Option<String>,
 }
 
 impl Default for Config {
@@ -192,6 +202,9 @@ impl Default for Config {
             proxyport: 1814,
             proxysecret: None,
             proxynasid: None,
+            radiusnasid: None,
+            radiuslocationid: None,
+            radiuslocationname: None,
         }
     }
 }
