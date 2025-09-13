@@ -5,7 +5,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -153,7 +153,8 @@ struct Lease {
 /// The DHCP server.
 pub struct DhcpServer {
     socket: Arc<UdpSocket>,
-    config: Arc<Config>,
+    config: Arc<Mutex<Arc<Config>>>,
+    config_rx: Arc<Mutex<watch::Receiver<Arc<Config>>>>,
     ip_pool: Arc<Mutex<Vec<Ipv4Addr>>>,
     leases: Arc<Mutex<HashMap<[u8; 6], Lease>>>,
     session_manager: Arc<SessionManager>,
@@ -162,10 +163,11 @@ pub struct DhcpServer {
 
 impl DhcpServer {
     pub async fn new(
-        config: Arc<Config>,
+        config_rx: watch::Receiver<Arc<Config>>,
         session_manager: Arc<SessionManager>,
         auth_tx: mpsc::Sender<AuthRequest>,
     ) -> Result<Self> {
+        let config = config_rx.borrow().clone();
         let addr = format!("{}:67", config.dhcplisten);
         let socket = UdpSocket::bind(&addr).await?;
         socket.set_broadcast(true)?;
@@ -180,7 +182,8 @@ impl DhcpServer {
 
         Ok(DhcpServer {
             socket: Arc::new(socket),
-            config,
+            config: Arc::new(Mutex::new(config)),
+            config_rx: Arc::new(Mutex::new(config_rx)),
             ip_pool: Arc::new(Mutex::new(ip_pool)),
             leases: Arc::new(Mutex::new(HashMap::new())),
             session_manager,
@@ -210,13 +213,35 @@ impl DhcpServer {
     pub async fn run(&self) -> Result<()> {
         let mut buf = [0u8; 1500];
         loop {
-            let (len, src) = self.socket.recv_from(&mut buf).await?;
-            if let Some(packet) = DhcpPacket::from_bytes(&buf[..len]) {
-                if let Err(e) = self.handle_packet(packet, src).await {
-                    error!("Error handling DHCP packet: {}", e);
+            let mut config_rx = self.config_rx.lock().await;
+            tokio::select! {
+                res = self.socket.recv_from(&mut buf) => {
+                    match res {
+                        Ok((len, src)) => {
+                            if let Some(packet) = DhcpPacket::from_bytes(&buf[..len]) {
+                                if let Err(e) = self.handle_packet(packet, src).await {
+                                    error!("Error handling DHCP packet: {}", e);
+                                }
+                            } else {
+                                warn!("Received invalid DHCP packet from {}", src);
+                            }
+                        }
+                        Err(e) => {
+                            error!("DHCP socket recv error: {}", e);
+                        }
+                    }
                 }
-            } else {
-                warn!("Received invalid DHCP packet from {}", src);
+                res = config_rx.changed() => {
+                    if res.is_ok() {
+                        let new_config = config_rx.borrow().clone();
+                        let mut config = self.config.lock().await;
+                        *config = new_config;
+                        info!("DHCP server reloaded configuration.");
+                    } else {
+                        info!("Config channel closed, ending DHCP server loop.");
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -260,10 +285,12 @@ impl DhcpServer {
 
         info!("Offering IP {} to MAC {}", ip_to_offer, hex::encode(mac));
 
+        let config = self.config.lock().await;
         let response = self.build_response(
+            &config,
             req_packet,
             DhcpMessageType::Offer,
-            self.config.dhcplisten,
+            config.dhcplisten,
             ip_to_offer,
         );
 
@@ -280,12 +307,13 @@ impl DhcpServer {
 
         // Check if it's a renewal
         let client_ip = req_packet.ciaddr();
+        let config = self.config.lock().await;
         if !client_ip.is_unspecified() {
             if let Some(lease) = leases.get(&mac) {
                 if lease.ip == client_ip {
                     info!("Renewing lease for IP {} for MAC {}", client_ip, &mac_str);
                     // Renew lease time
-                    let lease_duration = Duration::from_secs(self.config.lease as u64);
+                    let lease_duration = Duration::from_secs(config.lease as u64);
                     let new_lease = Lease {
                         ip: client_ip,
                         mac,
@@ -294,9 +322,10 @@ impl DhcpServer {
                     leases.insert(mac, new_lease);
 
                     let response = self.build_response(
+                        &config,
                         req_packet,
                         DhcpMessageType::Ack,
-                        self.config.dhcplisten,
+                        config.dhcplisten,
                         client_ip,
                     );
                     self.socket.send_to(&response, "255.255.255.255:68").await?;
@@ -317,7 +346,7 @@ impl DhcpServer {
             .map(Ipv4Addr::from);
 
         // Must be a request for our server
-        if server_id_opt != Some(self.config.dhcplisten) {
+        if server_id_opt != Some(config.dhcplisten) {
              warn!("DHCPREQUEST not for us (server_id: {:?})", server_id_opt);
              return Ok(());
         }
@@ -336,7 +365,7 @@ impl DhcpServer {
             requested_ip, &mac_str
         );
 
-        let lease_duration = Duration::from_secs(self.config.lease as u64);
+        let lease_duration = Duration::from_secs(config.lease as u64);
         let lease = Lease {
             ip: requested_ip,
             mac,
@@ -345,11 +374,11 @@ impl DhcpServer {
         leases.insert(mac, lease.clone());
 
         self.session_manager
-            .create_session(requested_ip, mac, &self.config)
+            .create_session(requested_ip, mac, &config)
             .await;
 
-        if self.config.macauth {
-            if self.config.macallowed.contains(&mac_str) {
+        if config.macauth {
+            if config.macallowed.contains(&mac_str) {
                 info!("MAC {} is in macallowed list, authenticating.", &mac_str);
                 self.session_manager.authenticate_session(&requested_ip).await;
             } else {
@@ -358,7 +387,7 @@ impl DhcpServer {
                     auth_type: AuthType::Pap,
                     ip: requested_ip,
                     username: mac_str.clone(),
-                    password: self.config.macpasswd.clone(),
+                    password: config.macpasswd.clone(),
                     tx,
                 };
 
@@ -369,7 +398,7 @@ impl DhcpServer {
                     }
                     _ => {
                         info!("MAC authentication failed for {}", &mac_str);
-                        if self.config.macauthdeny {
+                        if config.macauthdeny {
                             // Don't send ACK
                             return Ok(());
                         }
@@ -379,9 +408,10 @@ impl DhcpServer {
         }
 
         let response = self.build_response(
+            &config,
             req_packet,
             DhcpMessageType::Ack,
-            self.config.dhcplisten,
+            config.dhcplisten,
             requested_ip,
         );
 
@@ -393,6 +423,7 @@ impl DhcpServer {
 
     fn build_response(
         &self,
+        config: &Config,
         req_packet: &DhcpPacket,
         msg_type: DhcpMessageType,
         server_ip: Ipv4Addr,
@@ -423,26 +454,26 @@ impl DhcpServer {
         cursor += 6;
 
         // Lease Time
-        let lease_time_bytes = (self.config.lease as u32).to_be_bytes();
+        let lease_time_bytes = (config.lease as u32).to_be_bytes();
         response_buf[cursor..cursor + 2].copy_from_slice(&[DHCP_OPTION_LEASE_TIME, 4]);
         response_buf[cursor + 2..cursor + 6].copy_from_slice(&lease_time_bytes);
         cursor += 6;
 
         // Subnet Mask
-        let netmask = self.config.mask;
+        let netmask = config.mask;
         response_buf[cursor..cursor + 2].copy_from_slice(&[DHCP_OPTION_SUBNET_MASK, 4]);
         response_buf[cursor + 2..cursor + 6].copy_from_slice(&netmask.octets());
         cursor += 6;
 
         // Router
         response_buf[cursor..cursor + 2].copy_from_slice(&[DHCP_OPTION_ROUTER_OPTION, 4]);
-        response_buf[cursor + 2..cursor + 6].copy_from_slice(&self.config.uamlisten.octets());
+        response_buf[cursor + 2..cursor + 6].copy_from_slice(&config.uamlisten.octets());
         cursor += 6;
 
         // DNS Server
         response_buf[cursor..cursor + 2].copy_from_slice(&[DHCP_OPTION_DNS, 8]);
-        response_buf[cursor + 2..cursor + 6].copy_from_slice(&self.config.dns1.octets());
-        response_buf[cursor + 6..cursor + 10].copy_from_slice(&self.config.dns2.octets());
+        response_buf[cursor + 2..cursor + 6].copy_from_slice(&config.dns1.octets());
+        response_buf[cursor + 6..cursor + 10].copy_from_slice(&config.dns2.octets());
         cursor += 10;
 
         response_buf[cursor] = DHCP_OPTION_END;

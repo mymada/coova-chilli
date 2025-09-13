@@ -8,8 +8,7 @@ use chilli_net::dhcp::DhcpServer;
 use chilli_net::eap_mschapv2;
 use chilli_net::mschapv2;
 use chilli_net::radius::{
-    AuthResult, RadiusAttributeType, RadiusClient,
-    ACCT_TERMINATE_CAUSE_ADMIN_RESET, ACCT_TERMINATE_CAUSE_IDLE_TIMEOUT,
+    AuthResult, RadiusClient, ACCT_TERMINATE_CAUSE_IDLE_TIMEOUT,
     ACCT_TERMINATE_CAUSE_SESSION_TIMEOUT,
 };
 use chilli_net::tun;
@@ -23,9 +22,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::{watch, Mutex};
 use tracing::{error, info, warn};
-use chilli_net::eap::{EapPacket, EapType};
+use chilli_net::eap::EapPacket;
 use chilli_net::AsyncDevice;
 
 fn load_status(
@@ -56,14 +56,101 @@ fn save_status(
     Ok(())
 }
 
-async fn run_script(script_path: String, session: &Session) {
-    info!("Running script {} for session {}", script_path, session.state.sessionid);
+async fn run_script(
+    script_path: String,
+    session: &Session,
+    config: &Arc<chilli_core::Config>,
+    terminate_cause: Option<u32>,
+) {
+    info!(
+        "Running script {} for session {}",
+        script_path, session.state.sessionid
+    );
     let mut cmd = Command::new(&script_path);
-    cmd.env("FRAMED_IP_ADDRESS", session.hisip.to_string());
-    cmd.env("CALLING_STATION_ID", hex::encode(session.hismac));
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let session_time = now - session.state.start_time;
+    let idle_time = now - session.state.last_up_time;
+
+    cmd.env("DEV", config.tundev.as_deref().unwrap_or(""));
+    cmd.env("NET", config.net.to_string());
+    cmd.env("MASK", config.mask.to_string());
+    cmd.env("ADDR", config.uamlisten.to_string());
     if let Some(username) = &session.state.redir.username {
         cmd.env("USER_NAME", username);
     }
+    cmd.env("NAS_IP_ADDRESS", config.radiuslisten.to_string());
+    cmd.env("SERVICE_TYPE", "1");
+    cmd.env("FRAMED_IP_ADDRESS", session.hisip.to_string());
+    if let Some(filter_id) = &session.params.filterid {
+        cmd.env("FILTER_ID", filter_id);
+    }
+    if let Some(state) = &session.state.redir.state {
+        cmd.env("STATE", hex::encode(state));
+    }
+    if let Some(class) = &session.state.redir.class {
+        cmd.env("CLASS", hex::encode(class));
+    }
+    if let Some(cui) = &session.state.redir.cui {
+        cmd.env("CUI", hex::encode(cui));
+    }
+    cmd.env(
+        "SESSION_TIMEOUT",
+        session.params.sessiontimeout.to_string(),
+    );
+    cmd.env("IDLE_TIMEOUT", session.params.idletimeout.to_string());
+    cmd.env("CALLING_STATION_ID", hex::encode(session.hismac));
+    // Placeholder for CALLED_STATION_ID, which should be the NAS MAC
+    cmd.env("CALLED_STATION_ID", "00-00-00-00-00-00");
+    if let Some(nas_id) = &config.radiusnasid {
+        cmd.env("NAS_ID", nas_id);
+    }
+    cmd.env("NAS_PORT_TYPE", "19");
+    cmd.env("ACCT_SESSION_ID", &session.state.sessionid);
+    cmd.env(
+        "ACCT_INTERIM_INTERVAL",
+        session.params.interim_interval.to_string(),
+    );
+    if let Some(loc_id) = &config.radiuslocationid {
+        cmd.env("WISPR_LOCATION_ID", loc_id);
+    }
+    if let Some(loc_name) = &config.radiuslocationname {
+        cmd.env("WISPR_LOCATION_NAME", loc_name);
+    }
+    cmd.env(
+        "WISPR_BANDWIDTH_MAX_UP",
+        session.params.bandwidthmaxup.to_string(),
+    );
+    cmd.env(
+        "WISPR_BANDWIDTH_MAX_DOWN",
+        session.params.bandwidthmaxdown.to_string(),
+    );
+    cmd.env(
+        "COOVACHILLI_MAX_INPUT_OCTETS",
+        session.params.maxinputoctets.to_string(),
+    );
+    cmd.env(
+        "COOVACHILLI_MAX_OUTPUT_OCTETS",
+        session.params.maxoutputoctets.to_string(),
+    );
+    cmd.env(
+        "COOVACHILLI_MAX_TOTAL_OCTETS",
+        session.params.maxtotaloctets.to_string(),
+    );
+    cmd.env("INPUT_OCTETS", session.state.input_octets.to_string());
+    cmd.env("OUTPUT_OCTETS", session.state.output_octets.to_string());
+    cmd.env("INPUT_PACKETS", session.state.input_packets.to_string());
+    cmd.env("OUTPUT_PACKETS", session.state.output_packets.to_string());
+    cmd.env("SESSION_TIME", session_time.to_string());
+    cmd.env("IDLE_TIME", idle_time.to_string());
+
+    if let Some(cause) = terminate_cause {
+        cmd.env("TERMINATE_CAUSE", cause.to_string());
+    }
+
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
 
@@ -81,19 +168,111 @@ async fn run_script(script_path: String, session: &Session) {
     }
 }
 
+use std::env;
+
+// Constants for ioprio_set
+const IOPRIO_CLASS_SHIFT: i32 = 13;
+const IOPRIO_CLASS_RT: i32 = 1;
+const IOPRIO_WHO_PROCESS: i32 = 1;
+
+// Syscall numbers for ioprio_set
+#[cfg(target_arch = "x86_64")]
+const __NR_IOPRIO_SET: i64 = 251;
+#[cfg(target_arch = "x86")]
+const __NR_IOPRIO_SET: i64 = 289;
+#[cfg(target_arch = "aarch64")]
+const __NR_IOPRIO_SET: i64 = 59; // Common for aarch64, but may vary
+
+fn set_process_priority() {
+    if let Ok(prio_str) = env::var("CHILLI_PRIORITY") {
+        if let Ok(prio) = prio_str.parse::<i32>() {
+            unsafe {
+                let pid = libc::getpid();
+                if libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, prio) != 0 {
+                    warn!("Failed to set process priority: {}", std::io::Error::last_os_error());
+                } else {
+                    info!("Successfully set process priority to {}", prio);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+fn set_io_priority() {
+    if let Ok(prio_str) = env::var("CHILLI_IOPRIO_RT") {
+        if let Ok(prio) = prio_str.parse::<i32>() {
+            if prio < 0 || prio > 7 {
+                warn!("Invalid I/O priority value: {}. Must be between 0 and 7.", prio);
+                return;
+            }
+            let ioprio = prio | (IOPRIO_CLASS_RT << IOPRIO_CLASS_SHIFT);
+            unsafe {
+                let pid = libc::getpid();
+                let result = libc::syscall(__NR_IOPRIO_SET, IOPRIO_WHO_PROCESS, pid, ioprio);
+                if result != 0 {
+                    warn!("Failed to set I/O priority: {}", std::io::Error::last_os_error());
+                } else {
+                    info!("Successfully set I/O priority to real-time class with level {}", prio);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64"))))]
+fn set_io_priority() {
+    if env::var("CHILLI_IOPRIO_RT").is_ok() {
+        warn!("Setting I/O priority is only supported on Linux (x86, x86_64, aarch64).");
+    }
+}
+
+async fn sighup_handler(config_tx: watch::Sender<Arc<chilli_core::Config>>) {
+    let mut stream = match signal(SignalKind::hangup()) {
+        Ok(stream) => stream,
+        Err(e) => {
+            error!("Failed to create SIGHUP listener: {}", e);
+            return;
+        }
+    };
+
+    while stream.recv().await.is_some() {
+        info!("SIGHUP received, reloading configuration...");
+        match config::load_config() {
+            Ok(new_config) => {
+                if config_tx.send(Arc::new(new_config)).is_err() {
+                    error!("Config receiver dropped, cannot reload config.");
+                    break;
+                }
+                info!("Configuration reloaded successfully.");
+            }
+            Err(e) => {
+                error!("Failed to reload configuration: {}", e);
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     info!("Starting CoovaChilli-Rust");
 
-    let config = match config::load_config() {
+    set_process_priority();
+    set_io_priority();
+
+    let initial_config = match config::load_config() {
         Ok(config) => Arc::new(config),
         Err(e) => {
             eprintln!("Error loading config: {}", e);
             std::process::exit(1);
         }
     };
+
+    let (config_tx, config_rx) = watch::channel(initial_config);
+
+    let config = config_rx.borrow().clone();
 
     info!("Config loaded: {:?}", config);
 
@@ -130,7 +309,7 @@ async fn main() -> Result<()> {
     });
 
     let dhcp_server = Arc::new(
-        DhcpServer::new(config.clone(), session_manager.clone(), auth_tx.clone()).await?,
+        DhcpServer::new(config_rx.clone(), session_manager.clone(), auth_tx.clone()).await?,
     );
     let dhcp_server_run = dhcp_server.clone();
     let _dhcp_server_handle = tokio::spawn(async move {
@@ -141,7 +320,7 @@ async fn main() -> Result<()> {
 
     let dhcp_reaper_handle = tokio::spawn(dhcp_reaper_loop(dhcp_server.clone()));
 
-    let radius_client = Arc::new(RadiusClient::new(config.clone()).await?);
+    let radius_client = Arc::new(RadiusClient::new(config_rx.clone()).await?);
     let radius_run_client = radius_client.clone();
     let _radius_client_handle = tokio::spawn(async move {
         radius_run_client.run().await;
@@ -169,25 +348,27 @@ async fn main() -> Result<()> {
     };
 
     let walled_garden_resolver_handle = tokio::spawn(walled_garden_resolver_loop(
-        config.clone(),
+        config_rx.clone(),
         walled_garden_ips.clone(),
     ));
 
     let proxy_listener_handle = if let Some(listen_ip) = config.proxylisten {
-        let config = config.clone();
+        let config_rx = config_rx.clone();
         Some(tokio::spawn(async move {
+            let config = config_rx.borrow().clone();
             let addr = format!("{}:{}", listen_ip, config.proxyport);
             match UdpSocket::bind(&addr).await {
                 Ok(socket) => {
                     info!("RADIUS proxy listening on {}", addr);
                     let proxy_socket = Arc::new(socket);
-                    match chilli_net::radius_proxy::ProxyManager::new(config, proxy_socket.clone()).await {
-                        Ok(proxy_manager) => {
-                            let manager = Arc::new(proxy_manager);
-                            let req_handle = tokio::spawn(async move { manager.clone().run_request_listener().await; });
-                            // let res_handle = tokio::spawn(async move { manager.run_response_listener().await; });
-                            req_handle.await.ok();
-                            // res_handle.await.ok();
+                    match chilli_net::radius_proxy::ProxyManager::new(
+                        config_rx.clone(),
+                        proxy_socket.clone(),
+                    )
+                    .await
+                    {
+                        Ok(mut proxy_manager) => {
+                            proxy_manager.run_request_listener().await;
                         }
                         Err(e) => {
                             error!("Failed to create RADIUS proxy manager: {}", e);
@@ -221,7 +402,7 @@ async fn main() -> Result<()> {
     let packet_loop_handle = tokio::spawn(packet_loop(
         iface,
         session_manager.clone(),
-        config.clone(),
+        config_rx.clone(),
         walled_garden_ips.clone(),
     ));
 
@@ -230,13 +411,13 @@ async fn main() -> Result<()> {
         radius_client.clone(),
         session_manager.clone(),
         firewall.clone(),
-        config.clone(),
+        config_rx.clone(),
     ));
 
     let interim_update_handle = tokio::spawn(interim_update_loop(
         radius_client.clone(),
         session_manager.clone(),
-        config.clone(),
+        config_rx.clone(),
         firewall.clone(),
     ));
 
@@ -279,8 +460,12 @@ async fn main() -> Result<()> {
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl-C, shutting down.");
         }
+        _ = sighup_handler(config_tx) => {
+            info!("SIGHUP handler finished.");
+        }
     }
 
+    let config = config_rx.borrow().clone();
     if let Err(e) = save_status(&config.statusfile, &session_manager) {
         warn!("Failed to save status file: {}", e);
     }
@@ -292,7 +477,7 @@ async fn main() -> Result<()> {
         if session.state.authenticated {
             firewall.remove_user_filter(session.hisip).ok();
             if let Some(ref condown) = config.condown {
-                run_script(condown.clone(), &session).await;
+                run_script(condown.clone(), &session, &config, None).await;
             }
             if let Err(e) = radius_client.send_acct_stop(&session, None).await {
                 warn!(
@@ -317,11 +502,11 @@ async fn dhcp_reaper_loop(dhcp_server: Arc<DhcpServer>) {
 }
 
 async fn walled_garden_resolver_loop(
-    config: Arc<chilli_core::Config>,
+    mut config_rx: watch::Receiver<Arc<chilli_core::Config>>,
     walled_garden_ips: Arc<Mutex<HashSet<Ipv4Addr>>>,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_secs(60));
     loop {
+        let config = config_rx.borrow().clone();
         info!("Resolving walled garden domains...");
         let mut new_ips = HashSet::new();
         for domain in &config.walled_garden {
@@ -341,24 +526,52 @@ async fn walled_garden_resolver_loop(
         let mut wg_ips = walled_garden_ips.lock().await;
         *wg_ips = new_ips;
         info!("Walled garden IPs updated: {:?}", wg_ips);
-        interval.tick().await;
+
+        let sleep_duration = Duration::from_secs(config.interval as u64);
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_duration) => {},
+            res = config_rx.changed() => {
+                if res.is_err() {
+                    info!("Config channel closed, ending walled garden resolver loop.");
+                    return;
+                }
+            }
+        }
     }
 }
 
 async fn interim_update_loop(
     radius_client: Arc<RadiusClient>,
     session_manager: Arc<SessionManager>,
-    config: Arc<chilli_core::Config>,
+    mut config_rx: watch::Receiver<Arc<chilli_core::Config>>,
     firewall: Arc<Firewall>,
 ) {
-    let interval_secs = config.interval as u64;
-    if interval_secs == 0 {
-        info!("Interim updates disabled.");
-        return;
-    }
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
     loop {
-        interval.tick().await;
+        let config = config_rx.borrow().clone();
+        let interval_secs = config.interval as u64;
+
+        if interval_secs > 0 {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {},
+                res = config_rx.changed() => {
+                    if res.is_err() {
+                        info!("Config channel closed, ending interim update loop.");
+                        return;
+                    }
+                    // Config changed, loop will restart and use new interval
+                    continue;
+                }
+            }
+        } else {
+            // Interval is 0, wait for config change
+            if config_rx.changed().await.is_err() {
+                info!("Config channel closed, ending interim update loop.");
+                return;
+            }
+            // Loop to get new config
+            continue;
+        }
+
         info!("Sending interim updates for all active sessions...");
         for session in session_manager.get_all_sessions().await {
             if session.state.authenticated {
@@ -390,7 +603,7 @@ async fn interim_update_loop(
 
                 if let Some(cause) = terminate_cause {
                     if let Some(ref condown) = config.condown {
-                        run_script(condown.clone(), &session).await;
+                        run_script(condown.clone(), &session, &config, Some(cause)).await;
                     }
                     if let Err(e) = radius_client
                         .send_acct_stop(&session, Some(cause))
@@ -442,7 +655,7 @@ async fn handle_pap_auth(
 
             if let Some(session) = session_manager.get_session(&req.ip).await {
                 if let Some(ref conup) = config.conup {
-                    run_script(conup.clone(), &session).await;
+                    run_script(conup.clone(), &session, &config, None).await;
                 }
                 if let Err(e) = firewall.add_authenticated_ip(req.ip) {
                     error!("Failed to add authenticated IP to firewall: {}", e);
@@ -521,7 +734,7 @@ async fn handle_eap_auth(
 
                 if let Some(session) = session_manager.get_session(&req.ip).await {
                     if let Some(ref conup) = config.conup {
-                        run_script(conup.clone(), &session).await;
+                        run_script(conup.clone(), &session, &config, None).await;
                     }
                     if let Err(e) = firewall.add_authenticated_ip(req.ip) {
                         error!("Failed to add authenticated IP to firewall: {}", e);
@@ -553,9 +766,10 @@ async fn auth_loop(
     radius_client: Arc<RadiusClient>,
     session_manager: Arc<SessionManager>,
     firewall: Arc<Firewall>,
-    config: Arc<chilli_core::Config>,
+    config_rx: watch::Receiver<Arc<chilli_core::Config>>,
 ) {
     while let Some(req) = rx.recv().await {
+        let config = config_rx.borrow().clone();
         match req.auth_type {
             AuthType::Pap => {
                 tokio::spawn(handle_pap_auth(
@@ -621,11 +835,12 @@ async fn leaky_bucket(session_manager: &Arc<SessionManager>, ip: &Ipv4Addr, is_u
 async fn packet_loop(
     iface: AsyncDevice,
     session_manager: Arc<SessionManager>,
-    config: Arc<chilli_core::Config>,
+    config_rx: watch::Receiver<Arc<chilli_core::Config>>,
     walled_garden_ips: Arc<Mutex<HashSet<Ipv4Addr>>>,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; 1504];
     loop {
+        let config = config_rx.borrow().clone();
         let n = iface.recv(&mut buf).await?;
         let packet_slice = &buf[..n];
 
@@ -729,9 +944,9 @@ async fn packet_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chilli_core::{AuthRequest, Config};
-    use chilli_net::eap::EapCode;
-    use chilli_net::radius::{RadiusAttributeValue, RadiusCode, RadiusPacket, RADIUS_AUTH_LEN};
+    use chilli_core::Config;
+    use chilli_net::eap::{EapCode, EapType};
+    use chilli_net::radius::{RadiusAttributeType, RadiusAttributeValue, RadiusCode, RadiusPacket};
     use std::net::Ipv4Addr;
     use tokio::net::UdpSocket;
     use tokio::sync::oneshot;
@@ -827,11 +1042,13 @@ mod tests {
         let secret = config.radiussecret.clone();
         let arc_config = Arc::new(config);
 
+        let (_config_tx, config_rx) = watch::channel(arc_config.clone());
+
         let mock_server_handle = tokio::spawn(mock_radius_server(server_socket, secret));
 
-        let radius_client = Arc::new(RadiusClient::new(arc_config.clone()).await.unwrap());
+        let radius_client = Arc::new(RadiusClient::new(config_rx).await.unwrap());
         let session_manager = Arc::new(SessionManager::new());
-        let firewall = Arc::new(Firewall::new((**radius_client.config()).clone()));
+        let firewall = Arc::new(Firewall::new(arc_config.as_ref().clone()));
 
         let (tx, rx) = oneshot::channel();
         let auth_request = chilli_core::AuthRequest {

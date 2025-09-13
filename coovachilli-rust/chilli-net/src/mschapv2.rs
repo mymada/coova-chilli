@@ -1,4 +1,4 @@
-use md4::{Md4, Digest};
+use md4::Md4;
 use des::Des;
 use des::cipher::{KeyInit, BlockEncrypt};
 use getrandom::getrandom;

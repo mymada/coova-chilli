@@ -281,6 +281,7 @@ dependencies = [
  "clap",
  "etherparse",
  "hex",
+ "libc",
  "md5",
  "serde_json",
  "tokio",
@@ -294,6 +295,7 @@ dependencies = [
 name = "chilli-core"
 version = "0.1.0"
 dependencies = [
+ "rand",
  "serde",
  "tokio",
  "toml",

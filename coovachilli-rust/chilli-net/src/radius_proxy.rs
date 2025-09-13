@@ -8,7 +8,7 @@ use crate::radius::{RadiusAttributeType, RadiusPacket, parse_attributes};
 use chilli_core::Config;
 use md5::{Digest, Md5};
 use std::collections::HashMap;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tracing::{error, warn};
 
 struct ProxyState {
@@ -19,7 +19,8 @@ struct ProxyState {
 
 #[derive(Clone)]
 pub struct ProxyManager {
-    config: Arc<Config>,
+    config: Arc<Mutex<Arc<Config>>>,
+    config_rx: watch::Receiver<Arc<Config>>,
     proxy_socket: Arc<UdpSocket>,
     upstream_socket: Arc<UdpSocket>,
     pending_requests: Arc<Mutex<HashMap<u8, ProxyState>>>,
@@ -27,11 +28,19 @@ pub struct ProxyManager {
 }
 
 impl ProxyManager {
-    pub async fn new(config: Arc<Config>, proxy_socket: Arc<UdpSocket>) -> Result<Self> {
+    pub async fn new(
+        config_rx: watch::Receiver<Arc<Config>>,
+        proxy_socket: Arc<UdpSocket>,
+    ) -> Result<Self> {
         let upstream_socket = UdpSocket::bind("0.0.0.0:0").await?;
-        info!("RADIUS proxy upstream client listening on {}", upstream_socket.local_addr()?);
+        info!(
+            "RADIUS proxy upstream client listening on {}",
+            upstream_socket.local_addr()?
+        );
+        let initial_config = config_rx.borrow().clone();
         Ok(Self {
-            config,
+            config: Arc::new(Mutex::new(initial_config)),
+            config_rx,
             proxy_socket,
             upstream_socket: Arc::new(upstream_socket),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
@@ -39,13 +48,28 @@ impl ProxyManager {
         })
     }
 
-    pub async fn run_request_listener(&self) {
+    pub async fn run_request_listener(&mut self) {
         let mut buf = [0u8; 4096];
         loop {
-            if let Ok((len, src)) = self.proxy_socket.recv_from(&mut buf).await {
-                let packet_bytes = buf[..len].to_vec();
-                if let Err(e) = self.handle_proxy_request(&packet_bytes, src).await {
-                    error!("Error handling proxy request: {}", e);
+            tokio::select! {
+                res = self.proxy_socket.recv_from(&mut buf) => {
+                    if let Ok((len, src)) = res {
+                        let packet_bytes = buf[..len].to_vec();
+                        if let Err(e) = self.handle_proxy_request(&packet_bytes, src).await {
+                            error!("Error handling proxy request: {}", e);
+                        }
+                    }
+                }
+                res = self.config_rx.changed() => {
+                     if res.is_ok() {
+                        let new_config = self.config_rx.borrow().clone();
+                        let mut config = self.config.lock().await;
+                        *config = new_config;
+                        info!("RADIUS proxy reloaded configuration.");
+                    } else {
+                        info!("Config channel closed, ending RADIUS proxy listener loop.");
+                        return;
+                    }
                 }
             }
         }
@@ -66,9 +90,10 @@ impl ProxyManager {
             }
         };
 
-        if let Some(proxy_secret) = &self.config.proxysecret {
+        let config = self.config.lock().await;
+        if let Some(_proxy_secret) = &config.proxysecret {
             let attributes = parse_attributes(&packet.payload);
-            if let Some(message_authenticator) =
+            if let Some(_message_authenticator) =
                 attributes.get_standard(RadiusAttributeType::MessageAuthenticator)
             {
                 // The Message-Authenticator attribute must be temporarily removed
@@ -101,7 +126,7 @@ impl ProxyManager {
 
         // TODO: Modify packet (add NAS-ID, Proxy-State)
 
-        let server_addr = format!("{}:{}", self.config.radiusserver1, self.config.radiusauthport);
+        let server_addr = format!("{}:{}", config.radiusserver1, config.radiusauthport);
         self.upstream_socket.send_to(&new_packet, server_addr).await?;
 
         info!("Forwarded proxy request from {} to upstream server", src);
@@ -119,12 +144,13 @@ impl ProxyManager {
                         let mut response_packet = buf[..len].to_vec();
                         response_packet[1] = state.original_id;
 
+                        let config = self.config.lock().await;
                         // Recalculate the response authenticator
                         let mut to_hash = Vec::new();
                         to_hash.extend_from_slice(&response_packet[0..4]);
                         to_hash.extend_from_slice(&state.original_authenticator);
                         to_hash.extend_from_slice(&response_packet[20..len]);
-                        if let Some(secret) = &self.config.proxysecret {
+                        if let Some(secret) = &config.proxysecret {
                             to_hash.extend_from_slice(secret.as_bytes());
                         } else {
                             warn!("Cannot forward proxy response: no proxysecret configured.");

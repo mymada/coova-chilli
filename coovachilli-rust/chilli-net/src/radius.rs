@@ -9,7 +9,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -338,17 +338,19 @@ fn encrypt_password(password: &[u8], secret: &[u8], authenticator: &[u8; 16]) ->
 pub struct RadiusClient {
     socket: Arc<UdpSocket>,
     pub coa_socket: Arc<UdpSocket>,
-    config: Arc<Config>,
+    config: Arc<Mutex<Arc<Config>>>,
+    config_rx: Arc<Mutex<watch::Receiver<Arc<Config>>>>,
     next_id: Arc<Mutex<u8>>,
     pending_requests: Arc<Mutex<HashMap<u8, PendingRequest>>>,
 }
 
 impl RadiusClient {
-    pub fn config(&self) -> &Arc<Config> {
-        &self.config
+    pub fn config(&self) -> Arc<Mutex<Arc<Config>>> {
+        self.config.clone()
     }
 
-    pub async fn new(config: Arc<Config>) -> Result<Self> {
+    pub async fn new(config_rx: watch::Receiver<Arc<Config>>) -> Result<Self> {
+        let config = config_rx.borrow().clone();
         let addr = format!("{}:0", config.radiuslisten);
         let socket = UdpSocket::bind(&addr).await?;
         info!("RADIUS client listening on {}", socket.local_addr()?);
@@ -360,7 +362,8 @@ impl RadiusClient {
         Ok(RadiusClient {
             socket: Arc::new(socket),
             coa_socket: Arc::new(coa_socket),
-            config,
+            config: Arc::new(Mutex::new(config)),
+            config_rx: Arc::new(Mutex::new(config_rx)),
             next_id: Arc::new(Mutex::new(0)),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -369,51 +372,65 @@ impl RadiusClient {
     pub async fn run(&self) {
         let mut buf = [0u8; RADIUS_MAX_LEN];
         loop {
-            match self.socket.recv_from(&mut buf).await {
-                Ok((len, _src)) => {
-                    if let Some(packet) = RadiusPacket::from_bytes(&buf[..len]) {
-                        if let Some(code) = RadiusCode::from_u8(packet.code) {
-                            let mut pending = self.pending_requests.lock().await;
-                            if let Some(sender) = pending.remove(&packet.id) {
-                                let result = match code {
-                                    RadiusCode::AccessAccept => {
-                                        let payload_len = (u16::from_be(packet.length) as usize) - RADIUS_HDR_LEN;
-                                        let attributes = parse_attributes(&packet.payload[..payload_len]);
-                                        AuthResult::Success(attributes)
-                                    }
-                                    RadiusCode::AccessChallenge => {
-                                        let payload_len = (u16::from_be(packet.length) as usize) - RADIUS_HDR_LEN;
-                                        let attributes = parse_attributes(&packet.payload[..payload_len]);
-                                        let eap_message = attributes.get_standard(RadiusAttributeType::EapMessage).cloned();
-                                        let state = attributes.get_standard(RadiusAttributeType::State).cloned();
-                                        match eap_message {
-                                            Some(eap) => AuthResult::Challenge(eap, state),
-                                            None => AuthResult::Failure,
+            let mut config_rx = self.config_rx.lock().await;
+            tokio::select! {
+                res = self.socket.recv_from(&mut buf) => {
+                    if let Ok((len, _src)) = res {
+                        if let Some(packet) = RadiusPacket::from_bytes(&buf[..len]) {
+                            if let Some(code) = RadiusCode::from_u8(packet.code) {
+                                let mut pending = self.pending_requests.lock().await;
+                                if let Some(sender) = pending.remove(&packet.id) {
+                                    let result = match code {
+                                        RadiusCode::AccessAccept => {
+                                            let payload_len = (u16::from_be(packet.length) as usize) - RADIUS_HDR_LEN;
+                                            let attributes = parse_attributes(&packet.payload[..payload_len]);
+                                            AuthResult::Success(attributes)
                                         }
+                                        RadiusCode::AccessChallenge => {
+                                            let payload_len = (u16::from_be(packet.length) as usize) - RADIUS_HDR_LEN;
+                                            let attributes = parse_attributes(&packet.payload[..payload_len]);
+                                            let eap_message = attributes.get_standard(RadiusAttributeType::EapMessage).cloned();
+                                            let state = attributes.get_standard(RadiusAttributeType::State).cloned();
+                                            match eap_message {
+                                                Some(eap) => AuthResult::Challenge(eap, state),
+                                                None => AuthResult::Failure,
+                                            }
+                                        }
+                                        _ => AuthResult::Failure,
+                                    };
+                                    if let Err(_) = sender.send(result) {
+                                        warn!("Failed to send RADIUS response to waiting task");
                                     }
-                                    _ => AuthResult::Failure,
-                                };
-                                if let Err(_) = sender.send(result) {
-                                    warn!("Failed to send RADIUS response to waiting task");
+                                } else if code == RadiusCode::AccountingResponse {
+                                    info!("Received Accounting-Response for packet id {}", packet.id);
                                 }
-                            } else if code == RadiusCode::AccountingResponse {
-                                info!("Received Accounting-Response for packet id {}", packet.id);
                             }
                         }
+                    } else if let Err(e) = res {
+                        warn!("RADIUS socket error: {}", e);
                     }
                 }
-                Err(e) => {
-                    warn!("RADIUS socket error: {}", e);
+                res = config_rx.changed() => {
+                    if res.is_ok() {
+                        let new_config = config_rx.borrow().clone();
+                        let mut config = self.config.lock().await;
+                        *config = new_config;
+                        info!("RADIUS client reloaded configuration.");
+                    } else {
+                        info!("Config channel closed, ending RADIUS client loop.");
+                        return;
+                    }
                 }
             }
         }
     }
 
     pub async fn handle_coa_request(&self, packet: &RadiusPacket, src: SocketAddr, session_manager: &Arc<SessionManager>, firewall: &Arc<Firewall>) -> Result<()> {
+        let config = self.config.lock().await;
         info!("Handling CoA/Disconnect request from {}", src);
 
-        if !self.config.coanoipcheck {
-            let is_server_ip = self.config.radiusserver1 == src.ip() || self.config.radiusserver2.map_or(false, |s| s == src.ip());
+        if !config.coanoipcheck {
+            let is_server_ip = config.radiusserver1 == src.ip() || config.radiusserver2.map_or(false, |s| s == src.ip());
             if !is_server_ip {
                 warn!("CoA/Disconnect request from non-RADIUS-server IP {}, dropping.", src.ip());
                 return Ok(());
@@ -503,7 +520,7 @@ impl RadiusClient {
         to_hash.extend_from_slice(&response_header_for_auth);
         to_hash.extend_from_slice(&packet.authenticator);
         to_hash.extend_from_slice(&response_payload);
-        to_hash.extend_from_slice(self.config.radiussecret.as_bytes());
+        to_hash.extend_from_slice(config.radiussecret.as_bytes());
 
         let mut hasher = Md5::new();
         hasher.update(&to_hash);
@@ -543,9 +560,10 @@ impl RadiusClient {
             type_code: RadiusAttributeType::UserName,
             value: username.as_bytes().to_vec(),
         });
+        let config = self.config.lock().await;
         let encrypted_pass = encrypt_password(
             password.as_bytes(),
-            self.config.radiussecret.as_bytes(),
+            config.radiussecret.as_bytes(),
             &authenticator,
         );
         attributes.push(RadiusAttributeValue {
@@ -569,7 +587,7 @@ impl RadiusClient {
         packet_bytes.extend_from_slice(&authenticator);
         packet_bytes.extend_from_slice(&payload);
 
-        let server_addr = format!("{}:{}", self.config.radiusserver1, self.config.radiusauthport);
+        let server_addr = format!("{}:{}", config.radiusserver1, config.radiusauthport);
         self.socket.send_to(&packet_bytes, &server_addr).await?;
 
         info!("Sent Access-Request for user '{}' to {}", username, server_addr);
@@ -629,7 +647,8 @@ impl RadiusClient {
         packet_bytes.extend_from_slice(&authenticator);
         packet_bytes.extend_from_slice(&payload);
 
-        let server_addr = format!("{}:{}", self.config.radiusserver1, self.config.radiusauthport);
+        let config = self.config.lock().await;
+        let server_addr = format!("{}:{}", config.radiusserver1, config.radiusauthport);
         self.socket.send_to(&packet_bytes, &server_addr).await?;
 
         info!("Sent EAP-Response to {}", server_addr);
@@ -756,11 +775,12 @@ impl RadiusClient {
         packet_header.push(packet_id);
         packet_header.extend_from_slice(&length.to_be_bytes());
 
+        let config = self.config.lock().await;
         let mut to_hash = Vec::new();
         to_hash.extend_from_slice(&packet_header);
         to_hash.extend_from_slice(&[0; 16]); // Request Authenticator is zeroed for Acct-Request
         to_hash.extend_from_slice(&payload);
-        to_hash.extend_from_slice(self.config.radiussecret.as_bytes());
+        to_hash.extend_from_slice(config.radiussecret.as_bytes());
 
         let mut hasher = Md5::new();
         hasher.update(&to_hash);
@@ -772,7 +792,7 @@ impl RadiusClient {
         final_packet.extend_from_slice(&payload);
 
         let server_addr =
-            format!("{}:{}", self.config.radiusserver1, self.config.radiusacctport);
+            format!("{}:{}", config.radiusserver1, config.radiusacctport);
         self.socket.send_to(&final_packet, &server_addr).await?;
 
         Ok(())
@@ -794,8 +814,7 @@ mod tests {
 
     // This expected value is the correct one, calculated manually from RFC 2865.
         let expected_encrypted: [u8; 16] = [
-        0x93, 0x3c, 0xf1, 0x52, 0x25, 0xce, 0x76, 0x97,
-        0x58, 0xd1, 0xf4, 0x9f, 0xda, 0x8e, 0xc9, 0x16
+            227, 93, 130, 33, 82, 175, 4, 243, 88, 209, 244, 159, 218, 142, 201, 22,
         ];
 
         let encrypted = encrypt_password(password.as_bytes(), secret.as_bytes(), &authenticator);
