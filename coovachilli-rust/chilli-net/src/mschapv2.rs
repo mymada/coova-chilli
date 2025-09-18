@@ -124,6 +124,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_nt_password_hash() {
+        let password = "password";
+        let expected_hash: [u8; 16] = [
+            0x88, 0x46, 0xf7, 0xea, 0xee, 0x8f, 0xb1, 0x17,
+            0xad, 0x06, 0xbd, 0xd8, 0x30, 0xb7, 0x58, 0x6c,
+        ];
+        let hash = nt_password_hash(password);
+        assert_eq!(hash, expected_hash);
+    }
+
+    #[test]
     fn test_des_encrypt() {
         // This test vector is generated from this implementation.
         // It should be verified against a known-good implementation.

@@ -1,5 +1,6 @@
 pub mod config;
 pub mod session;
+pub mod eapol_session;
 
 use std::net::Ipv4Addr;
 
@@ -12,6 +13,7 @@ use tokio::sync::oneshot;
 pub enum AuthType {
     Pap,
     Eap,
+    MsChapV1,
 }
 
 #[derive(Debug)]

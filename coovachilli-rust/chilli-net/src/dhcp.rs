@@ -1,13 +1,24 @@
 use anyhow::Result;
-use chilli_core::{AuthRequest, AuthType, Config, SessionManager};
+use chilli_core::{Config};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{watch};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
+
+/// Actions for the DHCP server to take.
+pub enum DhcpAction {
+    Offer(Vec<u8>),
+    Ack {
+        response: Vec<u8>,
+        client_ip: Ipv4Addr,
+        client_mac: [u8; 6],
+    },
+    Nak(Vec<u8>),
+    NoResponse,
+}
 
 /// DHCP Message Types (RFC 2132)
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -150,28 +161,33 @@ struct Lease {
     expires: SystemTime,
 }
 
+//
+// FIXME: Architectural Limitation for EAPOL/VLAN support
+//
+// This `DhcpServer` implementation uses a `UdpSocket` bound to the DHCP port.
+// This approach is not sufficient for handling protocols that operate at
+// Layer 2, such as EAPOL (802.1x) or for inspecting VLAN tags (802.1q).
+//
+// A future refactoring should replace the `UdpSocket` with a raw packet
+// capture mechanism (e.g., using the `pnet` crate) to receive full
+// Ethernet frames from the physical interface.
+//
+// See the FIXME comment in `chilli-bin/src/main.rs` for more details.
+//
+
 /// The DHCP server.
 pub struct DhcpServer {
-    socket: Arc<UdpSocket>,
     config: Arc<Mutex<Arc<Config>>>,
-    config_rx: Arc<Mutex<watch::Receiver<Arc<Config>>>>,
     ip_pool: Arc<Mutex<Vec<Ipv4Addr>>>,
     leases: Arc<Mutex<HashMap<[u8; 6], Lease>>>,
-    session_manager: Arc<SessionManager>,
-    auth_tx: mpsc::Sender<AuthRequest>,
 }
 
 impl DhcpServer {
     pub async fn new(
         config_rx: watch::Receiver<Arc<Config>>,
-        session_manager: Arc<SessionManager>,
-        auth_tx: mpsc::Sender<AuthRequest>,
     ) -> Result<Self> {
         let config = config_rx.borrow().clone();
-        let addr = format!("{}:67", config.dhcplisten);
-        let socket = UdpSocket::bind(&addr).await?;
-        socket.set_broadcast(true)?;
-        info!("DHCP server listening on {}", addr);
+        info!("DHCP server initialized");
 
         let mut ip_pool = Vec::new();
         let start_ip = u32::from(config.dhcpstart);
@@ -181,13 +197,9 @@ impl DhcpServer {
         }
 
         Ok(DhcpServer {
-            socket: Arc::new(socket),
             config: Arc::new(Mutex::new(config)),
-            config_rx: Arc::new(Mutex::new(config_rx)),
             ip_pool: Arc::new(Mutex::new(ip_pool)),
             leases: Arc::new(Mutex::new(HashMap::new())),
-            session_manager,
-            auth_tx,
         })
     }
 
@@ -210,64 +222,40 @@ impl DhcpServer {
         }
     }
 
-    pub async fn run(&self) -> Result<()> {
-        let mut buf = [0u8; 1500];
-        loop {
-            let mut config_rx = self.config_rx.lock().await;
-            tokio::select! {
-                res = self.socket.recv_from(&mut buf) => {
-                    match res {
-                        Ok((len, src)) => {
-                            if let Some(packet) = DhcpPacket::from_bytes(&buf[..len]) {
-                                if let Err(e) = self.handle_packet(packet, src).await {
-                                    error!("Error handling DHCP packet: {}", e);
-                                }
-                            } else {
-                                warn!("Received invalid DHCP packet from {}", src);
-                            }
-                        }
-                        Err(e) => {
-                            error!("DHCP socket recv error: {}", e);
-                        }
-                    }
-                }
-                res = config_rx.changed() => {
-                    if res.is_ok() {
-                        let new_config = config_rx.borrow().clone();
-                        let mut config = self.config.lock().await;
-                        *config = new_config;
-                        info!("DHCP server reloaded configuration.");
-                    } else {
-                        info!("Config channel closed, ending DHCP server loop.");
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    }
-
-    async fn handle_packet(&self, packet: &DhcpPacket, src: SocketAddr) -> Result<()> {
+    pub async fn handle_dhcp_packet(
+        &self,
+        packet: &DhcpPacket,
+        src: SocketAddr,
+        _vlan_id: Option<u16>,
+    ) -> Result<DhcpAction> {
         let msg_type = match packet.get_message_type() {
             Some(t) => t,
             None => {
                 warn!("Received DHCP packet with no message type from {}", src);
-                return Ok(());
+                return Ok(DhcpAction::NoResponse);
             }
         };
 
-        info!("Handling DHCP {:?} from MAC {}", msg_type, hex::encode(packet.get_mac()));
+        info!(
+            "Handling DHCP {:?} from MAC {}",
+            msg_type,
+            hex::encode(packet.get_mac())
+        );
 
         match msg_type {
             DhcpMessageType::Discover => self.handle_discover(packet).await,
             DhcpMessageType::Request => self.handle_request(packet).await,
             _ => {
                 warn!("Unhandled DHCP message type: {:?}", msg_type);
-                Ok(())
+                Ok(DhcpAction::NoResponse)
             }
         }
     }
 
-    async fn handle_discover(&self, req_packet: &DhcpPacket) -> Result<()> {
+    async fn handle_discover(
+        &self,
+        req_packet: &DhcpPacket,
+    ) -> Result<DhcpAction> {
         let mac = req_packet.get_mac();
         let leases = self.leases.lock().await;
         let mut pool = self.ip_pool.lock().await;
@@ -278,7 +266,7 @@ impl DhcpServer {
                 Some(ip) => ip,
                 None => {
                     error!("DHCP IP pool is empty!");
-                    return Ok(());
+                    return Ok(DhcpAction::NoResponse);
                 }
             },
         };
@@ -294,13 +282,13 @@ impl DhcpServer {
             ip_to_offer,
         );
 
-        self.socket
-            .send_to(&response, "255.255.255.255:68")
-            .await?;
-        Ok(())
+        Ok(DhcpAction::Offer(response))
     }
 
-    async fn handle_request(&self, req_packet: &DhcpPacket) -> Result<()> {
+    async fn handle_request(
+        &self,
+        req_packet: &DhcpPacket,
+    ) -> Result<DhcpAction> {
         let mac = req_packet.get_mac();
         let mac_str = hex::encode(mac);
         let mut leases = self.leases.lock().await;
@@ -328,8 +316,11 @@ impl DhcpServer {
                         config.dhcplisten,
                         client_ip,
                     );
-                    self.socket.send_to(&response, "255.255.255.255:68").await?;
-                    return Ok(());
+                    return Ok(DhcpAction::Ack {
+                        response,
+                        client_ip,
+                        client_mac: mac,
+                    });
                 }
             }
         }
@@ -347,15 +338,18 @@ impl DhcpServer {
 
         // Must be a request for our server
         if server_id_opt != Some(config.dhcplisten) {
-             warn!("DHCPREQUEST not for us (server_id: {:?})", server_id_opt);
-             return Ok(());
+            warn!(
+                "DHCPREQUEST not for us (server_id: {:?})",
+                server_id_opt
+            );
+            return Ok(DhcpAction::NoResponse);
         }
 
         let requested_ip = match requested_ip_opt {
             Some(ip) => ip,
             None => {
                 warn!("DHCPREQUEST from {} with no requested IP", &mac_str);
-                return Ok(());
+                return Ok(DhcpAction::NoResponse);
             }
         };
 
@@ -373,40 +367,6 @@ impl DhcpServer {
         };
         leases.insert(mac, lease.clone());
 
-        self.session_manager
-            .create_session(requested_ip, mac, &config)
-            .await;
-
-        if config.macauth {
-            if config.macallowed.contains(&mac_str) {
-                info!("MAC {} is in macallowed list, authenticating.", &mac_str);
-                self.session_manager.authenticate_session(&requested_ip).await;
-            } else {
-                let (tx, rx) = oneshot::channel();
-                let auth_req = AuthRequest {
-                    auth_type: AuthType::Pap,
-                    ip: requested_ip,
-                    username: mac_str.clone(),
-                    password: config.macpasswd.clone(),
-                    tx,
-                };
-
-                self.auth_tx.send(auth_req).await?;
-                match rx.await {
-                    Ok(true) => {
-                        info!("MAC authentication successful for {}", &mac_str);
-                    }
-                    _ => {
-                        info!("MAC authentication failed for {}", &mac_str);
-                        if config.macauthdeny {
-                            // Don't send ACK
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-        }
-
         let response = self.build_response(
             &config,
             req_packet,
@@ -415,10 +375,11 @@ impl DhcpServer {
             requested_ip,
         );
 
-        self.socket
-            .send_to(&response, "255.255.255.255:68")
-            .await?;
-        Ok(())
+        Ok(DhcpAction::Ack {
+            response,
+            client_ip: requested_ip,
+            client_mac: mac,
+        })
     }
 
     fn build_response(

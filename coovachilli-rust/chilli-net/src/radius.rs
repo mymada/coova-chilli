@@ -59,6 +59,7 @@ impl RadiusCode {
 pub enum RadiusAttributeType {
     UserName = 1,
     UserPassword = 2,
+    ChapPassword = 3,
     FramedIpAddress = 8,
     FilterId = 11,
     State = 24,
@@ -66,6 +67,9 @@ pub enum RadiusAttributeType {
     VendorSpecific = 26,
     SessionTimeout = 27,
     IdleTimeout = 28,
+    NasIdentifier = 32,
+    ProxyState = 33,
+    ChapChallenge = 60,
     EapMessage = 79,
     MessageAuthenticator = 80,
     AcctStatusType = 40,
@@ -86,6 +90,10 @@ pub enum RadiusAttributeType {
 pub const VENDOR_ID_WISPR: u32 = 14122;
 pub const WISPR_BANDWIDTH_MAX_UP: u8 = 7;
 pub const WISPR_BANDWIDTH_MAX_DOWN: u8 = 8;
+pub const VENDOR_ID_COOVA: u32 = 14559;
+pub const COOVA_MAX_INPUT_OCTETS: u8 = 1;
+pub const COOVA_MAX_OUTPUT_OCTETS: u8 = 2;
+pub const COOVA_MAX_TOTAL_OCTETS: u8 = 3;
 
 // Acct-Status-Type values
 pub const ACCT_STATUS_TYPE_START: u32 = 1;
@@ -97,6 +105,7 @@ pub const ACCT_TERMINATE_CAUSE_USER_REQUEST: u32 = 1;
 pub const ACCT_TERMINATE_CAUSE_IDLE_TIMEOUT: u32 = 4;
 pub const ACCT_TERMINATE_CAUSE_SESSION_TIMEOUT: u32 = 5;
 pub const ACCT_TERMINATE_CAUSE_ADMIN_RESET: u32 = 6;
+pub const ACCT_TERMINATE_CAUSE_QUOTA_EXCEEDED: u32 = 100;
 
 
 pub const RADIUS_HDR_LEN: usize = 20;
@@ -126,7 +135,7 @@ impl RadiusPacket {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RadiusAttributes {
     pub standard: HashMap<RadiusAttributeType, Vec<Vec<u8>>>,
     pub vsas: HashMap<(u32, u8), Vec<Vec<u8>>>,
@@ -235,6 +244,42 @@ pub async fn apply_radius_attributes(
                 .await;
         }
     }
+
+    if let Some(val) = attributes.get_vsa(VENDOR_ID_COOVA, COOVA_MAX_INPUT_OCTETS) {
+        if val.len() == 4 {
+            let octets = BigEndian::read_u32(val) as u64;
+            info!("CoovaChilli-Max-Input-Octets for {} is {}", ip, octets);
+            session_manager
+                .update_session(ip, |session| {
+                    session.params.maxinputoctets = octets;
+                })
+                .await;
+        }
+    }
+
+    if let Some(val) = attributes.get_vsa(VENDOR_ID_COOVA, COOVA_MAX_OUTPUT_OCTETS) {
+        if val.len() == 4 {
+            let octets = BigEndian::read_u32(val) as u64;
+            info!("CoovaChilli-Max-Output-Octets for {} is {}", ip, octets);
+            session_manager
+                .update_session(ip, |session| {
+                    session.params.maxoutputoctets = octets;
+                })
+                .await;
+        }
+    }
+
+    if let Some(val) = attributes.get_vsa(VENDOR_ID_COOVA, COOVA_MAX_TOTAL_OCTETS) {
+        if val.len() == 4 {
+            let octets = BigEndian::read_u32(val) as u64;
+            info!("CoovaChilli-Max-Total-Octets for {} is {}", ip, octets);
+            session_manager
+                .update_session(ip, |session| {
+                    session.params.maxtotaloctets = octets;
+                })
+                .await;
+        }
+    }
 }
 
 impl RadiusAttributes {
@@ -292,6 +337,31 @@ pub fn parse_attributes(payload: &[u8]) -> RadiusAttributes {
     attributes
 }
 
+pub fn serialize_attributes(attributes: &RadiusAttributes) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for (type_code, values) in &attributes.standard {
+        for value in values {
+            payload.push(*type_code as u8);
+            payload.push((value.len() + 2) as u8);
+            payload.extend_from_slice(value);
+        }
+    }
+    for ((vendor_id, vsa_type), values) in &attributes.vsas {
+        for value in values {
+            let mut vsa_payload = Vec::new();
+            vsa_payload.extend_from_slice(&vendor_id.to_be_bytes());
+            vsa_payload.push(*vsa_type);
+            vsa_payload.push((value.len() + 2) as u8);
+            vsa_payload.extend_from_slice(value);
+
+            payload.push(RadiusAttributeType::VendorSpecific as u8);
+            payload.push((vsa_payload.len() + 2) as u8);
+            payload.extend_from_slice(&vsa_payload);
+        }
+    }
+    payload
+}
+
 
 pub struct RadiusAttributeValue {
     pub type_code: RadiusAttributeType,
@@ -302,17 +372,24 @@ pub struct RadiusAttributeValue {
 pub enum AuthResult {
     Success(RadiusAttributes),
     Challenge(Vec<u8>, Option<Vec<u8>>), // EAP Message, State
+    ChapChallenge(Vec<u8>, Option<Vec<u8>>), // CHAP Challenge, State
     Failure,
 }
 
 type PendingRequest = oneshot::Sender<AuthResult>;
 
 fn encrypt_password(password: &[u8], secret: &[u8], authenticator: &[u8; 16]) -> Vec<u8> {
+    // Per RFC 2865, the password must be padded to a multiple of 16 octets.
     let mut padded_password = password.to_vec();
-    let len = password.len();
-    // Per RFC 2865, pad to a multiple of 16. If already a multiple, add a full 16-byte block.
-    let num_blocks = if len % 16 == 0 { len / 16 + 1 } else { len / 16 + 1 };
-    padded_password.resize(num_blocks * 16, 0);
+    if padded_password.len() % 16 != 0 {
+        let new_len = (padded_password.len() + 15) & !15;
+        padded_password.resize(new_len, 0);
+    }
+
+    // The first block is a special case. If the password is empty, it should be treated as a 16-byte zero block.
+    if padded_password.is_empty() {
+        padded_password.resize(16, 0);
+    }
 
     let mut encrypted_password = Vec::new();
     let mut last_block = authenticator.to_vec();
@@ -390,10 +467,14 @@ impl RadiusClient {
                                             let payload_len = (u16::from_be(packet.length) as usize) - RADIUS_HDR_LEN;
                                             let attributes = parse_attributes(&packet.payload[..payload_len]);
                                             let eap_message = attributes.get_standard(RadiusAttributeType::EapMessage).cloned();
+                                            let chap_challenge = attributes.get_standard(RadiusAttributeType::ChapChallenge).cloned();
                                             let state = attributes.get_standard(RadiusAttributeType::State).cloned();
-                                            match eap_message {
-                                                Some(eap) => AuthResult::Challenge(eap, state),
-                                                None => AuthResult::Failure,
+                                            if let Some(eap) = eap_message {
+                                                AuthResult::Challenge(eap, state)
+                                            } else if let Some(chap) = chap_challenge {
+                                                AuthResult::ChapChallenge(chap, state)
+                                            } else {
+                                                AuthResult::Failure
                                             }
                                         }
                                         _ => AuthResult::Failure,
@@ -660,6 +741,120 @@ impl RadiusClient {
         }
     }
 
+    pub async fn send_chap_access_request(&self, username: &str) -> Result<AuthResult> {
+        let packet_id = {
+            let mut id = self.next_id.lock().await;
+            let packet_id = *id;
+            *id = id.wrapping_add(1);
+            packet_id
+        };
+
+        let (tx, rx) = oneshot::channel();
+        self.pending_requests.lock().await.insert(packet_id, tx);
+
+        let mut authenticator = [0u8; RADIUS_AUTH_LEN];
+        getrandom::getrandom(&mut authenticator)
+            .map_err(|e| anyhow::anyhow!("getrandom failed: {}", e))?;
+
+        let mut attributes = Vec::new();
+        attributes.push(RadiusAttributeValue {
+            type_code: RadiusAttributeType::UserName,
+            value: username.as_bytes().to_vec(),
+        });
+
+        let mut payload = Vec::new();
+        for attr in attributes {
+            payload.push(attr.type_code as u8);
+            payload.push((attr.value.len() + 2) as u8);
+            payload.extend_from_slice(&attr.value);
+        }
+
+        let length = (RADIUS_HDR_LEN + payload.len()) as u16;
+
+        let mut packet_bytes = Vec::with_capacity(length as usize);
+        packet_bytes.push(RadiusCode::AccessRequest as u8);
+        packet_bytes.push(packet_id);
+        packet_bytes.extend_from_slice(&length.to_be_bytes());
+        packet_bytes.extend_from_slice(&authenticator);
+        packet_bytes.extend_from_slice(&payload);
+
+        let config = self.config.lock().await;
+        let server_addr = format!("{}:{}", config.radiusserver1, config.radiusauthport);
+        self.socket.send_to(&packet_bytes, &server_addr).await?;
+
+        info!("Sent CHAP Access-Request for user '{}' to {}", username, server_addr);
+
+        match tokio::time::timeout(Duration::from_secs(5), rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => Err(anyhow!("RADIUS request channel closed unexpectedly")),
+            Err(_) => Err(anyhow!("RADIUS request timed out")),
+        }
+    }
+
+    pub async fn send_chap_response(
+        &self,
+        identifier: u8,
+        response: &[u8; 24],
+        state: Option<&[u8]>,
+    ) -> Result<AuthResult> {
+        let packet_id = {
+            let mut id = self.next_id.lock().await;
+            let packet_id = *id;
+            *id = id.wrapping_add(1);
+            packet_id
+        };
+
+        let (tx, rx) = oneshot::channel();
+        self.pending_requests.lock().await.insert(packet_id, tx);
+
+        let mut authenticator = [0u8; RADIUS_AUTH_LEN];
+        getrandom::getrandom(&mut authenticator)
+            .map_err(|e| anyhow::anyhow!("getrandom failed: {}", e))?;
+
+        let mut chap_password = vec![identifier];
+        chap_password.extend_from_slice(response);
+
+        let mut attributes = Vec::new();
+        attributes.push(RadiusAttributeValue {
+            type_code: RadiusAttributeType::ChapPassword,
+            value: chap_password,
+        });
+        if let Some(s) = state {
+            attributes.push(RadiusAttributeValue {
+                type_code: RadiusAttributeType::State,
+                value: s.to_vec(),
+            });
+        }
+
+        let mut payload = Vec::new();
+        for attr in attributes {
+            payload.push(attr.type_code as u8);
+            payload.push((attr.value.len() + 2) as u8);
+            payload.extend_from_slice(&attr.value);
+        }
+
+        let length = (RADIUS_HDR_LEN + payload.len()) as u16;
+
+        let mut packet_bytes = Vec::with_capacity(length as usize);
+        packet_bytes.push(RadiusCode::AccessRequest as u8);
+        packet_bytes.push(packet_id);
+        packet_bytes.extend_from_slice(&length.to_be_bytes());
+        packet_bytes.extend_from_slice(&authenticator);
+        packet_bytes.extend_from_slice(&payload);
+
+        let config = self.config.lock().await;
+        let server_addr = format!("{}:{}", config.radiusserver1, config.radiusauthport);
+        self.socket.send_to(&packet_bytes, &server_addr).await?;
+
+        info!("Sent CHAP-Response to {}", server_addr);
+
+        match tokio::time::timeout(Duration::from_secs(5), rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => Err(anyhow!("RADIUS request channel closed unexpectedly")),
+            Err(_) => Err(anyhow!("RADIUS request timed out")),
+        }
+    }
+
     pub async fn send_acct_start(&self, session: &chilli_core::Session) -> Result<()> {
         self.send_acct_packet(session, ACCT_STATUS_TYPE_START, None)
             .await
@@ -818,18 +1013,6 @@ mod tests {
         ];
 
         let encrypted = encrypt_password(password.as_bytes(), secret.as_bytes(), &authenticator);
-
-    // KNOWN BUG: The function is returning the raw MD5 hash instead of the XOR'd result.
-    // This implies the `padded_password` chunk is being treated as all-zeros during the XOR.
-    // The reason is unknown and could not be diagnosed. This assertion documents the
-    // buggy behavior to prevent silent failures if it changes.
-    let md5_hash: [u8; 16] = [
-        0xe3, 0x5d, 0x82, 0x21, 0x52, 0xaf, 0x04, 0xf3,
-        0x58, 0xd1, 0xf4, 0x9f, 0xda, 0x8e, 0xc9, 0x16
-    ];
-    if encrypted == md5_hash {
-        eprintln!("\n\nKNOWN BUG: `encrypt_password` returned raw MD5 hash. The password chunk was likely zeroed. Investigation required.\n\n");
-    }
 
         assert_eq!(encrypted, expected_encrypted);
     }
