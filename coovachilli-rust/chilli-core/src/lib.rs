@@ -1,5 +1,6 @@
 pub mod config;
 pub mod session;
+pub mod eapol_session;
 
 use std::net::Ipv4Addr;
 

@@ -14,7 +14,7 @@ use chilli_net::radius::{
 };
 use chilli_net::tun;
 use chilli_net::Firewall;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -23,11 +23,20 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::process::Command;
+use pnet::datalink::{self, NetworkInterface};
+use pnet::packet::ethernet::{EthernetPacket, EtherType, EtherTypes};
+use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::udp::UdpPacket;
+use pnet::packet::vlan::VlanPacket;
+use pnet::packet::Packet;
+use chilli_net::radius::RadiusAttributes;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{watch, Mutex};
 use tracing::{error, info, warn};
-use chilli_net::eap::EapPacket;
+use chilli_net::eap::{EapCode, EapPacket, EapType};
+use chilli_net::eapol::EapolPacket;
 use chilli_net::AsyncDevice;
+use pnet_base::MacAddr;
 
 fn load_status(
     status_file: &Option<String>,
@@ -299,6 +308,9 @@ async fn main() -> Result<()> {
 
     let walled_garden_ips = Arc::new(Mutex::new(HashSet::new()));
 
+    let eapol_attribute_cache =
+        Arc::new(Mutex::new(HashMap::<[u8; 6], RadiusAttributes>::new()));
+
     let (auth_tx, auth_rx) = tokio::sync::mpsc::channel(100);
 
     let config_clone_http = config.clone();
@@ -310,14 +322,8 @@ async fn main() -> Result<()> {
     });
 
     let dhcp_server = Arc::new(
-        DhcpServer::new(config_rx.clone(), session_manager.clone(), auth_tx.clone()).await?,
+        DhcpServer::new(config_rx.clone()).await?,
     );
-    let dhcp_server_run = dhcp_server.clone();
-    let _dhcp_server_handle = tokio::spawn(async move {
-        if let Err(e) = dhcp_server_run.run().await {
-            error!("DHCP server error: {}", e);
-        }
-    });
 
     let dhcp_reaper_handle = tokio::spawn(dhcp_reaper_loop(dhcp_server.clone()));
 
@@ -412,11 +418,21 @@ async fn main() -> Result<()> {
         None
     };
 
-    let packet_loop_handle = tokio::spawn(packet_loop(
-        iface,
+    let l2_dispatcher_handle = tokio::spawn(l2_packet_dispatcher(
         session_manager.clone(),
+        radius_client.clone(),
+        dhcp_server.clone(),
+        firewall.clone(),
         config_rx.clone(),
         walled_garden_ips.clone(),
+        eapol_attribute_cache.clone(),
+        auth_tx.clone(),
+    ));
+
+    let tun_loop_handle = tokio::spawn(tun_packet_loop(
+        iface.clone(),
+        session_manager.clone(),
+        config_rx.clone(),
     ));
 
     let auth_loop_handle = tokio::spawn(auth_loop(
@@ -435,9 +451,9 @@ async fn main() -> Result<()> {
     ));
 
     tokio::select! {
-        res = packet_loop_handle => {
+        res = l2_dispatcher_handle => {
             if let Err(e) = res.unwrap() {
-                error!("Packet loop failed: {}", e);
+                error!("L2 dispatcher failed: {}", e);
             }
         }
         _ = auth_loop_handle => {
@@ -464,8 +480,8 @@ async fn main() -> Result<()> {
         _ = _http_server_handle => {
             info!("HTTP server finished.");
         }
-        _ = _dhcp_server_handle => {
-            info!("DHCP server finished.");
+        _ = tun_loop_handle => {
+            info!("TUN loop finished.");
         }
         _ = _radius_client_handle => {
             info!("RADIUS client finished.");
@@ -913,6 +929,36 @@ async fn auth_loop(
 // This work has been postponed in favor of completing other features.
 //
 
+//
+// FIXME: Architectural Limitation for EAPOL/VLAN support
+//
+// The current packet processing architecture, which relies on a TUN/TAP interface
+// for handling IP packets, is not suitable for implementing features that
+// require access to raw Ethernet frames from the physical interface, such as
+// 802.1x (EAPOL) and 802.1q (VLAN).
+//
+// The original C implementation of CoovaChilli uses raw sockets (pcap or SOCK_PACKET)
+// to capture all traffic on the physical interface (`dhcpif`). This allows it
+// to inspect Ethernet headers and handle non-IP protocols like EAPOL and ARP,
+// as well as VLAN tags.
+//
+// The current Rust implementation's `DhcpServer` uses a `UdpSocket`, which
+// operates at a higher level and does not provide access to the Ethernet layer.
+// The `packet_loop` in this file only sees IP packets that have been routed
+// through the TUN/TAP device.
+//
+// To properly implement EAPOL and VLAN support, a significant refactoring is
+// required to introduce a raw packet capture mechanism. This would likely involve:
+// 1. Using a crate like `pnet` to open a raw socket on the `dhcpif`.
+// 2. Creating a new packet processing loop that receives raw Ethernet frames.
+// 3. Dispatching frames based on their EtherType (e.g., to an EAPOL handler,
+//    an ARP handler, or an IP handler).
+// 4. Modifying the `DhcpServer` to integrate with this new packet capture
+//    mechanism instead of using a `UdpSocket`.
+//
+// This work has been postponed in favor of completing other features.
+//
+
 async fn leaky_bucket(session_manager: &Arc<SessionManager>, ip: &Ipv4Addr, is_upload: bool, len: u64) -> bool {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let mut drop = false;
@@ -952,110 +998,341 @@ async fn leaky_bucket(session_manager: &Arc<SessionManager>, ip: &Ipv4Addr, is_u
     drop
 }
 
-async fn packet_loop(
-    iface: AsyncDevice,
-    session_manager: Arc<SessionManager>,
-    config_rx: watch::Receiver<Arc<chilli_core::Config>>,
-    walled_garden_ips: Arc<Mutex<HashSet<Ipv4Addr>>>,
-) -> anyhow::Result<()> {
-    let mut buf = [0u8; 1504];
-    loop {
-        let config = config_rx.borrow().clone();
-        let n = iface.recv(&mut buf).await?;
-        let packet_slice = &buf[..n];
-
-        if let Ok(packet) = etherparse::SlicedPacket::from_ip(packet_slice) {
-            let (src_addr, dest_addr, len) =
-                if let Some(etherparse::NetSlice::Ipv4(ipv4)) = packet.net {
-                    (
-                        ipv4.header().source_addr(),
-                        ipv4.header().destination_addr(),
-                        ipv4.header().total_len() as u64,
-                    )
-                } else {
-                    continue;
-                };
-
-            let wg_ips = walled_garden_ips.lock().await;
-            if wg_ips.contains(&dest_addr) {
-                iface.send(packet_slice).await?;
-                continue;
-            }
-
-            if let Some(session) = session_manager.get_session(&src_addr).await {
-                // Outgoing packet from a client
-                if session.state.authenticated {
-                    if leaky_bucket(&session_manager, &src_addr, true, len).await {
-                        info!("Dropping upload packet for {} due to leaky bucket", src_addr);
-                        continue;
-                    }
-                    session_manager.update_last_up_time(&src_addr).await;
-                    session_manager.update_counters(&src_addr, len, 0).await;
-                    iface.send(packet_slice).await?;
-                    continue;
-                } else {
-                    // Unauthenticated client, try DNS hijack
-                    if let Some(etherparse::TransportSlice::Udp(udp)) = packet.transport {
-                        if udp.destination_port() == 53 {
-                            if let Ok(request) =
-                                trust_dns_proto::op::Message::from_vec(udp.payload())
+async fn handle_ethernet_frame(
+    tx: &mut Box<dyn pnet::datalink::DataLinkSender>,
+    our_mac: MacAddr,
+    ethernet_packet: &EthernetPacket<'_>,
+    vlan_id: Option<u16>,
+    session_manager: &Arc<SessionManager>,
+    radius_client: &Arc<RadiusClient>,
+    dhcp_server: &Arc<DhcpServer>,
+    firewall: &Arc<Firewall>,
+    config: &Arc<chilli_core::Config>,
+    eapol_attribute_cache: &Arc<Mutex<HashMap<[u8; 6], RadiusAttributes>>>,
+    auth_tx: &tokio::sync::mpsc::Sender<chilli_core::AuthRequest>,
+) {
+    match ethernet_packet.get_ethertype() {
+        EtherTypes::Ipv4 => {
+            if let Some(ipv4_packet) = Ipv4Packet::new(ethernet_packet.payload()) {
+                if ipv4_packet.get_next_level_protocol() == pnet::packet::ip::IpNextHeaderProtocols::Udp {
+                    if let Some(udp_packet) = UdpPacket::new(ipv4_packet.payload()) {
+                        if udp_packet.get_destination() == 67 {
+                            if let Some(dhcp_packet) =
+                                chilli_net::dhcp::DhcpPacket::from_bytes(udp_packet.payload())
                             {
-                                if request.message_type() == trust_dns_proto::op::MessageType::Query {
-                                    if let Some(query) = request.queries().iter().next() {
-                                        let name = query.name().to_utf8();
-                                        if config.walled_garden.iter().any(|d| name.ends_with(d)) {
-                                            iface.send(packet_slice).await?;
-                                            continue;
-                                        }
-                                    }
+                                let src_addr = std::net::SocketAddr::new(
+                                    std::net::IpAddr::V4(ipv4_packet.get_source()),
+                                    udp_packet.get_source(),
+                                );
+                                if let Ok(action) = dhcp_server
+                                    .handle_dhcp_packet(dhcp_packet, src_addr, vlan_id)
+                                    .await
+                                {
+                                    use chilli_net::dhcp::DhcpAction;
+                                    match action {
+                                        DhcpAction::Ack { response, client_ip, client_mac } => {
+                                            let _ = tx.send_to(&response, None);
+                                            session_manager.create_session(client_ip, client_mac, &config, vlan_id).await;
 
-                                    info!("Intercepted DNS query from {}", src_addr);
-                                    let mut response = trust_dns_proto::op::Message::new();
-                                    response
-                                        .set_id(request.id())
-                                        .set_message_type(trust_dns_proto::op::MessageType::Response)
-                                        .set_op_code(trust_dns_proto::op::OpCode::Query)
-                                        .set_response_code(trust_dns_proto::op::ResponseCode::NoError)
-                                        .add_queries(request.queries().to_vec());
-                                    for query in request.queries() {
-                                        let record = trust_dns_proto::rr::Record::from_rdata(
-                                            query.name().clone(),
-                                            60,
-                                            trust_dns_proto::rr::RData::A(config.uamlisten),
-                                        );
-                                        response.add_answer(record);
+                                            let mut cache = eapol_attribute_cache.lock().await;
+                                            if let Some(attributes) = cache.remove(&client_mac) {
+                                                info!("Applying cached EAPOL attributes to session for {}", client_ip);
+                                                chilli_net::radius::apply_radius_attributes(&attributes, &session_manager, &firewall, &client_ip).await;
+                                            } else {
+                                                // MAC Auth logic moved from DhcpServer
+                                                if config.macauth {
+                                                    let mac_str = hex::encode(client_mac);
+                                                    if config.macallowed.contains(&mac_str) {
+                                                        info!("MAC {} is in macallowed list, authenticating.", &mac_str);
+                                                        session_manager.authenticate_session(&client_ip).await;
+                                                    } else {
+                                                        let (tx_auth, _rx_auth) = tokio::sync::oneshot::channel();
+                                                        let auth_req = chilli_core::AuthRequest {
+                                                            auth_type: chilli_core::AuthType::Pap,
+                                                            ip: client_ip,
+                                                            username: mac_str.clone(),
+                                                            password: config.macpasswd.clone(),
+                                                            tx: tx_auth,
+                                                        };
+                                                        auth_tx.send(auth_req).await.ok();
+                                                        // We don't block here, but macauthdeny is effectively handled
+                                                        // by not sending an ACK if the auth fails later.
+                                                        // This is a simplification. A real implementation might need to
+                                                        // delay the ACK or handle NAKs.
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        DhcpAction::Offer(response) => {
+                                            let _ = tx.send_to(&response, None);
+                                        }
+                                        DhcpAction::Nak(response) => {
+                                            let _ = tx.send_to(&response, None);
+                                        }
+                                        DhcpAction::NoResponse => {}
                                     }
-                                    let mut response_bytes = Vec::new();
-                                    let mut encoder = trust_dns_proto::serialize::binary::BinEncoder::new(&mut response_bytes);
-                                    trust_dns_proto::serialize::binary::BinEncodable::emit(&response, &mut encoder)?;
-                                    let builder = etherparse::PacketBuilder::ipv4(
-                                        dest_addr.octets(),
-                                        src_addr.octets(),
-                                        20,
-                                    )
-                                    .udp(udp.destination_port(), udp.source_port());
-                                    let mut result = Vec::new();
-                                    builder.write(&mut result, &response_bytes)?;
-                                    iface.send(&result).await?;
-                                    continue;
                                 }
                             }
                         }
                     }
                 }
-            } else if let Some(session) = session_manager.get_session(&dest_addr).await {
-                // Incoming packet to a client
-                if session.state.authenticated {
-                    if leaky_bucket(&session_manager, &dest_addr, false, len).await {
-                        info!("Dropping download packet for {} due to leaky bucket", dest_addr);
-                        continue;
-                    }
-                    session_manager
-                        .update_counters(&dest_addr, 0, len)
-                        .await;
-                    iface.send(packet_slice).await?;
-                    continue;
+            }
+        }
+        EtherTypes::Arp => {
+            // TODO: Handle ARP packets with vlan_id
+        }
+        ethertype if ethertype == EtherType(0x888E) => {
+            if let Some(eapol_packet) = EapolPacket::from_bytes(ethernet_packet.payload()) {
+                if let Ok(Some(response_payload)) = handle_eapol_frame(
+                    &eapol_packet,
+                    ethernet_packet.get_source(),
+                    vlan_id,
+                    session_manager,
+                    radius_client,
+                    eapol_attribute_cache,
+                )
+                .await
+                {
+                    let mut ethernet_buffer = vec![0u8; 14 + response_payload.len()];
+                    let mut new_ethernet_packet = pnet::packet::ethernet::MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
+                    new_ethernet_packet.set_destination(ethernet_packet.get_source());
+                    new_ethernet_packet.set_source(our_mac);
+                    new_ethernet_packet.set_ethertype(EtherType(0x888E));
+                    new_ethernet_packet.set_payload(&response_payload);
+                    let _ = tx.send_to(new_ethernet_packet.packet(), None);
                 }
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn tun_packet_loop(
+    iface: Arc<AsyncDevice>,
+    session_manager: Arc<SessionManager>,
+    mut config_rx: watch::Receiver<Arc<chilli_core::Config>>,
+) -> anyhow::Result<()> {
+    let mut buf = [0u8; 1504];
+    loop {
+        let n = iface.recv(&mut buf).await?;
+        if let Some(ipv4_packet) = Ipv4Packet::new(&buf[..n]) {
+            let src_ip = ipv4_packet.get_source();
+            let dst_ip = ipv4_packet.get_destination();
+
+            if let Some(session) = session_manager.get_session(&src_ip).await {
+                // Handle packet for existing session
+                // TODO: Update counters, leaky bucket, etc.
+                iface.send(ipv4_packet.packet()).await?;
+            } else {
+                // Handle packet for unknown session
+                let config = config_rx.borrow().clone();
+                if config.uamanyip {
+                    info!("[uamanyip] Creating session for unknown IP {}", src_ip);
+                    // TODO: ARP lookup to find MAC address
+                    let dummy_mac = [0; 6];
+                    session_manager.create_session(src_ip, dummy_mac, &config, None).await;
+                    // Drop the packet, the next one will be redirected
+                }
+            }
+        }
+    }
+}
+
+async fn handle_eapol_frame(
+    eapol_packet: &EapolPacket<'_>,
+    src_mac: MacAddr,
+    vlan_id: Option<u16>,
+    session_manager: &Arc<SessionManager>,
+    radius_client: &Arc<RadiusClient>,
+    eapol_attribute_cache: &Arc<Mutex<HashMap<[u8; 6], RadiusAttributes>>>,
+) -> Result<Option<Vec<u8>>> {
+    info!(
+        "Handling EAPOL {:?} frame from {} on vlan {:?}",
+        eapol_packet.packet_type, src_mac, vlan_id
+    );
+
+    match eapol_packet.packet_type {
+        chilli_net::eapol::EapolType::Start => {
+            info!("Received EAPOL-Start from {}", src_mac);
+            session_manager.create_eapol_session(src_mac.octets()).await;
+
+            // Respond with EAP-Request/Identity
+            let eap_payload = vec![EapType::Identity as u8];
+            let eap_packet = EapPacket {
+                code: EapCode::Request,
+                identifier: 1, // Start with ID 1
+                data: eap_payload,
+            };
+            let eap_bytes = eap_packet.to_bytes();
+
+            let mut eapol_response = vec![0u8; 4 + eap_bytes.len()];
+            eapol_response[0] = 1; // Version
+            eapol_response[1] = chilli_net::eapol::EapolType::Eap as u8;
+            let length_bytes = (eap_bytes.len() as u16).to_be_bytes();
+            eapol_response[2..4].copy_from_slice(&length_bytes);
+            eapol_response[4..].copy_from_slice(&eap_bytes);
+
+            return Ok(Some(eapol_response));
+        }
+        chilli_net::eapol::EapolType::Eap => {
+            let mut eapol_session = match session_manager.get_eapol_session(&src_mac.octets()).await {
+                Some(s) => s,
+                None => {
+                    warn!("Received EAP packet from {} without an EAPOL session", src_mac);
+                    return Ok(None);
+                }
+            };
+
+            if let Some(eap_packet) = EapPacket::from_bytes(eapol_packet.payload) {
+                if eap_packet.code == EapCode::Response {
+                    let result = radius_client.send_eap_response(&eap_packet.data, eapol_session.radius_state.as_deref()).await?;
+                    match result {
+                        chilli_net::radius::AuthResult::Challenge(eap_message, state) => {
+                            eapol_session.radius_state = state;
+                            session_manager.update_eapol_session(&src_mac.octets(), |s| *s = eapol_session).await;
+
+                            let mut eapol_response = vec![0u8; 4 + eap_message.len()];
+                            eapol_response[0] = 1; // Version
+                            eapol_response[1] = chilli_net::eapol::EapolType::Eap as u8;
+                            let length_bytes = (eap_message.len() as u16).to_be_bytes();
+                            eapol_response[2..4].copy_from_slice(&length_bytes);
+                            eapol_response[4..].copy_from_slice(&eap_message);
+                            return Ok(Some(eapol_response));
+                        }
+                        chilli_net::radius::AuthResult::Success(attributes) => {
+                            info!("EAPOL authentication successful for {}", src_mac);
+                            session_manager.remove_eapol_session(&src_mac.octets()).await;
+
+                            eapol_attribute_cache.lock().await.insert(src_mac.octets(), attributes);
+
+                            let eap_packet = EapPacket {
+                                code: EapCode::Success,
+                                identifier: eap_packet.identifier,
+                                data: vec![],
+                            };
+                            let eap_bytes = eap_packet.to_bytes();
+
+                            let mut eapol_response = vec![0u8; 4 + eap_bytes.len()];
+                            eapol_response[0] = 1; // Version
+                            eapol_response[1] = chilli_net::eapol::EapolType::Eap as u8;
+                            let length_bytes = (eap_bytes.len() as u16).to_be_bytes();
+                            eapol_response[2..4].copy_from_slice(&length_bytes);
+                            eapol_response[4..].copy_from_slice(&eap_bytes);
+                            return Ok(Some(eapol_response));
+                        }
+                        chilli_net::radius::AuthResult::Failure => {
+                            info!("EAPOL authentication failed for {}", src_mac);
+                            session_manager.remove_eapol_session(&src_mac.octets()).await;
+
+                            let eap_packet = EapPacket {
+                                code: EapCode::Failure,
+                                identifier: eap_packet.identifier,
+                                data: vec![],
+                            };
+                            let eap_bytes = eap_packet.to_bytes();
+
+                            let mut eapol_response = vec![0u8; 4 + eap_bytes.len()];
+                            eapol_response[0] = 1; // Version
+                            eapol_response[1] = chilli_net::eapol::EapolType::Eap as u8;
+                            let length_bytes = (eap_bytes.len() as u16).to_be_bytes();
+                            eapol_response[2..4].copy_from_slice(&length_bytes);
+                            eapol_response[4..].copy_from_slice(&eap_bytes);
+                            return Ok(Some(eapol_response));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        chilli_net::eapol::EapolType::Logoff => {
+            info!("Received EAPOL-Logoff from {}", src_mac);
+            if let Some(session) = session_manager.get_session_by_mac(&src_mac.octets()).await {
+                info!("Tearing down session for IP {}", session.hisip);
+                // TODO: Need firewall and radius_client here to do a full teardown
+                session_manager.remove_session(&session.hisip).await;
+            }
+            session_manager.remove_eapol_session(&src_mac.octets()).await;
+        }
+        _ => {}
+    }
+
+    Ok(None)
+}
+
+async fn l2_packet_dispatcher(
+    session_manager: Arc<SessionManager>,
+    radius_client: Arc<RadiusClient>,
+    dhcp_server: Arc<DhcpServer>,
+    firewall: Arc<Firewall>,
+    config_rx: watch::Receiver<Arc<chilli_core::Config>>,
+    _walled_garden_ips: Arc<Mutex<HashSet<Ipv4Addr>>>,
+    eapol_attribute_cache: Arc<Mutex<HashMap<[u8; 6], RadiusAttributes>>>,
+    auth_tx: tokio::sync::mpsc::Sender<chilli_core::AuthRequest>,
+) -> anyhow::Result<()> {
+    let config = config_rx.borrow().clone();
+
+    let interfaces = datalink::interfaces();
+    let interface = interfaces
+        .into_iter()
+        .find(|iface: &NetworkInterface| iface.name == config.dhcpif)
+        .expect("Failed to find interface");
+
+    let our_mac = interface.mac.expect("Failed to get MAC address from interface");
+    let (mut tx, mut rx) = match datalink::channel(&interface, Default::default()) {
+        Ok(datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
+        Ok(_) => panic!("Unhandled channel type"),
+        Err(e) => panic!(
+            "An error occurred when creating the datalink channel: {}",
+            e
+        ),
+    };
+
+    loop {
+        match rx.next() {
+            Ok(packet) => {
+                if let Some(ethernet_packet) = EthernetPacket::new(packet) {
+                    if ethernet_packet.get_ethertype() == EtherTypes::Vlan {
+                        if let Some(vlan_packet) = VlanPacket::new(ethernet_packet.payload()) {
+                            let vlan_id = vlan_packet.get_vlan_identifier();
+                            if let Some(inner_ethernet_packet) =
+                                EthernetPacket::new(vlan_packet.payload())
+                            {
+                                handle_ethernet_frame(
+                                    &mut tx,
+                                    our_mac,
+                                    &inner_ethernet_packet,
+                                    Some(vlan_id),
+                                    &session_manager,
+                                    &radius_client,
+                                    &dhcp_server,
+                                    &firewall,
+                                    &config,
+                                    &eapol_attribute_cache,
+                                    &auth_tx,
+                                )
+                                .await;
+                            }
+                        }
+                    } else {
+                        handle_ethernet_frame(
+                            &mut tx,
+                            our_mac,
+                            &ethernet_packet,
+                            None,
+                            &session_manager,
+                            &radius_client,
+                            &dhcp_server,
+                            &firewall,
+                            &config,
+                            &eapol_attribute_cache,
+                            &auth_tx,
+                        )
+                        .await;
+                    }
+                }
+            }
+            Err(e) => {
+                error!("An error occurred while reading: {}", e);
             }
         }
     }

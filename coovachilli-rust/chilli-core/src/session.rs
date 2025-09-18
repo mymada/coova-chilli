@@ -1,3 +1,4 @@
+use crate::eapol_session::EapolSession;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -154,13 +155,43 @@ pub type Session = Connection;
 
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<Ipv4Addr, Connection>>>,
+    eapol_sessions: Arc<Mutex<HashMap<[u8; 6], EapolSession>>>,
 }
 
 impl SessionManager {
     pub fn new() -> Self {
         SessionManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            eapol_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub async fn create_eapol_session(&self, mac: [u8; 6]) {
+        let mut eapol_sessions = self.eapol_sessions.lock().await;
+        if !eapol_sessions.contains_key(&mac) {
+            let session = EapolSession::new(mac);
+            eapol_sessions.insert(mac, session);
+        }
+    }
+
+    pub async fn get_eapol_session(&self, mac: &[u8; 6]) -> Option<EapolSession> {
+        let eapol_sessions = self.eapol_sessions.lock().await;
+        eapol_sessions.get(mac).cloned()
+    }
+
+    pub async fn update_eapol_session<F>(&self, mac: &[u8; 6], update_fn: F)
+    where
+        F: FnOnce(&mut EapolSession),
+    {
+        let mut eapol_sessions = self.eapol_sessions.lock().await;
+        if let Some(session) = eapol_sessions.get_mut(mac) {
+            update_fn(session);
+        }
+    }
+
+    pub async fn remove_eapol_session(&self, mac: &[u8; 6]) -> Option<EapolSession> {
+        let mut eapol_sessions = self.eapol_sessions.lock().await;
+        eapol_sessions.remove(mac)
     }
 
     pub fn load_sessions(&self, sessions_to_load: Vec<Session>) {
@@ -174,7 +205,13 @@ impl SessionManager {
         self.sessions.blocking_lock().values().cloned().collect()
     }
 
-    pub async fn create_session(&self, ip: Ipv4Addr, mac: [u8; 6], config: &super::Config) {
+    pub async fn create_session(
+        &self,
+        ip: Ipv4Addr,
+        mac: [u8; 6],
+        config: &super::Config,
+        vlan_id: Option<u16>,
+    ) {
         let mut sessions = self.sessions.lock().await;
 
         let rt = SystemTime::now()
@@ -198,6 +235,7 @@ impl SessionManager {
         let mut state = SessionState::default();
         state.sessionid = sessionid;
         state.chilli_sessionid = chilli_sessionid;
+        state.vlan_id = vlan_id;
 
         let connection = Connection {
             inuse: true,
@@ -225,6 +263,11 @@ impl SessionManager {
     pub async fn get_session(&self, ip: &Ipv4Addr) -> Option<Session> {
         let sessions = self.sessions.lock().await;
         sessions.get(ip).cloned()
+    }
+
+    pub async fn get_session_by_mac(&self, mac: &[u8; 6]) -> Option<Session> {
+        let sessions = self.sessions.lock().await;
+        sessions.values().find(|s| &s.hismac == mac).cloned()
     }
 
     pub async fn get_all_sessions(&self) -> Vec<Session> {
