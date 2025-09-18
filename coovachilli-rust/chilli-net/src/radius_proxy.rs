@@ -6,6 +6,7 @@ use tracing::info;
 
 use crate::radius::{RadiusAttributeType, RadiusPacket, parse_attributes};
 use chilli_core::Config;
+use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
 use std::collections::HashMap;
 use tokio::sync::{watch, Mutex};
@@ -21,7 +22,8 @@ struct ProxyState {
 pub struct ProxyManager {
     config: Arc<Mutex<Arc<Config>>>,
     config_rx: watch::Receiver<Arc<Config>>,
-    proxy_socket: Arc<UdpSocket>,
+    auth_proxy_socket: Arc<UdpSocket>,
+    acct_proxy_socket: Arc<UdpSocket>,
     upstream_socket: Arc<UdpSocket>,
     pending_requests: Arc<Mutex<HashMap<u8, ProxyState>>>,
     next_id: Arc<Mutex<u8>>,
@@ -30,7 +32,8 @@ pub struct ProxyManager {
 impl ProxyManager {
     pub async fn new(
         config_rx: watch::Receiver<Arc<Config>>,
-        proxy_socket: Arc<UdpSocket>,
+        auth_proxy_socket: Arc<UdpSocket>,
+        acct_proxy_socket: Arc<UdpSocket>,
     ) -> Result<Self> {
         let upstream_socket = UdpSocket::bind("0.0.0.0:0").await?;
         info!(
@@ -41,7 +44,8 @@ impl ProxyManager {
         Ok(Self {
             config: Arc::new(Mutex::new(initial_config)),
             config_rx,
-            proxy_socket,
+            auth_proxy_socket,
+            acct_proxy_socket,
             upstream_socket: Arc::new(upstream_socket),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(Mutex::new(0)),
@@ -49,14 +53,23 @@ impl ProxyManager {
     }
 
     pub async fn run_request_listener(&mut self) {
-        let mut buf = [0u8; 4096];
+        let mut auth_buf = [0u8; 4096];
+        let mut acct_buf = [0u8; 4096];
         loop {
             tokio::select! {
-                res = self.proxy_socket.recv_from(&mut buf) => {
+                res = self.auth_proxy_socket.recv_from(&mut auth_buf) => {
                     if let Ok((len, src)) = res {
-                        let packet_bytes = buf[..len].to_vec();
-                        if let Err(e) = self.handle_proxy_request(&packet_bytes, src).await {
-                            error!("Error handling proxy request: {}", e);
+                        let packet_bytes = auth_buf[..len].to_vec();
+                        if let Err(e) = self.handle_proxy_request(&packet_bytes, src, false).await {
+                            error!("Error handling auth proxy request: {}", e);
+                        }
+                    }
+                }
+                res = self.acct_proxy_socket.recv_from(&mut acct_buf) => {
+                    if let Ok((len, src)) = res {
+                        let packet_bytes = acct_buf[..len].to_vec();
+                        if let Err(e) = self.handle_proxy_request(&packet_bytes, src, true).await {
+                            error!("Error handling acct proxy request: {}", e);
                         }
                     }
                 }
@@ -79,6 +92,7 @@ impl ProxyManager {
         &self,
         packet_bytes: &[u8],
         src: SocketAddr,
+        is_acct: bool,
     ) -> Result<()> {
         info!("Received RADIUS proxy request from {}", src);
 
@@ -91,18 +105,9 @@ impl ProxyManager {
         };
 
         let config = self.config.lock().await;
-        if let Some(_proxy_secret) = &config.proxysecret {
-            let attributes = parse_attributes(&packet.payload);
-            if let Some(_message_authenticator) =
-                attributes.get_standard(RadiusAttributeType::MessageAuthenticator)
-            {
-                // The Message-Authenticator attribute must be temporarily removed
-                // from the packet for validation, which is complex to do on the byte array.
-                // For now, we will assume it's valid if present. A real implementation
-                // would need to do this properly.
-                info!("Message-Authenticator present, assuming valid for now.");
-            } else {
-                warn!("Proxy secret is configured, but no Message-Authenticator from {}. Dropping packet.", src);
+        if let Some(proxy_secret) = &config.proxysecret {
+            if !validate_message_authenticator(packet_bytes, proxy_secret.as_bytes()) {
+                warn!("Invalid Message-Authenticator from {}. Dropping packet.", src);
                 return Ok(());
             }
         }
@@ -121,13 +126,38 @@ impl ProxyManager {
         };
         self.pending_requests.lock().await.insert(new_id, state);
 
-        let mut new_packet = packet_bytes.to_vec();
-        new_packet[1] = new_id;
+        let mut attributes = parse_attributes(&packet.payload);
+        attributes
+            .standard
+            .entry(RadiusAttributeType::ProxyState)
+            .or_default()
+            .push(new_id.to_be_bytes().to_vec());
+        if let Some(nas_id) = &config.proxynasid {
+            attributes
+                .standard
+                .entry(RadiusAttributeType::NasIdentifier)
+                .or_default()
+                .push(nas_id.as_bytes().to_vec());
+        }
 
-        // TODO: Modify packet (add NAS-ID, Proxy-State)
+        let new_payload = crate::radius::serialize_attributes(&attributes);
+        let new_length = crate::radius::RADIUS_HDR_LEN + new_payload.len();
+        let mut new_packet = Vec::with_capacity(new_length);
 
-        let server_addr = format!("{}:{}", config.radiusserver1, config.radiusauthport);
-        self.upstream_socket.send_to(&new_packet, server_addr).await?;
+        new_packet.push(packet.code);
+        new_packet.push(new_id);
+        new_packet.extend_from_slice(&(new_length as u16).to_be_bytes());
+        new_packet.extend_from_slice(&packet.authenticator);
+        new_packet.extend_from_slice(&new_payload);
+
+        let server_addr = if is_acct {
+            format!("{}:{}", config.radiusserver1, config.radiusacctport)
+        } else {
+            format!("{}:{}", config.radiusserver1, config.radiusauthport)
+        };
+        self.upstream_socket
+            .send_to(&new_packet, server_addr)
+            .await?;
 
         info!("Forwarded proxy request from {} to upstream server", src);
 
@@ -157,13 +187,14 @@ impl ProxyManager {
                             continue;
                         }
 
+                        // TODO: Recalculate Message-Authenticator if present in response
                         let mut hasher = Md5::new();
                         hasher.update(&to_hash);
                         let new_authenticator = hasher.finalize();
                         response_packet[4..20].copy_from_slice(&new_authenticator);
 
                         info!("Forwarding proxy response to {}", state.original_src);
-                        if let Err(e) = self.proxy_socket.send_to(&response_packet, state.original_src).await {
+                        if let Err(e) = self.auth_proxy_socket.send_to(&response_packet, state.original_src).await {
                             error!("Failed to send proxy response: {}", e);
                         }
                     }
@@ -171,4 +202,66 @@ impl ProxyManager {
             }
         }
     }
+}
+
+fn validate_message_authenticator(packet_bytes: &[u8], secret: &[u8]) -> bool {
+    let packet = match RadiusPacket::from_bytes(packet_bytes) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let payload_len = u16::from_be(packet.length) as usize - crate::radius::RADIUS_HDR_LEN;
+    let payload = &packet.payload[..payload_len];
+    let mut authenticator_pos = None;
+    let mut offset = 0;
+
+    while offset < payload.len() {
+        let type_code = payload[offset];
+        if type_code == 0 {
+            offset += 1;
+            continue;
+        }
+        if payload.len() < offset + 2 {
+            break;
+        }
+        let length = payload[offset + 1] as usize;
+
+        if type_code == RadiusAttributeType::MessageAuthenticator as u8 {
+            authenticator_pos = Some(offset);
+            break;
+        }
+
+        if length == 0 {
+            // Avoid infinite loop on malformed attribute
+            return false;
+        }
+        offset += length;
+    }
+
+    let authenticator_pos = match authenticator_pos {
+        Some(pos) => pos,
+        None => {
+            warn!("Message-Authenticator validation failed: attribute not found");
+            return false;
+        }
+    };
+
+    let mut packet_for_hmac = packet_bytes.to_vec();
+    let authenticator_in_packet = &packet_bytes
+        [crate::radius::RADIUS_HDR_LEN + authenticator_pos + 2..crate::radius::RADIUS_HDR_LEN + authenticator_pos + 2 + 16].to_vec();
+
+    // Zero out the Message-Authenticator value for the HMAC calculation
+    for byte in &mut packet_for_hmac
+        [crate::radius::RADIUS_HDR_LEN + authenticator_pos + 2..crate::radius::RADIUS_HDR_LEN + authenticator_pos + 2 + 16]
+    {
+        *byte = 0;
+    }
+
+    type HmacMd5 = Hmac<Md5>;
+    let mut mac = HmacMd5::new_from_slice(secret).expect("HMAC can take key of any size");
+    mac.update(&packet_for_hmac);
+    let result = mac.finalize();
+    let code_bytes = result.into_bytes();
+
+    code_bytes.as_slice() == authenticator_in_packet.as_slice()
 }

@@ -150,6 +150,20 @@ struct Lease {
     expires: SystemTime,
 }
 
+//
+// FIXME: Architectural Limitation for EAPOL/VLAN support
+//
+// This `DhcpServer` implementation uses a `UdpSocket` bound to the DHCP port.
+// This approach is not sufficient for handling protocols that operate at
+// Layer 2, such as EAPOL (802.1x) or for inspecting VLAN tags (802.1q).
+//
+// A future refactoring should replace the `UdpSocket` with a raw packet
+// capture mechanism (e.g., using the `pnet` crate) to receive full
+// Ethernet frames from the physical interface.
+//
+// See the FIXME comment in `chilli-bin/src/main.rs` for more details.
+//
+
 /// The DHCP server.
 pub struct DhcpServer {
     socket: Arc<UdpSocket>,

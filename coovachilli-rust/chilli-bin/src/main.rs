@@ -6,6 +6,7 @@ use chilli_core::{AuthType, Session, SessionManager};
 use chilli_http::server;
 use chilli_net::dhcp::DhcpServer;
 use chilli_net::eap_mschapv2;
+use chilli_net::mschapv1;
 use chilli_net::mschapv2;
 use chilli_net::radius::{
     AuthResult, RadiusClient, ACCT_TERMINATE_CAUSE_IDLE_TIMEOUT,
@@ -356,27 +357,39 @@ async fn main() -> Result<()> {
         let config_rx = config_rx.clone();
         Some(tokio::spawn(async move {
             let config = config_rx.borrow().clone();
-            let addr = format!("{}:{}", listen_ip, config.proxyport);
-            match UdpSocket::bind(&addr).await {
-                Ok(socket) => {
-                    info!("RADIUS proxy listening on {}", addr);
-                    let proxy_socket = Arc::new(socket);
-                    match chilli_net::radius_proxy::ProxyManager::new(
-                        config_rx.clone(),
-                        proxy_socket.clone(),
-                    )
-                    .await
-                    {
-                        Ok(mut proxy_manager) => {
-                            proxy_manager.run_request_listener().await;
+            let auth_addr = format!("{}:{}", listen_ip, config.proxyport);
+            let acct_addr = format!("{}:{}", listen_ip, config.proxyport + 1); // TODO: Make this configurable
+
+            match UdpSocket::bind(&auth_addr).await {
+                Ok(auth_socket) => {
+                    info!("RADIUS proxy auth listening on {}", auth_addr);
+                    match UdpSocket::bind(&acct_addr).await {
+                        Ok(acct_socket) => {
+                            info!("RADIUS proxy acct listening on {}", acct_addr);
+                            let auth_proxy_socket = Arc::new(auth_socket);
+                            let acct_proxy_socket = Arc::new(acct_socket);
+                            match chilli_net::radius_proxy::ProxyManager::new(
+                                config_rx.clone(),
+                                auth_proxy_socket.clone(),
+                                acct_proxy_socket.clone(),
+                            )
+                            .await
+                            {
+                                Ok(mut proxy_manager) => {
+                                    proxy_manager.run_request_listener().await;
+                                }
+                                Err(e) => {
+                                    error!("Failed to create RADIUS proxy manager: {}", e);
+                                }
+                            }
                         }
                         Err(e) => {
-                            error!("Failed to create RADIUS proxy manager: {}", e);
+                            error!("Failed to bind RADIUS proxy acct socket on {}: {}", acct_addr, e);
                         }
                     }
                 }
                 Err(e) => {
-                    error!("Failed to bind RADIUS proxy socket on {}: {}", addr, e);
+                    error!("Failed to bind RADIUS proxy auth socket on {}: {}", auth_addr, e);
                 }
             }
         }))
@@ -760,6 +773,74 @@ async fn handle_eap_auth(
     req.tx.send(false).ok();
 }
 
+async fn handle_mschapv1_auth(
+    req: chilli_core::AuthRequest,
+    radius_client: Arc<RadiusClient>,
+    session_manager: Arc<SessionManager>,
+    firewall: Arc<Firewall>,
+    config: Arc<chilli_core::Config>,
+) {
+    info!("Processing MS-CHAPv1 auth request for user '{}'", req.username);
+
+    let result = radius_client.send_chap_access_request(&req.username).await;
+
+    match result {
+        Ok(AuthResult::ChapChallenge(challenge_data, state)) => {
+            if challenge_data.len() < 9 {
+                error!("Invalid CHAP challenge received from RADIUS server.");
+                req.tx.send(false).ok();
+                return;
+            }
+            let identifier = challenge_data[0];
+            let challenge: [u8; 8] = challenge_data[1..9].try_into().unwrap();
+
+            let password = req.password.as_deref().unwrap_or_default();
+            let response = mschapv1::mschap_lanman_response(&challenge, password);
+
+            let result = radius_client
+                .send_chap_response(identifier, &response, state.as_deref())
+                .await;
+
+            match result {
+                Ok(AuthResult::Success(attributes)) => {
+                    info!("MS-CHAPv1 Authentication successful for user '{}'", req.username);
+                    session_manager.authenticate_session(&req.ip).await;
+                    chilli_net::radius::apply_radius_attributes(
+                        &attributes,
+                        &session_manager,
+                        &firewall,
+                        &req.ip,
+                    )
+                    .await;
+                    if let Some(session) = session_manager.get_session(&req.ip).await {
+                        if let Some(ref conup) = config.conup {
+                            run_script(conup.clone(), &session, &config, None).await;
+                        }
+                        if let Err(e) = firewall.add_authenticated_ip(req.ip) {
+                            error!("Failed to add authenticated IP to firewall: {}", e);
+                        }
+                        if let Err(e) = radius_client.send_acct_start(&session).await {
+                            warn!(
+                                "Failed to send Acct-Start for user '{}': {}",
+                                req.username, e
+                            );
+                        }
+                    }
+                    req.tx.send(true).ok();
+                }
+                _ => {
+                    info!("MS-CHAPv1 Authentication failed for user '{}'", req.username);
+                    req.tx.send(false).ok();
+                }
+            }
+        }
+        _ => {
+            info!("MS-CHAPv1 Authentication failed for user '{}'", req.username);
+            req.tx.send(false).ok();
+        }
+    }
+}
+
 
 async fn auth_loop(
     mut rx: tokio::sync::mpsc::Receiver<chilli_core::AuthRequest>,
@@ -789,9 +870,48 @@ async fn auth_loop(
                     config.clone(),
                 ));
             }
+            AuthType::MsChapV1 => {
+                tokio::spawn(handle_mschapv1_auth(
+                    req,
+                    radius_client.clone(),
+                    session_manager.clone(),
+                    firewall.clone(),
+                    config.clone(),
+                ));
+            }
         }
     }
 }
+
+//
+// FIXME: Architectural Limitation for EAPOL/VLAN support
+//
+// The current packet processing architecture, which relies on a TUN/TAP interface
+// for handling IP packets, is not suitable for implementing features that
+// require access to raw Ethernet frames from the physical interface, such as
+// 802.1x (EAPOL) and 802.1q (VLAN).
+//
+// The original C implementation of CoovaChilli uses raw sockets (pcap or SOCK_PACKET)
+// to capture all traffic on the physical interface (`dhcpif`). This allows it
+// to inspect Ethernet headers and handle non-IP protocols like EAPOL and ARP,
+// as well as VLAN tags.
+//
+// The current Rust implementation's `DhcpServer` uses a `UdpSocket`, which
+// operates at a higher level and does not provide access to the Ethernet layer.
+// The `packet_loop` in this file only sees IP packets that have been routed
+// through the TUN/TAP device.
+//
+// To properly implement EAPOL and VLAN support, a significant refactoring is
+// required to introduce a raw packet capture mechanism. This would likely involve:
+// 1. Using a crate like `pnet` to open a raw socket on the `dhcpif`.
+// 2. Creating a new packet processing loop that receives raw Ethernet frames.
+// 3. Dispatching frames based on their EtherType (e.g., to an EAPOL handler,
+//    an ARP handler, or an IP handler).
+// 4. Modifying the `DhcpServer` to integrate with this new packet capture
+//    mechanism instead of using a `UdpSocket`.
+//
+// This work has been postponed in favor of completing other features.
+//
 
 async fn leaky_bucket(session_manager: &Arc<SessionManager>, ip: &Ipv4Addr, is_upload: bool, len: u64) -> bool {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();

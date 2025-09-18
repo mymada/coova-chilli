@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 pub enum AuthType {
     Pap,
     Eap,
+    MsChapV1,
 }
 
 #[derive(Debug)]

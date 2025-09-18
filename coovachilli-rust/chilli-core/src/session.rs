@@ -94,6 +94,7 @@ pub struct SessionState {
     pub bucketdown: u64,
     pub bucketupsize: u64,
     pub bucketdownsize: u64,
+    pub vlan_id: Option<u16>,
 }
 
 impl Default for SessionState {
@@ -122,6 +123,7 @@ impl Default for SessionState {
             bucketdown: 0,
             bucketupsize: 0,
             bucketdownsize: 0,
+            vlan_id: None,
         }
     }
 }
