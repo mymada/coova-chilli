@@ -99,6 +99,9 @@ pub struct Config {
     pub uamlisten: Ipv4Addr,
     /// The TCP port to listen on for UAM requests.
     pub uamport: u16,
+    /// Allow clients from any IP address to access the UAM server.
+    #[serde(default)]
+    pub uamanyip: bool,
 
     /// The maximum number of clients to allow.
     pub max_clients: i32,
@@ -188,6 +191,7 @@ impl Default for Config {
             uamurl: Some("http://127.0.0.1:3990/login".to_string()),
             uamlisten: "192.168.182.1".parse().unwrap(),
             uamport: 3990,
+            uamanyip: false,
             max_clients: 1024,
             walled_garden: Vec::new(),
             macauth: false,

@@ -24,7 +24,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::process::Command;
 use pnet::datalink::{self, NetworkInterface};
-use pnet::packet::ethernet::{EthernetPacket, EtherType, EtherTypes};
+use pnet::packet::arp::{ArpPacket, ArpOperations, ArpHardwareTypes};
+use pnet::packet::ethernet::{MutableEthernetPacket, EthernetPacket, EtherType, EtherTypes};
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::udp::UdpPacket;
 use pnet::packet::vlan::VlanPacket;
@@ -293,7 +294,7 @@ async fn main() -> Result<()> {
     }
 
     let iface = match tun::create_tun(&config).await {
-        Ok(iface) => iface,
+        Ok(iface) => Arc::new(iface),
         Err(e) => {
             error!("Error creating TUN interface: {}", e);
             firewall.cleanup().ok();
@@ -998,6 +999,89 @@ async fn leaky_bucket(session_manager: &Arc<SessionManager>, ip: &Ipv4Addr, is_u
     drop
 }
 
+
+async fn arp_lookup(
+    if_name: &str,
+    target_ip: Ipv4Addr,
+) -> std::io::Result<MacAddr> {
+    let interfaces = pnet::datalink::interfaces();
+    let interface = interfaces
+        .into_iter()
+        .find(|iface| iface.name == if_name)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Interface not found"))?;
+
+    let our_ip = interface.ips.iter().find(|ip| ip.is_ipv4()).map(|ip| match ip.ip() {
+        std::net::IpAddr::V4(ip) => ip,
+        _ => unreachable!(),
+    }).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No IPv4 address found for interface"))?;
+
+    let our_mac = interface.mac.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No MAC address found for interface"))?;
+
+    let mut config = pnet::datalink::Config::default();
+    config.read_timeout = Some(Duration::from_millis(100));
+    let (mut tx, mut rx) = match pnet::datalink::channel(&interface, config) {
+        Ok(pnet::datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
+        Ok(_) => return Err(std::io::Error::new(std::io::ErrorKind::Other, "Unknown channel type")),
+        Err(e) => return Err(e),
+    };
+
+    let mut ethernet_buffer = [0u8; 42];
+    let mut request_packet = MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
+
+    request_packet.set_destination(MacAddr::broadcast());
+    request_packet.set_source(our_mac);
+    request_packet.set_ethertype(EtherTypes::Arp);
+
+    let mut arp_buffer = [0u8; 28];
+    let mut arp_packet = pnet::packet::arp::MutableArpPacket::new(&mut arp_buffer).unwrap();
+
+    arp_packet.set_hardware_type(ArpHardwareTypes::Ethernet);
+    arp_packet.set_protocol_type(EtherTypes::Ipv4);
+    arp_packet.set_hw_addr_len(6);
+    arp_packet.set_proto_addr_len(4);
+    arp_packet.set_operation(ArpOperations::Request);
+    arp_packet.set_sender_hw_addr(our_mac);
+    arp_packet.set_sender_proto_addr(our_ip);
+    arp_packet.set_target_hw_addr(MacAddr::zero());
+    arp_packet.set_target_proto_addr(target_ip);
+
+    request_packet.set_payload(arp_packet.packet());
+
+    if tx.send_to(request_packet.packet(), None).is_none() {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to send ARP request"));
+    }
+
+    let start_time = std::time::Instant::now();
+    loop {
+        if start_time.elapsed() > Duration::from_secs(2) {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "ARP lookup timed out"));
+        }
+
+        match rx.next() {
+            Ok(packet) => {
+                if let Some(ethernet_frame) = EthernetPacket::new(packet) {
+                    if ethernet_frame.get_ethertype() == EtherTypes::Arp {
+                        if let Some(arp_reply) = ArpPacket::new(ethernet_frame.payload()) {
+                            if arp_reply.get_operation() == ArpOperations::Reply
+                                && arp_reply.get_sender_proto_addr() == target_ip
+                            {
+                                return Ok(arp_reply.get_sender_hw_addr());
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::TimedOut {
+                    return Err(e);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+
 async fn handle_ethernet_frame(
     tx: &mut Box<dyn pnet::datalink::DataLinkSender>,
     our_mac: MacAddr,
@@ -1079,7 +1163,43 @@ async fn handle_ethernet_frame(
             }
         }
         EtherTypes::Arp => {
-            // TODO: Handle ARP packets with vlan_id
+            if let Some(arp_packet) = ArpPacket::new(ethernet_packet.payload()) {
+                if arp_packet.get_operation() == ArpOperations::Request {
+                    let target_ip = arp_packet.get_target_proto_addr();
+                    if session_manager.get_session(&target_ip).await.is_some() {
+                        info!("Handling ARP request for our IP {}", target_ip);
+
+                        let src_mac = ethernet_packet.get_source();
+                        let src_ip = arp_packet.get_sender_proto_addr();
+
+                        let mut ethernet_buffer = [0u8; 42]; // 14 for Ethernet header + 28 for ARP payload
+                        let mut arp_reply_packet = pnet::packet::ethernet::MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
+
+                        arp_reply_packet.set_destination(src_mac);
+                        arp_reply_packet.set_source(our_mac);
+                        arp_reply_packet.set_ethertype(EtherTypes::Arp);
+
+                        let mut arp_payload = [0u8; 28];
+                        let mut arp_packet_payload = pnet::packet::arp::MutableArpPacket::new(&mut arp_payload).unwrap();
+
+                        arp_packet_payload.set_hardware_type(ArpHardwareTypes::Ethernet);
+                        arp_packet_payload.set_protocol_type(EtherTypes::Ipv4);
+                        arp_packet_payload.set_hw_addr_len(6);
+                        arp_packet_payload.set_proto_addr_len(4);
+                        arp_packet_payload.set_operation(ArpOperations::Reply);
+                        arp_packet_payload.set_sender_hw_addr(our_mac);
+                        arp_packet_payload.set_sender_proto_addr(target_ip);
+                        arp_packet_payload.set_target_hw_addr(src_mac);
+                        arp_packet_payload.set_target_proto_addr(src_ip);
+
+                        arp_reply_packet.set_payload(arp_packet_payload.packet());
+
+                        if tx.send_to(arp_reply_packet.packet(), None).is_none() {
+                            error!("Failed to send ARP reply");
+                        }
+                    }
+                }
+            }
         }
         ethertype if ethertype == EtherType(0x888E) => {
             if let Some(eapol_packet) = EapolPacket::from_bytes(ethernet_packet.payload()) {
@@ -1110,16 +1230,16 @@ async fn handle_ethernet_frame(
 async fn tun_packet_loop(
     iface: Arc<AsyncDevice>,
     session_manager: Arc<SessionManager>,
-    mut config_rx: watch::Receiver<Arc<chilli_core::Config>>,
+    config_rx: watch::Receiver<Arc<chilli_core::Config>>,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; 1504];
     loop {
         let n = iface.recv(&mut buf).await?;
         if let Some(ipv4_packet) = Ipv4Packet::new(&buf[..n]) {
             let src_ip = ipv4_packet.get_source();
-            let dst_ip = ipv4_packet.get_destination();
+            let _dst_ip = ipv4_packet.get_destination();
 
-            if let Some(session) = session_manager.get_session(&src_ip).await {
+            if let Some(_session) = session_manager.get_session(&src_ip).await {
                 // Handle packet for existing session
                 // TODO: Update counters, leaky bucket, etc.
                 iface.send(ipv4_packet.packet()).await?;
@@ -1127,11 +1247,19 @@ async fn tun_packet_loop(
                 // Handle packet for unknown session
                 let config = config_rx.borrow().clone();
                 if config.uamanyip {
-                    info!("[uamanyip] Creating session for unknown IP {}", src_ip);
-                    // TODO: ARP lookup to find MAC address
-                    let dummy_mac = [0; 6];
-                    session_manager.create_session(src_ip, dummy_mac, &config, None).await;
-                    // Drop the packet, the next one will be redirected
+                    info!("[uamanyip] Attempting ARP lookup for unknown IP {}", src_ip);
+                    match arp_lookup(&config.dhcpif, src_ip).await {
+                        Ok(mac) => {
+                            info!("ARP lookup successful for {}: MAC is {}", src_ip, mac);
+                            session_manager.create_session(src_ip, mac.octets(), &config, None).await;
+                        }
+                        Err(e) => {
+                            warn!("ARP lookup for {} failed: {}", src_ip, e);
+                        }
+                    }
+                    // Drop the packet, the next one will be redirected or handled
+                } else {
+                    warn!("Dropping packet for unknown session from IP {}", src_ip);
                 }
             }
         }
