@@ -6,10 +6,9 @@ use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::{self, MutableIpv4Packet};
 use pnet::packet::udp::MutableUdpPacket;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, Mutex};
 use chilli_bin::{initialize_services, process_ethernet_frame, tun_packet_loop};
 use chilli_net::PacketDevice;
-use std::collections::HashSet;
 use async_trait::async_trait;
 use anyhow::Result;
 
@@ -197,7 +196,7 @@ async fn test_upload_quota_exceeded() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_download_quota_exceeded() {
     let quota = 1000;
-    let (config, session_manager, client_ip, _) = setup_test_session("output", quota).await;
+    let (_config, session_manager, client_ip, _) = setup_test_session("output", quota).await;
 
     let (_, _, radius_client, _, firewall, _, _, _, config_tx) = initialize_services(None).await;
 

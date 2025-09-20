@@ -249,7 +249,7 @@ impl DhcpServer {
     ) -> Result<DhcpAction> {
         let mac = req_packet.get_mac();
         let leases = self.leases.lock().await;
-        let mut pool = self.ip_pool.lock().await;
+        let pool = self.ip_pool.lock().await;
 
         let ip_to_offer = match leases.get(&mac) {
             Some(lease) => lease.ip,
