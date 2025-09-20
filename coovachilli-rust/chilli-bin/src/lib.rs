@@ -10,7 +10,7 @@ use chilli_net::mschapv1;
 use chilli_net::mschapv2;
 use chilli_net::radius::{
     AuthResult, RadiusClient, ACCT_TERMINATE_CAUSE_IDLE_TIMEOUT,
-    ACCT_TERMINATE_CAUSE_SESSION_TIMEOUT,
+    ACCT_TERMINATE_CAUSE_SESSION_TIMEOUT, ACCT_TERMINATE_CAUSE_QUOTA_EXCEEDED,
 };
 use chilli_net::tun;
 use chilli_net::Firewall;
@@ -36,7 +36,7 @@ use tokio::sync::{watch, Mutex};
 use tracing::{error, info, warn};
 use chilli_net::eap::{EapCode, EapPacket, EapType};
 use chilli_net::eapol::EapolPacket;
-use chilli_net::AsyncDevice;
+use chilli_net::{PacketDevice, TunWrapper};
 use pnet_base::MacAddr;
 
 use std::net::SocketAddr;
@@ -335,7 +335,7 @@ pub async fn run() -> Result<()> {
     }
 
     let iface = match tun::create_tun(&config).await {
-        Ok(iface) => Arc::new(iface),
+        Ok(iface) => Arc::new(TunWrapper(Arc::new(iface))),
         Err(e) => {
             error!("Error creating TUN interface: {}", e);
             firewall.cleanup().ok();
@@ -475,6 +475,8 @@ pub async fn run() -> Result<()> {
         iface.clone(),
         session_manager.clone(),
         config_rx.clone(),
+        radius_client.clone(),
+        firewall.clone(),
     ));
 
     let auth_loop_handle = tokio::spawn(auth_loop(
@@ -611,6 +613,40 @@ async fn walled_garden_resolver_loop(
     }
 }
 
+async fn terminate_session(
+    session: &Session,
+    cause: u32,
+    config: &Arc<chilli_core::Config>,
+    radius_client: &Arc<RadiusClient>,
+    firewall: &Arc<Firewall>,
+    session_manager: &Arc<SessionManager>,
+) {
+    info!(
+        "Terminating session {} for user {:?} due to cause {}",
+        session.state.sessionid, session.state.redir.username, cause
+    );
+
+    if let Some(ref condown) = config.condown {
+        run_script(condown.clone(), session, config, Some(cause)).await;
+    }
+
+    if let Err(e) = radius_client.send_acct_stop(session, Some(cause)).await {
+        warn!(
+            "Failed to send Acct-Stop for session {}: {}",
+            session.state.sessionid, e
+        );
+    }
+
+    firewall.remove_user_filter(session.hisip).ok();
+    if let Err(e) = firewall.remove_authenticated_ip(session.hisip) {
+        error!(
+            "Failed to remove authenticated IP from firewall for session {}: {}",
+            session.state.sessionid, e
+        );
+    }
+    session_manager.remove_session(&session.hisip).await;
+}
+
 async fn interim_update_loop(
     radius_client: Arc<RadiusClient>,
     session_manager: Arc<SessionManager>,
@@ -673,26 +709,15 @@ async fn interim_update_loop(
                 }
 
                 if let Some(cause) = terminate_cause {
-                    if let Some(ref condown) = config.condown {
-                        run_script(condown.clone(), &session, &config, Some(cause)).await;
-                    }
-                    if let Err(e) = radius_client
-                        .send_acct_stop(&session, Some(cause))
-                        .await
-                    {
-                        warn!(
-                            "Failed to send Acct-Stop for session {}: {}",
-                            session.state.sessionid, e
-                        );
-                    }
-                    firewall.remove_user_filter(session.hisip).ok();
-                    session_manager.remove_session(&session.hisip).await;
-                    if let Err(e) = firewall.remove_authenticated_ip(session.hisip) {
-                        error!(
-                            "Failed to remove authenticated IP from firewall for session {}: {}",
-                            session.state.sessionid, e
-                        );
-                    }
+                    terminate_session(
+                        &session,
+                        cause,
+                        &config,
+                        &radius_client,
+                        &firewall,
+                        &session_manager,
+                    )
+                    .await;
                 } else {
                     if let Err(e) = radius_client.send_acct_interim_update(&session).await {
                         warn!(
@@ -1247,31 +1272,92 @@ async fn handle_ethernet_frame(
     }
 }
 
-async fn tun_packet_loop(
-    iface: Arc<AsyncDevice>,
+pub async fn tun_packet_loop<T: PacketDevice + 'static>(
+    iface: Arc<T>,
     session_manager: Arc<SessionManager>,
     config_rx: watch::Receiver<Arc<chilli_core::Config>>,
+    radius_client: Arc<RadiusClient>,
+    firewall: Arc<Firewall>,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; 1504];
     loop {
         let n = iface.recv(&mut buf).await?;
-        if let Some(ipv4_packet) = Ipv4Packet::new(&buf[..n]) {
-            let src_ip = ipv4_packet.get_source();
-            let _dst_ip = ipv4_packet.get_destination();
+        let packet_bytes = &buf[..n];
 
-            if let Some(_session) = session_manager.get_session(&src_ip).await {
-                // Handle packet for existing session
-                // TODO: Update counters, leaky bucket, etc.
-                iface.send(ipv4_packet.packet()).await?;
+        if let Some(ipv4_packet) = Ipv4Packet::new(packet_bytes) {
+            let src_ip = ipv4_packet.get_source();
+            let config = config_rx.borrow().clone();
+
+            if let Some(mut session) = session_manager.get_session(&src_ip).await {
+                if !session.state.authenticated {
+                    continue; // Drop packet if session is not authenticated
+                }
+
+                // --- UPLOAD ACCOUNTING ---
+                session.state.input_octets += n as u64;
+                session.state.input_packets += 1;
+
+                let mut terminate = false;
+                if session.params.maxinputoctets > 0
+                    && session.state.input_octets >= session.params.maxinputoctets
+                {
+                    info!(
+                        "Input quota exceeded for session {}",
+                        session.state.sessionid
+                    );
+                    terminate = true;
+                }
+
+                if !terminate
+                    && session.params.maxtotaloctets > 0
+                    && (session.state.input_octets + session.state.output_octets)
+                        >= session.params.maxtotaloctets
+                {
+                    info!(
+                        "Total quota exceeded for session {}",
+                        session.state.sessionid
+                    );
+                    terminate = true;
+                }
+
+                // Update session with new counters before deciding to terminate or forward
+                session_manager
+                    .update_session(&src_ip, |s| {
+                        s.state.input_octets = session.state.input_octets;
+                        s.state.input_packets = session.state.input_packets;
+                    })
+                    .await;
+
+                if terminate {
+                    terminate_session(
+                        &session,
+                        ACCT_TERMINATE_CAUSE_QUOTA_EXCEEDED,
+                        &config,
+                        &radius_client,
+                        &firewall,
+                        &session_manager,
+                    )
+                    .await;
+                    continue; // Drop packet that caused the quota to be exceeded
+                }
+
+                // --- DOWNLOAD ACCOUNTING (Placeholder) ---
+                // The packet flow for download traffic is not clear in the current architecture.
+                // A proper implementation would need to intercept packets from the WAN destined
+                // for the client and account for them here before sending them to the TUN interface.
+                // The line below simply forwards/echoes the received packet.
+                // Download quota checks (maxoutputoctets) should be placed here.
+                iface.send(packet_bytes).await?;
             } else {
                 // Handle packet for unknown session
-                let config = config_rx.borrow().clone();
                 if config.uamanyip {
                     info!("[uamanyip] Attempting ARP lookup for unknown IP {}", src_ip);
                     match arp_lookup(&config.dhcpif, src_ip).await {
                         Ok(mac) => {
                             info!("ARP lookup successful for {}: MAC is {}", src_ip, mac);
-                            session_manager.create_session(src_ip, mac.octets(), &config, None).await;
+                            session_manager
+                                .create_session(src_ip, mac.octets(), &config, None)
+                                .await;
                         }
                         Err(e) => {
                             warn!("ARP lookup for {} failed: {}", src_ip, e);

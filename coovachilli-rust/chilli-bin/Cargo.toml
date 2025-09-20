@@ -25,3 +25,8 @@ hex = "0.4"
 
 [dev-dependencies]
 md5 = "0.8"
+async-trait = "0.1.89"
+
+[[test]]
+name = "quota_test"
+path = "tests/quota_test.rs"
