@@ -1,4 +1,5 @@
 use std::net::Ipv4Addr;
+use md5::{Digest, Md5};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::info;
@@ -57,7 +58,8 @@ fn build_dhcp_payload(
     server_ip: Option<Ipv4Addr>,
 ) -> Vec<u8> {
     let mut dhcp_buf = vec![0u8; 512];
-    let packet = DhcpPacket::from_bytes_mut(&mut dhcp_buf).unwrap();
+    let packet =
+        DhcpPacket::from_bytes_mut(&mut dhcp_buf).expect("Failed to create dhcp packet buffer");
 
     packet.op = BootpMessageType::BootRequest as u8;
     packet.htype = 1; // Ethernet
@@ -95,14 +97,16 @@ fn build_dhcp_payload(
 
 fn build_full_dhcp_packet(chaddr: MacAddr, payload: Vec<u8>) -> Vec<u8> {
     let mut udp_buf = vec![0u8; 8 + payload.len()];
-    let mut udp_packet = MutableUdpPacket::new(&mut udp_buf).unwrap();
+    let mut udp_packet =
+        MutableUdpPacket::new(&mut udp_buf).expect("Failed to create udp packet buffer");
     udp_packet.set_source(68);
     udp_packet.set_destination(67);
     udp_packet.set_length((8 + payload.len()) as u16);
     udp_packet.set_payload(&payload);
 
     let mut ip_buf = vec![0u8; 20 + udp_packet.packet().len()];
-    let mut ip_packet = MutableIpv4Packet::new(&mut ip_buf).unwrap();
+    let mut ip_packet =
+        MutableIpv4Packet::new(&mut ip_buf).expect("Failed to create ipv4 packet buffer");
     ip_packet.set_version(4);
     ip_packet.set_header_length(5);
     ip_packet.set_total_length((20 + udp_packet.packet().len()) as u16);
@@ -113,11 +117,16 @@ fn build_full_dhcp_packet(chaddr: MacAddr, payload: Vec<u8>) -> Vec<u8> {
     ip_packet.set_payload(udp_packet.packet());
     let checksum = ipv4::checksum(&ip_packet.to_immutable());
     ip_packet.set_checksum(checksum);
-    let udp_checksum = udp::ipv4_checksum(&udp_packet.to_immutable(), &ip_packet.get_source(), &ip_packet.get_destination());
+    let udp_checksum = udp::ipv4_checksum(
+        &udp_packet.to_immutable(),
+        &ip_packet.get_source(),
+        &ip_packet.get_destination(),
+    );
     udp_packet.set_checksum(udp_checksum);
 
     let mut eth_buf = vec![0u8; 14 + ip_packet.packet().len()];
-    let mut eth_packet = MutableEthernetPacket::new(&mut eth_buf).unwrap();
+    let mut eth_packet =
+        MutableEthernetPacket::new(&mut eth_buf).expect("Failed to create ethernet packet buffer");
     eth_packet.set_destination(MacAddr::broadcast());
     eth_packet.set_source(chaddr);
     eth_packet.set_ethertype(EtherTypes::Ipv4);
@@ -144,7 +153,8 @@ fn build_eapol_packet(
     }
 
     let mut eth_buf = vec![0u8; 14 + eapol_buf.len()];
-    let mut eth_packet = MutableEthernetPacket::new(&mut eth_buf).unwrap();
+    let mut eth_packet =
+        MutableEthernetPacket::new(&mut eth_buf).expect("Failed to create ethernet packet buffer");
     eth_packet.set_destination(dst_mac);
     eth_packet.set_source(src_mac);
     eth_packet.set_ethertype(EtherType(0x888E));
@@ -166,11 +176,11 @@ fn create_radius_response(code: RadiusCode, id: u8, req_authenticator: &[u8; 16]
     to_hash.extend_from_slice(payload);
     to_hash.extend_from_slice(secret.as_bytes());
 
-    let response_auth = md5::compute(&to_hash);
+    let response_auth = Md5::digest(&to_hash);
 
     let mut final_packet = Vec::new();
     final_packet.extend_from_slice(&response_header);
-    final_packet.extend_from_slice(&response_auth.0);
+    final_packet.extend_from_slice(&response_auth);
     final_packet.extend_from_slice(payload);
 
     final_packet
@@ -183,11 +193,15 @@ async fn mock_radius_server_eap_mschapv2(socket: UdpSocket, secret: String) {
 
     // 1. Receive Identity Response, send MSCHAPv2 Challenge
     info!("[mock_radius] waiting for Identity-Response");
-    let (len, src) = socket.recv_from(&mut buf).await.unwrap();
-    let req_packet = RadiusPacket::from_bytes(&buf[..len]).unwrap();
+    let (len, src) = socket
+        .recv_from(&mut buf)
+        .await
+        .expect("Mock RADIUS failed to receive");
+    let req_packet =
+        RadiusPacket::from_bytes(&buf[..len]).expect("Failed to parse RADIUS packet");
     info!("[mock_radius] received Identity-Response, sending Challenge");
 
-    let server_challenge = mschapv2::generate_challenge();
+    let server_challenge = mschapv2::generate_challenge().expect("Failed to generate server challenge");
     let mut mschapv2_challenge_data = vec![0x01, req_packet.id]; // Op-Code: Challenge, Identifier
     let challenge_len_plus_header = (server_challenge.len() + 2) as u8;
     mschapv2_challenge_data.push(challenge_len_plus_header);
@@ -218,20 +232,28 @@ async fn mock_radius_server_eap_mschapv2(socket: UdpSocket, secret: String) {
         &response_payload,
         &secret,
     );
-    socket.send_to(&response, src).await.unwrap();
+    socket
+        .send_to(&response, src)
+        .await
+        .expect("Mock RADIUS failed to send challenge");
     info!("[mock_radius] sent Challenge");
 
     // 2. Receive MSCHAPv2 Challenge Response, send Success
     info!("[mock_radius] waiting for Challenge-Response");
-    let (len, src) = socket.recv_from(&mut buf).await.unwrap();
-    let req_packet = RadiusPacket::from_bytes(&buf[..len]).unwrap();
+    let (len, src) = socket
+        .recv_from(&mut buf)
+        .await
+        .expect("Mock RADIUS failed to receive challenge response");
+    let req_packet =
+        RadiusPacket::from_bytes(&buf[..len]).expect("Failed to parse RADIUS packet");
     info!("[mock_radius] received Challenge-Response, sending Success Request");
 
     let req_attributes = parse_attributes(&req_packet.payload[..len - 20]);
     let eap_response_msg = req_attributes
         .get_standard(RadiusAttributeType::EapMessage)
-        .unwrap();
-    let eap_response_packet = EapPacket::from_bytes(eap_response_msg).unwrap();
+        .expect("EAP-Message attribute not found");
+    let eap_response_packet =
+        EapPacket::from_bytes(eap_response_msg).expect("Failed to parse EAP packet");
     let mschapv2_payload = &eap_response_packet.data[1..]; // Skip EAP type
 
     // TODO: proper parsing of this
@@ -240,15 +262,22 @@ async fn mock_radius_server_eap_mschapv2(socket: UdpSocket, secret: String) {
 
     let expected_nt_response = mschapv2::verify_response_and_generate_nt_response(
         &server_challenge,
-        peer_challenge.try_into().unwrap(),
+        peer_challenge
+            .try_into()
+            .expect("Failed to convert peer challenge"),
         username,
         password,
     )
-    .unwrap();
+    .expect("Failed to generate expected NT response");
     assert_eq!(nt_response, &expected_nt_response[..]);
 
-    let success_response =
-        mschapv2::generate_success_response(password, nt_response.try_into().unwrap());
+    let success_response = mschapv2::generate_success_response(
+        password,
+        nt_response
+            .try_into()
+            .expect("Failed to convert NT response"),
+    )
+    .expect("Failed to generate success response");
     let mut mschapv2_success_data = vec![0x03, eap_response_packet.identifier]; // Op-Code: Success
     let success_len_plus_header = (success_response.len() + 4) as u16;
     mschapv2_success_data.extend_from_slice(&success_len_plus_header.to_be_bytes());
@@ -279,13 +308,20 @@ async fn mock_radius_server_eap_mschapv2(socket: UdpSocket, secret: String) {
         &response_payload,
         &secret,
     );
-    socket.send_to(&response, src).await.unwrap();
+    socket
+        .send_to(&response, src)
+        .await
+        .expect("Mock RADIUS failed to send success request");
     info!("[mock_radius] sent Success Request");
 
     // 3. Receive Success Response, send Access-Accept
     info!("[mock_radius] waiting for Success-Response");
-    let (len, src) = socket.recv_from(&mut buf).await.unwrap();
-    let req_packet = RadiusPacket::from_bytes(&buf[..len]).unwrap();
+    let (len, src) = socket
+        .recv_from(&mut buf)
+        .await
+        .expect("Mock RADIUS failed to receive success response");
+    let req_packet =
+        RadiusPacket::from_bytes(&buf[..len]).expect("Failed to parse RADIUS packet");
     info!("[mock_radius] received Success-Response, sending Access-Accept");
 
     let success_attributes = RadiusAttributes::default();
@@ -297,7 +333,10 @@ async fn mock_radius_server_eap_mschapv2(socket: UdpSocket, secret: String) {
         &success_payload,
         &secret,
     );
-    socket.send_to(&success_response, src).await.unwrap();
+    socket
+        .send_to(&success_response, src)
+        .await
+        .expect("Mock RADIUS failed to send access-accept");
     info!("[mock_radius] sent Access-Accept");
 }
 
@@ -306,10 +345,14 @@ async fn test_eap_mschapv2_flow() {
     tracing_subscriber::fmt::try_init().ok();
     info!("Starting test_eap_mschapv2_flow");
 
-    let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let server_addr = server_socket.local_addr().unwrap();
+    let server_socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind mock RADIUS socket");
+    let server_addr = server_socket
+        .local_addr()
+        .expect("Failed to get mock RADIUS local address");
 
-    let (config, session_manager, radius_client, dhcp_server, firewall, eapol_attribute_cache, auth_tx, _auth_rx, _config_tx) = initialize_services(Some(server_addr)).await;
+    let (config, session_manager, radius_client, dhcp_server, firewall, eapol_attribute_cache, core_tx, _core_rx, _config_tx) = initialize_services(Some(server_addr), Some(0)).await.expect("initialize_services failed");
     let (upload_tx, _upload_rx) = tokio::sync::mpsc::channel(100);
     let secret = config.radiussecret.clone();
 
@@ -330,16 +373,20 @@ async fn test_eap_mschapv2_flow() {
     // --- DHCP Discover ---
     let discover_payload = build_dhcp_payload(client_mac, xid, DhcpMessageType::Discover, None, None);
     let discover_packet = build_full_dhcp_packet(client_mac, discover_payload);
-    process_ethernet_frame(&mut tx, our_mac, &discover_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
+    process_ethernet_frame(&mut tx, our_mac, &discover_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &core_tx, &upload_tx).await;
 
     // --- Capture and parse Offer ---
     let offered_ip = {
-        let packets = sent_packets.lock().unwrap();
+        let packets = sent_packets.lock().expect("Failed to lock sent_packets");
         assert_eq!(packets.len(), 1, "Expected DHCP Offer packet");
-        let offer_eth_packet = EthernetPacket::new(&packets[0]).unwrap();
-        let offer_ip_packet = ipv4::Ipv4Packet::new(offer_eth_packet.payload()).unwrap();
-        let offer_udp_packet = udp::UdpPacket::new(offer_ip_packet.payload()).unwrap();
-        let offer_dhcp_packet = DhcpPacket::from_bytes(offer_udp_packet.payload()).unwrap();
+        let offer_eth_packet =
+            EthernetPacket::new(&packets[0]).expect("Failed to parse ethernet packet");
+        let offer_ip_packet =
+            ipv4::Ipv4Packet::new(offer_eth_packet.payload()).expect("Failed to parse ipv4 packet");
+        let offer_udp_packet =
+            udp::UdpPacket::new(offer_ip_packet.payload()).expect("Failed to parse udp packet");
+        let offer_dhcp_packet =
+            DhcpPacket::from_bytes(offer_udp_packet.payload()).expect("Failed to parse dhcp packet");
         let offered_ip = Ipv4Addr::from(u32::from_be(offer_dhcp_packet.yiaddr));
         info!("Received offer for IP: {}", offered_ip);
         offered_ip
@@ -349,12 +396,12 @@ async fn test_eap_mschapv2_flow() {
     // --- DHCP Request ---
     let request_payload = build_dhcp_payload(client_mac, xid, DhcpMessageType::Request, Some(offered_ip), Some(config.dhcplisten));
     let request_packet = build_full_dhcp_packet(client_mac, request_payload);
-    process_ethernet_frame(&mut tx, our_mac, &request_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
+    process_ethernet_frame(&mut tx, our_mac, &request_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &core_tx, &upload_tx).await;
 
     // --- Wait for ACK to be sent ---
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            let packets = sent_packets.lock().unwrap();
+            let packets = sent_packets.lock().expect("Failed to lock sent_packets");
             if !packets.is_empty() {
                 assert_eq!(packets.len(), 1, "Expected DHCP ACK packet");
                 break;
@@ -362,31 +409,39 @@ async fn test_eap_mschapv2_flow() {
             drop(packets);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }).await.expect("Timed out waiting for DHCP ACK");
-    sent_packets.lock().unwrap().clear();
+    })
+    .await
+    .expect("Timed out waiting for DHCP ACK");
+    sent_packets.lock().expect("Failed to lock sent_packets").clear();
 
-    assert!(session_manager.get_session(&offered_ip).await.is_some(), "Session should exist after DHCP");
+    assert!(
+        session_manager.get_session(&offered_ip).await.is_some(),
+        "Session should exist after DHCP"
+    );
     info!("DHCP Flow complete, session created for {}", offered_ip);
 
     info!("Sending EAPOL-Start");
     let start_packet = build_eapol_packet(client_mac, our_mac, EapolType::Start, None);
-    process_ethernet_frame(&mut tx, our_mac, &start_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
+    process_ethernet_frame(&mut tx, our_mac, &start_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &core_tx, &upload_tx).await;
 
     info!("Verifying EAP-Request/Identity");
-    let packets = sent_packets.lock().unwrap();
+    let packets = sent_packets.lock().expect("Failed to lock sent_packets");
     assert_eq!(packets.len(), 1, "Expected one packet (EAP-Request/Identity)");
-    let identity_req_eth = EthernetPacket::new(&packets[0]).unwrap();
+    let identity_req_eth =
+        EthernetPacket::new(&packets[0]).expect("Failed to parse ethernet packet");
     assert_eq!(identity_req_eth.get_destination(), client_mac);
-    let identity_req_eapol = EapolPacket::from_bytes(identity_req_eth.payload()).unwrap();
+    let identity_req_eapol =
+        EapolPacket::from_bytes(identity_req_eth.payload()).expect("Failed to parse EAPOL packet");
     assert_eq!(identity_req_eapol.packet_type, EapolType::Eap);
-    let identity_req_eap = EapPacket::from_bytes(identity_req_eapol.payload).unwrap();
+    let identity_req_eap =
+        EapPacket::from_bytes(identity_req_eapol.payload).expect("Failed to parse EAP packet");
     assert_eq!(identity_req_eap.code, EapCode::Request);
     assert_eq!(identity_req_eap.data[0], EapType::Identity as u8);
     let identity_req_id = identity_req_eap.identifier;
     drop(packets);
 
     info!("Sending EAP-Response/Identity");
-    sent_packets.lock().unwrap().clear();
+    sent_packets.lock().expect("Failed to lock sent_packets").clear();
     let username = "test-eap-user";
     let mut identity_resp_payload = vec![EapType::Identity as u8];
     identity_resp_payload.extend_from_slice(username.as_bytes());
@@ -396,33 +451,38 @@ async fn test_eap_mschapv2_flow() {
         data: identity_resp_payload,
     };
     let identity_resp_packet = build_eapol_packet(client_mac, our_mac, EapolType::Eap, Some(identity_resp_eap.to_bytes()));
-    process_ethernet_frame(&mut tx, our_mac, &identity_resp_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
+    process_ethernet_frame(&mut tx, our_mac, &identity_resp_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &core_tx, &upload_tx).await;
 
     info!("Waiting for EAP-Request/MS-CHAPv2-Challenge...");
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     info!("Verifying EAP-Request/MS-CHAPv2-Challenge");
-    let packets = sent_packets.lock().unwrap();
+    let packets = sent_packets.lock().expect("Failed to lock sent_packets");
     assert_eq!(
         packets.len(),
         1,
         "Expected one packet (EAP-Request/MS-CHAPv2-Challenge)"
     );
-    let challenge_req_eth = EthernetPacket::new(&packets[0]).unwrap();
-    let challenge_req_eapol = EapolPacket::from_bytes(challenge_req_eth.payload()).unwrap();
-    let challenge_req_eap = EapPacket::from_bytes(challenge_req_eapol.payload).unwrap();
+    let challenge_req_eth =
+        EthernetPacket::new(&packets[0]).expect("Failed to parse ethernet packet");
+    let challenge_req_eapol =
+        EapolPacket::from_bytes(challenge_req_eth.payload()).expect("Failed to parse EAPOL packet");
+    let challenge_req_eap =
+        EapPacket::from_bytes(challenge_req_eapol.payload).expect("Failed to parse EAP packet");
     assert_eq!(challenge_req_eap.code, EapCode::Request);
     assert_eq!(challenge_req_eap.data[0], EapType::MsChapV2 as u8);
     let challenge_req_id = challenge_req_eap.identifier;
 
     let mschapv2_payload = &challenge_req_eap.data[1..];
     let mschapv2_challenge_id = mschapv2_payload[1];
-    let server_challenge: [u8; 16] = mschapv2_payload[3..19].try_into().unwrap();
+    let server_challenge: [u8; 16] = mschapv2_payload[3..19]
+        .try_into()
+        .expect("Failed to get server challenge from payload");
     drop(packets);
 
     info!("Sending EAP-Response/MS-CHAPv2-Challenge");
-    sent_packets.lock().unwrap().clear();
-    let peer_challenge = mschapv2::generate_challenge();
+    sent_packets.lock().expect("Failed to lock sent_packets").clear();
+    let peer_challenge = mschapv2::generate_challenge().expect("Failed to generate peer challenge");
     let password = "password123";
     let nt_response = mschapv2::verify_response_and_generate_nt_response(
         &server_challenge,
@@ -430,7 +490,7 @@ async fn test_eap_mschapv2_flow() {
         username,
         password,
     )
-    .unwrap();
+    .expect("Failed to generate NT response");
 
     let challenge_resp_eap = chilli_net::eap_mschapv2::create_challenge_response_packet(
         challenge_req_id,
@@ -455,7 +515,7 @@ async fn test_eap_mschapv2_flow() {
         &firewall,
         &config,
         &eapol_attribute_cache,
-        &auth_tx,
+        &core_tx,
         &upload_tx,
     )
     .await;
@@ -464,22 +524,25 @@ async fn test_eap_mschapv2_flow() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     info!("Verifying EAP-Request/MS-CHAPv2-Success");
-    let packets = sent_packets.lock().unwrap();
+    let packets = sent_packets.lock().expect("Failed to lock sent_packets");
     assert_eq!(
         packets.len(),
         1,
         "Expected one packet (EAP-Request/MS-CHAPv2-Success)"
     );
-    let success_req_eth = EthernetPacket::new(&packets[0]).unwrap();
-    let success_req_eapol = EapolPacket::from_bytes(success_req_eth.payload()).unwrap();
-    let success_req_eap = EapPacket::from_bytes(success_req_eapol.payload).unwrap();
+    let success_req_eth =
+        EthernetPacket::new(&packets[0]).expect("Failed to parse ethernet packet");
+    let success_req_eapol =
+        EapolPacket::from_bytes(success_req_eth.payload()).expect("Failed to parse EAPOL packet");
+    let success_req_eap =
+        EapPacket::from_bytes(success_req_eapol.payload).expect("Failed to parse EAP packet");
     assert_eq!(success_req_eap.code, EapCode::Request);
     assert_eq!(success_req_eap.data[0], EapType::MsChapV2 as u8);
     let success_req_id = success_req_eap.identifier;
     drop(packets);
 
     info!("Sending EAP-Response/MS-CHAPv2-Success");
-    sent_packets.lock().unwrap().clear();
+    sent_packets.lock().expect("Failed to lock sent_packets").clear();
 
     let mut success_resp_mschap_payload = vec![0x03, mschapv2_challenge_id]; // Op-Code: Success
     let len_plus_header = (success_resp_mschap_payload.len() + 2) as u16;
@@ -510,7 +573,7 @@ async fn test_eap_mschapv2_flow() {
         &firewall,
         &config,
         &eapol_attribute_cache,
-        &auth_tx,
+        &core_tx,
         &upload_tx,
     )
     .await;
@@ -519,17 +582,25 @@ async fn test_eap_mschapv2_flow() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     info!("Verifying EAP-Success");
-    let packets = sent_packets.lock().unwrap();
+    let packets = sent_packets.lock().expect("Failed to lock sent_packets");
     assert_eq!(packets.len(), 1, "Expected one packet (EAP-Success)");
-    let success_eth = EthernetPacket::new(&packets[0]).unwrap();
-    let success_eapol = EapolPacket::from_bytes(success_eth.payload()).unwrap();
-    let success_eap = EapPacket::from_bytes(success_eapol.payload).unwrap();
+    let success_eth = EthernetPacket::new(&packets[0]).expect("Failed to parse ethernet packet");
+    let success_eapol =
+        EapolPacket::from_bytes(success_eth.payload()).expect("Failed to parse EAPOL packet");
+    let success_eap =
+        EapPacket::from_bytes(success_eapol.payload).expect("Failed to parse EAP packet");
     assert_eq!(success_eap.code, EapCode::Success);
     drop(packets);
 
     info!("Verifying session state");
-    let eapol_session = session_manager.get_eapol_session(&client_mac.octets()).await.unwrap();
-    assert_eq!(eapol_session.state, chilli_core::eapol_session::EapolState::Authenticated);
+    let eapol_session = session_manager
+        .get_eapol_session(&client_mac.octets())
+        .await
+        .expect("EAPOL session not found");
+    assert_eq!(
+        eapol_session.state,
+        chilli_core::eapol_session::EapolState::Authenticated
+    );
 
     mock_server_handle.abort();
     radius_client_handle.abort();

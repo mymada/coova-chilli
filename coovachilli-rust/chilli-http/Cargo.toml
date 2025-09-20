@@ -9,3 +9,7 @@ axum = { version = "0.7", features = ["form"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 serde = { version = "1.0", features = ["derive"] }
+rand = "0.8"
+hex = "0.4"
+url = { version = "2.5", features = ["serde"] }
+md-5 = "0.10"

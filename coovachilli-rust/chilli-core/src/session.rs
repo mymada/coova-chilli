@@ -6,6 +6,17 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
+use tracing::error;
+
+fn get_current_time_secs() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(e) => {
+            error!("System time is before the UNIX epoch, this is not supported. Using 0 as timestamp. Error: {}", e);
+            0
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SessionParams {
@@ -105,10 +116,7 @@ impl Default for SessionState {
             authenticated: false,
             sessionid: "".to_string(),
             chilli_sessionid: "".to_string(),
-            start_time: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("System time is before the UNIX epoch, which is not supported.")
-                .as_secs(),
+            start_time: get_current_time_secs(),
             interim_time: 0,
             last_bw_time: 0,
             last_up_time: 0,
@@ -214,10 +222,7 @@ impl SessionManager {
     ) {
         let mut sessions = self.sessions.lock().await;
 
-        let rt = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let rt = get_current_time_secs();
         let unit: u32 = rand::thread_rng().gen();
 
         let sessionid = format!("{:08x}{:08x}", rt, unit);
@@ -292,10 +297,7 @@ impl SessionManager {
         let mut sessions = self.sessions.lock().await;
         if let Some(session) = sessions.get_mut(ip) {
             session.state.authenticated = true;
-            session.state.last_up_time = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("System time is before the UNIX epoch, which is not supported.")
-                .as_secs();
+            session.state.last_up_time = get_current_time_secs();
             true
         } else {
             false
@@ -329,10 +331,7 @@ impl SessionManager {
     pub async fn update_last_up_time(&self, ip: &Ipv4Addr) {
         let mut sessions = self.sessions.lock().await;
         if let Some(session) = sessions.get_mut(ip) {
-            session.state.last_up_time = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("System time is before the UNIX epoch, which is not supported.")
-                .as_secs();
+            session.state.last_up_time = get_current_time_secs();
         }
     }
 }

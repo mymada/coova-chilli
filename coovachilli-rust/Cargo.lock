@@ -292,15 +292,17 @@ dependencies = [
  "etherparse",
  "hex",
  "libc",
- "md5",
+ "md-5",
  "pnet",
  "pnet_base",
+ "rand",
  "serde_json",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
  "trust-dns-proto",
+ "url",
 ]
 
 [[package]]
@@ -320,9 +322,13 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chilli-core",
+ "hex",
+ "md-5",
+ "rand",
  "serde",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -1092,12 +1098,6 @@ checksum = "7da5ac363534dce5fabf69949225e174fbf111a498bf0ff794c8ea1fba9f3dda"
 dependencies = [
  "digest",
 ]
-
-[[package]]
-name = "md5"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae960838283323069879657ca3de837e9f7bbb4c7bf6ea7f1b290d5e9476d2e0"
 
 [[package]]
 name = "memchr"

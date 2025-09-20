@@ -14,7 +14,8 @@ use chilli_net::PacketDevice;
 // Helper to create a dummy IPv4 packet
 fn create_ipv4_packet(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, len: usize) -> Vec<u8> {
     let mut buf = vec![0u8; len];
-    let mut ip_packet = MutableIpv4Packet::new(&mut buf).unwrap();
+    let mut ip_packet =
+        MutableIpv4Packet::new(&mut buf).expect("Failed to create ipv4 packet buffer");
     ip_packet.set_version(4);
     ip_packet.set_header_length(5);
     ip_packet.set_total_length(len as u16);
@@ -52,7 +53,10 @@ impl PacketDevice for MockTunDevice {
     }
 
     async fn send(&self, buf: &[u8]) -> anyhow::Result<usize> {
-        self.sent_packets_tx.send(buf.to_vec()).await.unwrap();
+        self.sent_packets_tx
+            .send(buf.to_vec())
+            .await
+            .expect("MockTunDevice failed to send packet");
         Ok(buf.len())
     }
 }
@@ -60,9 +64,9 @@ impl PacketDevice for MockTunDevice {
 #[tokio::test]
 async fn test_quota_exceeded() {
     let (config, session_manager, radius_client, _dhcp_server, firewall, _eapol_attribute_cache, _auth_tx, _auth_rx, config_tx) =
-        initialize_services(None).await;
+        initialize_services(None, Some(0)).await.expect("initialize_services failed");
 
-    let client_ip = "10.1.0.10".parse().unwrap();
+    let client_ip = "10.1.0.10".parse().expect("Failed to parse IP");
     let client_mac = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05];
     let quota = 1000;
 
@@ -76,7 +80,7 @@ async fn test_quota_exceeded() {
             session.params.maxoutputoctets = quota;
         })
         .await
-        .unwrap();
+        .expect("Failed to update session");
 
     let (sent_tx, _sent_rx) = mpsc::channel(100);
     let (to_recv_tx, to_recv_rx) = mpsc::channel(100);
@@ -98,11 +102,14 @@ async fn test_quota_exceeded() {
         download_tx,
     ));
 
-    let packet = create_ipv4_packet("8.8.8.8".parse().unwrap(), client_ip, 150);
+    let packet = create_ipv4_packet("8.8.8.8".parse().expect("Failed to parse IP"), client_ip, 150);
     let num_packets_to_exceed = (quota / packet.len() as u64) + 1;
 
     for _ in 0..num_packets_to_exceed {
-        to_recv_tx.send(packet.clone()).await.unwrap();
+        to_recv_tx
+            .send(packet.clone())
+            .await
+            .expect("Failed to send packet to mock tun device");
     }
 
     let result = tokio::time::timeout(Duration::from_secs(2), async {

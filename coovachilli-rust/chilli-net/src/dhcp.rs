@@ -271,7 +271,7 @@ impl DhcpServer {
             DhcpMessageType::Offer,
             config.dhcplisten,
             ip_to_offer,
-        );
+        )?;
 
         Ok(DhcpAction::Offer {
             response,
@@ -310,7 +310,7 @@ impl DhcpServer {
                         DhcpMessageType::Ack,
                         config.dhcplisten,
                         client_ip,
-                    );
+                    )?;
                     return Ok(DhcpAction::Ack {
                         response,
                         client_ip,
@@ -373,7 +373,7 @@ impl DhcpServer {
             DhcpMessageType::Ack,
             config.dhcplisten,
             requested_ip,
-        );
+        )?;
 
         Ok(DhcpAction::Ack {
             response,
@@ -389,9 +389,10 @@ impl DhcpServer {
         msg_type: DhcpMessageType,
         server_ip: Ipv4Addr,
         offered_ip: Ipv4Addr,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>> {
         let mut response_buf = vec![0u8; 512];
-        let packet = DhcpPacket::from_bytes_mut(&mut response_buf).unwrap();
+        let packet = DhcpPacket::from_bytes_mut(&mut response_buf)
+            .ok_or_else(|| anyhow::anyhow!("Failed to create DHCP response buffer"))?;
 
         packet.op = BootpMessageType::BootReply as u8;
         packet.htype = req_packet.htype;
@@ -443,7 +444,7 @@ impl DhcpServer {
         // The actual packet is from the start of the op code to the DHCP_OPTION_END
         let final_len = 236 + cursor;
         response_buf.truncate(final_len);
-        response_buf
+        Ok(response_buf)
     }
 }
 
@@ -457,24 +458,34 @@ mod tests {
     async fn test_handle_discover_and_request() {
         let config = Arc::new(Config::default());
         let (_config_tx, config_rx) = watch::channel(config);
-        let dhcp_server = DhcpServer::new(config_rx).await.unwrap();
+        let dhcp_server = DhcpServer::new(config_rx)
+            .await
+            .expect("Failed to create test DHCP server");
 
         // 1. Discover
         let mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
         let mut discover_buf = [0u8; 512];
-        let discover_packet = DhcpPacket::from_bytes_mut(&mut discover_buf).unwrap();
+        let discover_packet = DhcpPacket::from_bytes_mut(&mut discover_buf)
+            .expect("Failed to create discover packet buffer");
         discover_packet.op = BootpMessageType::BootRequest as u8;
         discover_packet.chaddr[..6].copy_from_slice(&mac);
         discover_packet.options[0..4].copy_from_slice(&DHCP_MAGIC_COOKIE);
         discover_packet.options[4..7].copy_from_slice(&[DHCP_OPTION_MESSAGE_TYPE, 1, DhcpMessageType::Discover as u8]);
         discover_packet.options[7] = DHCP_OPTION_END;
 
-        let src_addr = "0.0.0.0:68".parse().unwrap();
-        let action = dhcp_server.handle_dhcp_packet(discover_packet, src_addr, None).await.unwrap();
+        let src_addr = "0.0.0.0:68".parse().expect("Failed to parse source address");
+        let action = dhcp_server
+            .handle_dhcp_packet(discover_packet, src_addr, None)
+            .await
+            .expect("Handling discover packet failed");
 
         let offered_ip = if let DhcpAction::Offer { response, .. } = action {
-            let offer_packet = DhcpPacket::from_bytes(&response).unwrap();
-            assert_eq!(offer_packet.get_message_type(), Some(DhcpMessageType::Offer));
+            let offer_packet =
+                DhcpPacket::from_bytes(&response).expect("Failed to parse offer packet");
+            assert_eq!(
+                offer_packet.get_message_type(),
+                Some(DhcpMessageType::Offer)
+            );
             Ipv4Addr::from(u32::from_be(offer_packet.yiaddr))
         } else {
             panic!("Expected DhcpAction::Offer");
@@ -482,7 +493,8 @@ mod tests {
 
         // 2. Request
         let mut request_buf = [0u8; 512];
-        let request_packet = DhcpPacket::from_bytes_mut(&mut request_buf).unwrap();
+        let request_packet = DhcpPacket::from_bytes_mut(&mut request_buf)
+            .expect("Failed to create request packet buffer");
         request_packet.op = BootpMessageType::BootRequest as u8;
         request_packet.chaddr[..6].copy_from_slice(&mac);
         request_packet.options[0..4].copy_from_slice(&DHCP_MAGIC_COOKIE);
@@ -496,10 +508,14 @@ mod tests {
         cursor += 6;
         request_packet.options[cursor] = DHCP_OPTION_END;
 
-        let action = dhcp_server.handle_dhcp_packet(request_packet, src_addr, None).await.unwrap();
+        let action = dhcp_server
+            .handle_dhcp_packet(request_packet, src_addr, None)
+            .await
+            .expect("Handling request packet failed");
 
         if let DhcpAction::Ack { response, client_ip, client_mac } = action {
-            let ack_packet = DhcpPacket::from_bytes(&response).unwrap();
+            let ack_packet =
+                DhcpPacket::from_bytes(&response).expect("Failed to parse ack packet");
             assert_eq!(ack_packet.get_message_type(), Some(DhcpMessageType::Ack));
             assert_eq!(client_ip, offered_ip);
             assert_eq!(client_mac, mac);
