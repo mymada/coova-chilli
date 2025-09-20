@@ -2,7 +2,7 @@ pub mod config;
 pub mod cmdsock;
 
 use anyhow::Result;
-use chilli_core::{AuthType, Session, SessionManager};
+use chilli_core::{AuthType, Session, SessionManager, eapol_session::{EapolSession, EapolState}};
 use chilli_http::server;
 use chilli_net::dhcp::DhcpServer;
 use chilli_net::eap_mschapv2;
@@ -39,7 +39,9 @@ use chilli_net::eapol::EapolPacket;
 use chilli_net::AsyncDevice;
 use pnet_base::MacAddr;
 
-pub async fn initialize_services() -> (
+use std::net::SocketAddr;
+
+pub async fn initialize_services(radius_server: Option<SocketAddr>) -> (
     Arc<chilli_core::Config>,
     Arc<SessionManager>,
     Arc<RadiusClient>,
@@ -48,6 +50,7 @@ pub async fn initialize_services() -> (
     Arc<Mutex<HashMap<[u8; 6], RadiusAttributes>>>,
     tokio::sync::mpsc::Sender<chilli_core::AuthRequest>,
     tokio::sync::mpsc::Receiver<chilli_core::AuthRequest>,
+    tokio::sync::watch::Sender<Arc<chilli_core::Config>>,
 ) {
     let mut config = chilli_core::Config::default();
     config.dhcpif = "lo".to_string();
@@ -57,8 +60,15 @@ pub async fn initialize_services() -> (
     config.dhcpstart = Ipv4Addr::new(10, 1, 0, 1);
     config.dhcpend = Ipv4Addr::new(10, 1, 0, 1);
 
+    if let Some(addr) = radius_server {
+        if let std::net::IpAddr::V4(ip) = addr.ip() {
+            config.radiusserver1 = ip;
+        }
+        config.radiusauthport = addr.port();
+    }
+
     let initial_config = Arc::new(config);
-    let (_config_tx, config_rx) = watch::channel(initial_config);
+    let (config_tx, config_rx) = watch::channel(initial_config);
     let config_clone = config_rx.borrow().clone();
 
     let firewall = Arc::new(Firewall::new((*config_clone).clone()));
@@ -68,7 +78,7 @@ pub async fn initialize_services() -> (
     let dhcp_server = Arc::new(DhcpServer::new(config_rx.clone()).await.unwrap());
     let radius_client = Arc::new(RadiusClient::new(config_rx.clone()).await.unwrap());
 
-    (config_clone, session_manager, radius_client, dhcp_server, firewall, eapol_attribute_cache, auth_tx, auth_rx)
+    (config_clone, session_manager, radius_client, dhcp_server, firewall, eapol_attribute_cache, auth_tx, auth_rx, config_tx)
 }
 
 fn load_status(
@@ -1324,13 +1334,126 @@ async fn tun_packet_loop(
     }
 }
 
+// New helper function to build an EAPOL response
+fn build_eapol_response(eap_payload: Vec<u8>) -> Vec<u8> {
+    let mut eapol_response = vec![0u8; 4 + eap_payload.len()];
+    eapol_response[0] = 1; // Version
+    eapol_response[1] = chilli_net::eapol::EapolType::Eap as u8;
+    let length_bytes = (eap_payload.len() as u16).to_be_bytes();
+    eapol_response[2..4].copy_from_slice(&length_bytes);
+    eapol_response[4..].copy_from_slice(&eap_payload);
+    eapol_response
+}
+
+// New helper to build the initial Identity Request
+fn build_eap_identity_request(session: &mut EapolSession) -> Vec<u8> {
+    session.eap_identifier = 1;
+    session.state = EapolState::IdentitySent;
+    let eap_payload = vec![EapType::Identity as u8];
+    let eap_packet = EapPacket {
+        code: EapCode::Request,
+        identifier: session.eap_identifier,
+        data: eap_payload,
+    };
+    build_eapol_response(eap_packet.to_bytes())
+}
+
+// The new state machine logic
+async fn process_eapol_state(
+    session: &mut EapolSession,
+    eap_packet: &EapPacket,
+    radius_client: &Arc<RadiusClient>,
+) -> Result<Option<Vec<u8>>> {
+    if eap_packet.code != EapCode::Response {
+        warn!("Received EAP packet that is not a Response, ignoring.");
+        return Ok(None);
+    }
+
+    match session.state {
+        EapolState::IdentitySent => {
+            if let Some(eap_type) = eap_packet.data.get(0) {
+                if *eap_type == EapType::Identity as u8 {
+                    let username = String::from_utf8_lossy(&eap_packet.data[1..]).to_string();
+                    info!("Received EAP-Response/Identity for user: {}", username);
+                    session.username = Some(username);
+
+                    // Re-use the EAP-Response/Identity from the client to kick off the RADIUS conversation
+                    let eap_identity_response = EapPacket {
+                        code: EapCode::Response,
+                        identifier: eap_packet.identifier,
+                        data: eap_packet.data.to_vec(),
+                    };
+
+                    let result = radius_client.send_eap_response(&eap_identity_response.to_bytes(), session.radius_state.as_deref()).await;
+                    info!("RADIUS client result from IdentitySent: {:?}", result);
+                    match result {
+                        Ok(AuthResult::Challenge(eap_message, state)) => {
+                            session.radius_state = state;
+                            session.state = EapolState::Md5ChallengeSent;
+                            session.eap_identifier = session.eap_identifier.wrapping_add(1);
+
+                            // The eap_message from RADIUS is a full EAP packet (Request/MD5-Challenge)
+                            // We just need to wrap it in EAPOL
+                            return Ok(Some(build_eapol_response(eap_message)));
+                        }
+                        Ok(_) => {
+                            warn!("Expected Access-Challenge from RADIUS, but got something else.");
+                            session.state = EapolState::Failed;
+                        }
+                        Err(e) => {
+                            error!("RADIUS request failed: {}", e);
+                            session.state = EapolState::Failed;
+                        }
+                    }
+                } else {
+                    warn!("Received unexpected EAP type in IdentitySent state");
+                    session.state = EapolState::Failed;
+                }
+            }
+        }
+        EapolState::Md5ChallengeSent => {
+             if let Some(eap_type) = eap_packet.data.get(0) {
+                if *eap_type == EapType::Md5Challenge as u8 {
+                    info!("Received EAP-Response/MD5-Challenge from client");
+                    match radius_client.send_eap_response(&eap_packet.to_bytes(), session.radius_state.as_deref()).await {
+                        Ok(AuthResult::Success(_attributes)) => {
+                            info!("EAP-MD5 authentication successful");
+                            session.state = EapolState::Authenticated;
+                            let eap_success = EapPacket {
+                                code: EapCode::Success,
+                                identifier: eap_packet.identifier,
+                                data: vec![],
+                            };
+                            return Ok(Some(build_eapol_response(eap_success.to_bytes())));
+                        }
+                        _ => {
+                            warn!("EAP-MD5 authentication failed");
+                            session.state = EapolState::Failed;
+                            let eap_failure = EapPacket {
+                                code: EapCode::Failure,
+                                identifier: eap_packet.identifier,
+                                data: vec![],
+                            };
+                            return Ok(Some(build_eapol_response(eap_failure.to_bytes())));
+                        }
+                    }
+                }
+             }
+        }
+        _ => {
+            warn!("Received EAP packet in unhandled state: {:?}", session.state);
+        }
+    }
+    Ok(None)
+}
+
 async fn handle_eapol_frame(
     eapol_packet: &EapolPacket<'_>,
     src_mac: MacAddr,
     vlan_id: Option<u16>,
     session_manager: &Arc<SessionManager>,
     radius_client: &Arc<RadiusClient>,
-    eapol_attribute_cache: &Arc<Mutex<HashMap<[u8; 6], RadiusAttributes>>>,
+    _eapol_attribute_cache: &Arc<Mutex<HashMap<[u8; 6], RadiusAttributes>>>,
 ) -> Result<Option<Vec<u8>>> {
     info!(
         "Handling EAPOL {:?} frame from {} on vlan {:?}",
@@ -1340,110 +1463,56 @@ async fn handle_eapol_frame(
     match eapol_packet.packet_type {
         chilli_net::eapol::EapolType::Start => {
             info!("Received EAPOL-Start from {}", src_mac);
-            session_manager.create_eapol_session(src_mac.octets()).await;
+            if session_manager.get_eapol_session(&src_mac.octets()).await.is_none() {
+                session_manager.create_eapol_session(src_mac.octets()).await;
+            }
 
-            // Respond with EAP-Request/Identity
-            let eap_payload = vec![EapType::Identity as u8];
-            let eap_packet = EapPacket {
-                code: EapCode::Request,
-                identifier: 1, // Start with ID 1
-                data: eap_payload,
-            };
-            let eap_bytes = eap_packet.to_bytes();
-
-            let mut eapol_response = vec![0u8; 4 + eap_bytes.len()];
-            eapol_response[0] = 1; // Version
-            eapol_response[1] = chilli_net::eapol::EapolType::Eap as u8;
-            let length_bytes = (eap_bytes.len() as u16).to_be_bytes();
-            eapol_response[2..4].copy_from_slice(&length_bytes);
-            eapol_response[4..].copy_from_slice(&eap_bytes);
-
-            return Ok(Some(eapol_response));
+            if let Some(mut session) = session_manager.get_eapol_session(&src_mac.octets()).await {
+                let response = build_eap_identity_request(&mut session);
+                session_manager.update_eapol_session(&src_mac.octets(), |s| *s = session).await;
+                Ok(Some(response))
+            } else {
+                error!("Failed to create or retrieve EAPOL session for {}", src_mac);
+                Ok(None)
+            }
         }
         chilli_net::eapol::EapolType::Eap => {
-            let mut eapol_session = match session_manager.get_eapol_session(&src_mac.octets()).await {
-                Some(s) => s,
-                None => {
-                    warn!("Received EAP packet from {} without an EAPOL session", src_mac);
-                    return Ok(None);
-                }
-            };
+            if let Some(mut session) = session_manager.get_eapol_session(&src_mac.octets()).await {
+                if let Some(eap_packet) = EapPacket::from_bytes(eapol_packet.payload) {
+                    let response = process_eapol_state(&mut session, &eap_packet, radius_client).await?;
 
-            if let Some(eap_packet) = EapPacket::from_bytes(eapol_packet.payload) {
-                if eap_packet.code == EapCode::Response {
-                    let result = radius_client.send_eap_response(&eap_packet.data, eapol_session.radius_state.as_deref()).await?;
-                    match result {
-                        chilli_net::radius::AuthResult::Challenge(eap_message, state) => {
-                            eapol_session.radius_state = state;
-                            session_manager.update_eapol_session(&src_mac.octets(), |s| *s = eapol_session).await;
-
-                            let mut eapol_response = vec![0u8; 4 + eap_message.len()];
-                            eapol_response[0] = 1; // Version
-                            eapol_response[1] = chilli_net::eapol::EapolType::Eap as u8;
-                            let length_bytes = (eap_message.len() as u16).to_be_bytes();
-                            eapol_response[2..4].copy_from_slice(&length_bytes);
-                            eapol_response[4..].copy_from_slice(&eap_message);
-                            return Ok(Some(eapol_response));
-                        }
-                        chilli_net::radius::AuthResult::Success(attributes) => {
-                            info!("EAPOL authentication successful for {}", src_mac);
-                            session_manager.remove_eapol_session(&src_mac.octets()).await;
-
-                            eapol_attribute_cache.lock().await.insert(src_mac.octets(), attributes);
-
-                            let eap_packet = EapPacket {
-                                code: EapCode::Success,
-                                identifier: eap_packet.identifier,
-                                data: vec![],
-                            };
-                            let eap_bytes = eap_packet.to_bytes();
-
-                            let mut eapol_response = vec![0u8; 4 + eap_bytes.len()];
-                            eapol_response[0] = 1; // Version
-                            eapol_response[1] = chilli_net::eapol::EapolType::Eap as u8;
-                            let length_bytes = (eap_bytes.len() as u16).to_be_bytes();
-                            eapol_response[2..4].copy_from_slice(&length_bytes);
-                            eapol_response[4..].copy_from_slice(&eap_bytes);
-                            return Ok(Some(eapol_response));
-                        }
-                        chilli_net::radius::AuthResult::Failure => {
-                            info!("EAPOL authentication failed for {}", src_mac);
-                            session_manager.remove_eapol_session(&src_mac.octets()).await;
-
-                            let eap_packet = EapPacket {
-                                code: EapCode::Failure,
-                                identifier: eap_packet.identifier,
-                                data: vec![],
-                            };
-                            let eap_bytes = eap_packet.to_bytes();
-
-                            let mut eapol_response = vec![0u8; 4 + eap_bytes.len()];
-                            eapol_response[0] = 1; // Version
-                            eapol_response[1] = chilli_net::eapol::EapolType::Eap as u8;
-                            let length_bytes = (eap_bytes.len() as u16).to_be_bytes();
-                            eapol_response[2..4].copy_from_slice(&length_bytes);
-                            eapol_response[4..].copy_from_slice(&eap_bytes);
-                            return Ok(Some(eapol_response));
-                        }
-                        _ => {}
+                    if session.state == EapolState::Authenticated {
+                        info!("EAPOL authentication successful for {}", src_mac);
+                        // The RADIUS attributes are in the AuthResult::Success, which we are not capturing yet.
+                        // This will be handled when we fully integrate the attribute caching.
+                        // For now, we just mark the session as authenticated.
                     }
+
+                    session_manager.update_eapol_session(&src_mac.octets(), |s| *s = session).await;
+                    Ok(response)
+                } else {
+                    warn!("Failed to parse EAP packet");
+                    Ok(None)
                 }
+            } else {
+                warn!("Received EAP packet from {} without an EAPOL session", src_mac);
+                Ok(None)
             }
         }
         chilli_net::eapol::EapolType::Logoff => {
             info!("Received EAPOL-Logoff from {}", src_mac);
             if let Some(session) = session_manager.get_session_by_mac(&src_mac.octets()).await {
                 info!("Tearing down session for IP {}", session.hisip);
-                // TODO: Need firewall and radius_client here to do a full teardown
+                // TODO: Need firewall here to do a full teardown
                 session_manager.remove_session(&session.hisip).await;
             }
             session_manager.remove_eapol_session(&src_mac.octets()).await;
+            Ok(None)
         }
-        _ => {}
+        _ => Ok(None),
     }
-
-    Ok(None)
 }
+
 
 async fn packet_loop(
     mut tx: Box<dyn datalink::DataLinkSender>,
