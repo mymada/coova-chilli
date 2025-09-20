@@ -10,7 +10,11 @@ use tracing::{error, info, warn};
 
 /// Actions for the DHCP server to take.
 pub enum DhcpAction {
-    Offer(Vec<u8>),
+    Offer {
+        response: Vec<u8>,
+        client_ip: Ipv4Addr,
+        client_mac: [u8; 6],
+    },
     Ack {
         response: Vec<u8>,
         client_ip: Ipv4Addr,
@@ -282,7 +286,11 @@ impl DhcpServer {
             ip_to_offer,
         );
 
-        Ok(DhcpAction::Offer(response))
+        Ok(DhcpAction::Offer {
+            response,
+            client_ip: ip_to_offer,
+            client_mac: mac,
+        })
     }
 
     async fn handle_request(
@@ -406,43 +414,105 @@ impl DhcpServer {
         let mut cursor = 4;
 
         // Message Type
-        response_buf[cursor..cursor + 3].copy_from_slice(&[DHCP_OPTION_MESSAGE_TYPE, 1, msg_type as u8]);
+        packet.options[cursor..cursor + 3].copy_from_slice(&[DHCP_OPTION_MESSAGE_TYPE, 1, msg_type as u8]);
         cursor += 3;
 
         // Server ID
-        response_buf[cursor..cursor + 2].copy_from_slice(&[DHCP_OPTION_SERVER_ID, 4]);
-        response_buf[cursor + 2..cursor + 6].copy_from_slice(&server_ip.octets());
+        packet.options[cursor..cursor + 2].copy_from_slice(&[DHCP_OPTION_SERVER_ID, 4]);
+        packet.options[cursor + 2..cursor + 6].copy_from_slice(&server_ip.octets());
         cursor += 6;
 
         // Lease Time
         let lease_time_bytes = (config.lease as u32).to_be_bytes();
-        response_buf[cursor..cursor + 2].copy_from_slice(&[DHCP_OPTION_LEASE_TIME, 4]);
-        response_buf[cursor + 2..cursor + 6].copy_from_slice(&lease_time_bytes);
+        packet.options[cursor..cursor + 2].copy_from_slice(&[DHCP_OPTION_LEASE_TIME, 4]);
+        packet.options[cursor + 2..cursor + 6].copy_from_slice(&lease_time_bytes);
         cursor += 6;
 
         // Subnet Mask
         let netmask = config.mask;
-        response_buf[cursor..cursor + 2].copy_from_slice(&[DHCP_OPTION_SUBNET_MASK, 4]);
-        response_buf[cursor + 2..cursor + 6].copy_from_slice(&netmask.octets());
+        packet.options[cursor..cursor + 2].copy_from_slice(&[DHCP_OPTION_SUBNET_MASK, 4]);
+        packet.options[cursor + 2..cursor + 6].copy_from_slice(&netmask.octets());
         cursor += 6;
 
         // Router
-        response_buf[cursor..cursor + 2].copy_from_slice(&[DHCP_OPTION_ROUTER_OPTION, 4]);
-        response_buf[cursor + 2..cursor + 6].copy_from_slice(&config.uamlisten.octets());
+        packet.options[cursor..cursor + 2].copy_from_slice(&[DHCP_OPTION_ROUTER_OPTION, 4]);
+        packet.options[cursor + 2..cursor + 6].copy_from_slice(&config.uamlisten.octets());
         cursor += 6;
 
         // DNS Server
-        response_buf[cursor..cursor + 2].copy_from_slice(&[DHCP_OPTION_DNS, 8]);
-        response_buf[cursor + 2..cursor + 6].copy_from_slice(&config.dns1.octets());
-        response_buf[cursor + 6..cursor + 10].copy_from_slice(&config.dns2.octets());
+        packet.options[cursor..cursor + 2].copy_from_slice(&[DHCP_OPTION_DNS, 8]);
+        packet.options[cursor + 2..cursor + 6].copy_from_slice(&config.dns1.octets());
+        packet.options[cursor + 6..cursor + 10].copy_from_slice(&config.dns2.octets());
         cursor += 10;
 
-        response_buf[cursor] = DHCP_OPTION_END;
+        packet.options[cursor] = DHCP_OPTION_END;
         cursor += 1;
 
         // The actual packet is from the start of the op code to the DHCP_OPTION_END
         let final_len = 236 + cursor;
         response_buf.truncate(final_len);
         response_buf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chilli_core::Config;
+    use tokio::sync::watch;
+
+    #[tokio::test]
+    async fn test_handle_discover_and_request() {
+        let config = Arc::new(Config::default());
+        let (_config_tx, config_rx) = watch::channel(config);
+        let dhcp_server = DhcpServer::new(config_rx).await.unwrap();
+
+        // 1. Discover
+        let mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let mut discover_buf = [0u8; 512];
+        let discover_packet = DhcpPacket::from_bytes_mut(&mut discover_buf).unwrap();
+        discover_packet.op = BootpMessageType::BootRequest as u8;
+        discover_packet.chaddr[..6].copy_from_slice(&mac);
+        discover_packet.options[0..4].copy_from_slice(&DHCP_MAGIC_COOKIE);
+        discover_packet.options[4..7].copy_from_slice(&[DHCP_OPTION_MESSAGE_TYPE, 1, DhcpMessageType::Discover as u8]);
+        discover_packet.options[7] = DHCP_OPTION_END;
+
+        let src_addr = "0.0.0.0:68".parse().unwrap();
+        let action = dhcp_server.handle_dhcp_packet(discover_packet, src_addr, None).await.unwrap();
+
+        let offered_ip = if let DhcpAction::Offer { response, .. } = action {
+            let offer_packet = DhcpPacket::from_bytes(&response).unwrap();
+            assert_eq!(offer_packet.get_message_type(), Some(DhcpMessageType::Offer));
+            Ipv4Addr::from(u32::from_be(offer_packet.yiaddr))
+        } else {
+            panic!("Expected DhcpAction::Offer");
+        };
+
+        // 2. Request
+        let mut request_buf = [0u8; 512];
+        let request_packet = DhcpPacket::from_bytes_mut(&mut request_buf).unwrap();
+        request_packet.op = BootpMessageType::BootRequest as u8;
+        request_packet.chaddr[..6].copy_from_slice(&mac);
+        request_packet.options[0..4].copy_from_slice(&DHCP_MAGIC_COOKIE);
+        let mut cursor = 4;
+        request_packet.options[cursor..cursor + 3].copy_from_slice(&[DHCP_OPTION_MESSAGE_TYPE, 1, DhcpMessageType::Request as u8]);
+        cursor += 3;
+        request_packet.options[cursor..cursor + 6].copy_from_slice(&[DHCP_OPTION_REQUESTED_IP, 4, offered_ip.octets()[0], offered_ip.octets()[1], offered_ip.octets()[2], offered_ip.octets()[3]]);
+        cursor += 6;
+        let server_id = dhcp_server.config.lock().await.dhcplisten;
+        request_packet.options[cursor..cursor + 6].copy_from_slice(&[DHCP_OPTION_SERVER_ID, 4, server_id.octets()[0], server_id.octets()[1], server_id.octets()[2], server_id.octets()[3]]);
+        cursor += 6;
+        request_packet.options[cursor] = DHCP_OPTION_END;
+
+        let action = dhcp_server.handle_dhcp_packet(request_packet, src_addr, None).await.unwrap();
+
+        if let DhcpAction::Ack { response, client_ip, client_mac } = action {
+            let ack_packet = DhcpPacket::from_bytes(&response).unwrap();
+            assert_eq!(ack_packet.get_message_type(), Some(DhcpMessageType::Ack));
+            assert_eq!(client_ip, offered_ip);
+            assert_eq!(client_mac, mac);
+        } else {
+            panic!("Expected DhcpAction::Ack");
+        }
     }
 }

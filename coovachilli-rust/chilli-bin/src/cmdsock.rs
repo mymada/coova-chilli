@@ -177,7 +177,7 @@ mod tests {
         let test_ip: Ipv4Addr = "192.168.1.10".parse()?;
         let test_mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
         session_manager
-            .create_session(test_ip, test_mac, &config)
+            .create_session(test_ip, test_mac, &config, None)
             .await;
         session_manager.authenticate_session(&test_ip).await;
 
