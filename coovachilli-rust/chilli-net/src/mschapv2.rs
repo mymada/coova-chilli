@@ -107,7 +107,7 @@ pub fn generate_success_response(
     sha1.update(&magic);
     let digest = sha1.finalize();
 
-    let mut magic2 = [0u8; 40];
+    let mut magic2 = [0u8; 41];
     magic2.copy_from_slice(b"Pad to make it do more than one iteration");
     let mut sha2 = Sha1::new();
     sha2.update(&digest);

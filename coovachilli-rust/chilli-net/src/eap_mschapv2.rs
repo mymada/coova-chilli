@@ -28,13 +28,14 @@ pub fn parse_challenge_request(packet: &EapPacket) -> Option<([u8; 16], u8)> {
 }
 
 pub fn create_challenge_response_packet(
-    identifier: u8,
+    eap_identifier: u8,
+    mschapv2_identifier: u8,
     peer_challenge: &[u8; 16],
     nt_response: &[u8; 24],
     username: &str,
 ) -> EapPacket {
     let mut data = vec![0x02]; // Op-Code: Response
-    data.push(identifier);
+    data.push(mschapv2_identifier);
     let length = (52 + username.len()) as u16;
     data.extend_from_slice(&length.to_be_bytes());
     data.extend_from_slice(peer_challenge);
@@ -46,7 +47,7 @@ pub fn create_challenge_response_packet(
     let eap_data = create_eap_payload(EapType::MsChapV2, &data);
     EapPacket {
         code: EapCode::Response,
-        identifier,
+        identifier: eap_identifier,
         data: eap_data,
     }
 }

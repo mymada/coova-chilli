@@ -778,7 +778,7 @@ async fn handle_eap_auth(
                         let password = req.password.as_deref().unwrap_or_default();
                         let peer_challenge = mschapv2::generate_challenge();
                         if let Some(nt_response) = mschapv2::verify_response_and_generate_nt_response(&challenge, &peer_challenge, &req.username, password) {
-                            let response_packet = eap_mschapv2::create_challenge_response_packet(identifier, &peer_challenge, &nt_response, &req.username);
+                            let response_packet = eap_mschapv2::create_challenge_response_packet(eap_request.identifier, identifier, &peer_challenge, &nt_response, &req.username);
                             info!("Sending EAP Challenge Response: {:?}", response_packet);
                             result = radius_client.send_eap_response(&response_packet.to_bytes(), eap_state.as_deref()).await;
                         } else {
@@ -850,7 +850,14 @@ async fn handle_mschapv1_auth(
                 return;
             }
             let identifier = challenge_data[0];
-            let challenge: [u8; 8] = challenge_data[1..9].try_into().unwrap();
+            let challenge: [u8; 8] = match challenge_data[1..9].try_into() {
+                Ok(c) => c,
+                Err(_) => {
+                    error!("Invalid CHAP challenge received from RADIUS server: incorrect length.");
+                    req.tx.send(false).ok();
+                    return;
+                }
+            };
 
             let password = req.password.as_deref().unwrap_or_default();
             let response = mschapv1::mschap_lanman_response(&challenge, password);
@@ -941,65 +948,6 @@ async fn auth_loop(
     }
 }
 
-//
-// FIXME: Architectural Limitation for EAPOL/VLAN support
-//
-// The current packet processing architecture, which relies on a TUN/TAP interface
-// for handling IP packets, is not suitable for implementing features that
-// require access to raw Ethernet frames from the physical interface, such as
-// 802.1x (EAPOL) and 802.1q (VLAN).
-//
-// The original C implementation of CoovaChilli uses raw sockets (pcap or SOCK_PACKET)
-// to capture all traffic on the physical interface (`dhcpif`). This allows it
-// to inspect Ethernet headers and handle non-IP protocols like EAPOL and ARP,
-// as well as VLAN tags.
-//
-// The current Rust implementation's `DhcpServer` uses a `UdpSocket`, which
-// operates at a higher level and does not provide access to the Ethernet layer.
-// The `packet_loop` in this file only sees IP packets that have been routed
-// through the TUN/TAP device.
-//
-// To properly implement EAPOL and VLAN support, a significant refactoring is
-// required to introduce a raw packet capture mechanism. This would likely involve:
-// 1. Using a crate like `pnet` to open a raw socket on the `dhcpif`.
-// 2. Creating a new packet processing loop that receives raw Ethernet frames.
-// 3. Dispatching frames based on their EtherType (e.g., to an EAPOL handler,
-//    an ARP handler, or an IP handler).
-// 4. Modifying the `DhcpServer` to integrate with this new packet capture
-//    mechanism instead of using a `UdpSocket`.
-//
-// This work has been postponed in favor of completing other features.
-//
-
-//
-// FIXME: Architectural Limitation for EAPOL/VLAN support
-//
-// The current packet processing architecture, which relies on a TUN/TAP interface
-// for handling IP packets, is not suitable for implementing features that
-// require access to raw Ethernet frames from the physical interface, such as
-// 802.1x (EAPOL) and 802.1q (VLAN).
-//
-// The original C implementation of CoovaChilli uses raw sockets (pcap or SOCK_PACKET)
-// to capture all traffic on the physical interface (`dhcpif`). This allows it
-// to inspect Ethernet headers and handle non-IP protocols like EAPOL and ARP,
-// as well as VLAN tags.
-//
-// The current Rust implementation's `DhcpServer` uses a `UdpSocket`, which
-// operates at a higher level and does not provide access to the Ethernet layer.
-// The `packet_loop` in this file only sees IP packets that have been routed
-// through the TUN/TAP device.
-//
-// To properly implement EAPOL and VLAN support, a significant refactoring is
-// required to introduce a raw packet capture mechanism. This would likely involve:
-// 1. Using a crate like `pnet` to open a raw socket on the `dhcpif`.
-// 2. Creating a new packet processing loop that receives raw Ethernet frames.
-// 3. Dispatching frames based on their EtherType (e.g., to an EAPOL handler,
-//    an ARP handler, or an IP handler).
-// 4. Modifying the `DhcpServer` to integrate with this new packet capture
-//    mechanism instead of using a `UdpSocket`.
-//
-// This work has been postponed in favor of completing other features.
-//
 
 async fn arp_lookup(
     if_name: &str,
@@ -1085,14 +1033,18 @@ async fn arp_lookup(
 
 async fn build_arp_reply(
     ethernet_packet: &EthernetPacket<'_>,
-    session_manager: &Arc<SessionManager>,
+    config: &Arc<chilli_core::Config>,
     our_mac: MacAddr,
 ) -> Option<Vec<u8>> {
     if let Some(arp_packet) = ArpPacket::new(ethernet_packet.payload()) {
         if arp_packet.get_operation() == ArpOperations::Request {
             let target_ip = arp_packet.get_target_proto_addr();
-            if session_manager.get_session(&target_ip).await.is_some() {
-                info!("Building ARP reply for our IP {}", target_ip);
+            let target_ip_u32 = u32::from(target_ip);
+            let dhcp_start_u32 = u32::from(config.dhcpstart);
+            let dhcp_end_u32 = u32::from(config.dhcpend);
+
+            if target_ip_u32 >= dhcp_start_u32 && target_ip_u32 <= dhcp_end_u32 {
+                info!("Building Proxy ARP reply for IP {}", target_ip);
 
                 let src_mac = ethernet_packet.get_source();
                 let src_ip = arp_packet.get_sender_proto_addr();
@@ -1263,7 +1215,7 @@ async fn handle_ethernet_frame(
             }
         }
         EtherTypes::Arp => {
-            if let Some(reply) = build_arp_reply(ethernet_packet, session_manager, our_mac).await {
+            if let Some(reply) = build_arp_reply(ethernet_packet, config, our_mac).await {
                 if tx.send_to(&reply, None).is_none() {
                     error!("Failed to send ARP reply");
                 }
@@ -1389,10 +1341,10 @@ async fn process_eapol_state(
                     match result {
                         Ok(AuthResult::Challenge(eap_message, state)) => {
                             session.radius_state = state;
-                            session.state = EapolState::Md5ChallengeSent;
+                            session.state = EapolState::ChallengeSent;
                             session.eap_identifier = session.eap_identifier.wrapping_add(1);
 
-                            // The eap_message from RADIUS is a full EAP packet (Request/MD5-Challenge)
+                            // The eap_message from RADIUS is a full EAP packet (Request/Challenge)
                             // We just need to wrap it in EAPOL
                             return Ok(Some(build_eapol_response(eap_message)));
                         }
@@ -1411,14 +1363,15 @@ async fn process_eapol_state(
                 }
             }
         }
-        EapolState::Md5ChallengeSent => {
+        EapolState::ChallengeSent => {
              if let Some(eap_type) = eap_packet.data.get(0) {
-                if *eap_type == EapType::Md5Challenge as u8 {
-                    info!("Received EAP-Response/MD5-Challenge from client");
+                if *eap_type == EapType::Md5Challenge as u8 || *eap_type == EapType::MsChapV2 as u8 {
+                    info!("Received EAP-Response/Challenge from client (type: {})", eap_type);
                     match radius_client.send_eap_response(&eap_packet.to_bytes(), session.radius_state.as_deref()).await {
                         Ok(AuthResult::Success(_attributes)) => {
-                            info!("EAP-MD5 authentication successful");
+                            info!("EAP authentication successful");
                             session.state = EapolState::Authenticated;
+                            // TODO: Cache attributes for post-DHCP application
                             let eap_success = EapPacket {
                                 code: EapCode::Success,
                                 identifier: eap_packet.identifier,
@@ -1426,8 +1379,14 @@ async fn process_eapol_state(
                             };
                             return Ok(Some(build_eapol_response(eap_success.to_bytes())));
                         }
+                        Ok(AuthResult::Challenge(eap_message, state)) => {
+                            info!("Received another challenge from RADIUS (likely for EAP-MSCHAPv2 success message)");
+                            session.radius_state = state;
+                            session.state = EapolState::ChallengeSent; // Stay in this state
+                            return Ok(Some(build_eapol_response(eap_message)));
+                        }
                         _ => {
-                            warn!("EAP-MD5 authentication failed");
+                            warn!("EAP authentication failed");
                             session.state = EapolState::Failed;
                             let eap_failure = EapPacket {
                                 code: EapCode::Failure,
@@ -1463,17 +1422,28 @@ async fn handle_eapol_frame(
     match eapol_packet.packet_type {
         chilli_net::eapol::EapolType::Start => {
             info!("Received EAPOL-Start from {}", src_mac);
-            if session_manager.get_eapol_session(&src_mac.octets()).await.is_none() {
-                session_manager.create_eapol_session(src_mac.octets()).await;
-            }
+            let mut session = match session_manager.get_eapol_session(&src_mac.octets()).await {
+                Some(s) => s,
+                None => {
+                    // Create a new session if one doesn't exist
+                    session_manager.create_eapol_session(src_mac.octets()).await;
+                    // This unwrap is safe because we just created it.
+                    session_manager.get_eapol_session(&src_mac.octets()).await.unwrap()
+                }
+            };
 
-            if let Some(mut session) = session_manager.get_eapol_session(&src_mac.octets()).await {
-                let response = build_eap_identity_request(&mut session);
-                session_manager.update_eapol_session(&src_mac.octets(), |s| *s = session).await;
-                Ok(Some(response))
-            } else {
-                error!("Failed to create or retrieve EAPOL session for {}", src_mac);
-                Ok(None)
+            match session.state {
+                EapolState::IdentitySent | EapolState::ChallengeSent => {
+                    warn!("Ignoring EAPOL-Start for MAC {} in state {:?}", src_mac, session.state);
+                    Ok(None)
+                }
+                _ => { // Start, Authenticated, or Failed state, it's safe to restart
+                    info!("Processing EAPOL-Start for MAC {}, (re)starting authentication.", src_mac);
+                    session.state = EapolState::Start;
+                    let response = build_eap_identity_request(&mut session);
+                    session_manager.update_eapol_session(&src_mac.octets(), |s| *s = session).await;
+                    Ok(Some(response))
+                }
             }
         }
         chilli_net::eapol::EapolType::Eap => {
@@ -1794,13 +1764,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_arp_reply() {
-        let session_manager = Arc::new(SessionManager::new());
-        let config = Config::default();
-        let our_mac = MacAddr::new(0x00, 0x01, 0x02, 0x03, 0x04, 0x05);
-        let client_ip = "10.0.0.10".parse().unwrap();
-        let client_mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let mut config = Config::default();
+        config.dhcpstart = "10.0.0.10".parse().unwrap();
+        config.dhcpend = "10.0.0.20".parse().unwrap();
+        let arc_config = Arc::new(config);
 
-        session_manager.create_session(client_ip, client_mac, &config, None).await;
+        let our_mac = MacAddr::new(0x00, 0x01, 0x02, 0x03, 0x04, 0x05);
+        let client_ip = "10.0.0.15".parse().unwrap(); // IP within the DHCP range
 
         let mut ethernet_buffer = [0u8; 42];
         let mut request_packet = MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
@@ -1821,7 +1791,7 @@ mod tests {
         arp_packet.set_target_proto_addr(client_ip);
         request_packet.set_payload(arp_packet.packet());
 
-        let reply = build_arp_reply(&request_packet.to_immutable(), &session_manager, our_mac).await;
+        let reply = build_arp_reply(&request_packet.to_immutable(), &arc_config, our_mac).await;
 
         assert!(reply.is_some());
         let reply_vec = reply.unwrap();

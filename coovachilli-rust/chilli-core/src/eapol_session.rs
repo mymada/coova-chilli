@@ -2,16 +2,16 @@
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EapolState {
-    Started,
+    Start,
     IdentitySent,
-    Md5ChallengeSent,
+    ChallengeSent,
     Authenticated,
     Failed,
 }
 
 impl Default for EapolState {
     fn default() -> Self {
-        EapolState::Started
+        EapolState::Start
     }
 }
 
@@ -33,7 +33,7 @@ impl EapolSession {
     pub fn new(mac_addr: [u8; 6]) -> Self {
         EapolSession {
             mac_addr,
-            state: EapolState::Started,
+            state: EapolState::Start,
             eap_identifier: 0,
             radius_state: None,
             username: None,
