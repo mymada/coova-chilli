@@ -850,7 +850,14 @@ async fn handle_mschapv1_auth(
                 return;
             }
             let identifier = challenge_data[0];
-            let challenge: [u8; 8] = challenge_data[1..9].try_into().unwrap();
+            let challenge: [u8; 8] = match challenge_data[1..9].try_into() {
+                Ok(c) => c,
+                Err(_) => {
+                    error!("Invalid CHAP challenge received from RADIUS server: incorrect length.");
+                    req.tx.send(false).ok();
+                    return;
+                }
+            };
 
             let password = req.password.as_deref().unwrap_or_default();
             let response = mschapv1::mschap_lanman_response(&challenge, password);
