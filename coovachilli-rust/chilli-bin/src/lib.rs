@@ -778,7 +778,7 @@ async fn handle_eap_auth(
                         let password = req.password.as_deref().unwrap_or_default();
                         let peer_challenge = mschapv2::generate_challenge();
                         if let Some(nt_response) = mschapv2::verify_response_and_generate_nt_response(&challenge, &peer_challenge, &req.username, password) {
-                            let response_packet = eap_mschapv2::create_challenge_response_packet(identifier, &peer_challenge, &nt_response, &req.username);
+                            let response_packet = eap_mschapv2::create_challenge_response_packet(eap_request.identifier, identifier, &peer_challenge, &nt_response, &req.username);
                             info!("Sending EAP Challenge Response: {:?}", response_packet);
                             result = radius_client.send_eap_response(&response_packet.to_bytes(), eap_state.as_deref()).await;
                         } else {
@@ -941,65 +941,6 @@ async fn auth_loop(
     }
 }
 
-//
-// FIXME: Architectural Limitation for EAPOL/VLAN support
-//
-// The current packet processing architecture, which relies on a TUN/TAP interface
-// for handling IP packets, is not suitable for implementing features that
-// require access to raw Ethernet frames from the physical interface, such as
-// 802.1x (EAPOL) and 802.1q (VLAN).
-//
-// The original C implementation of CoovaChilli uses raw sockets (pcap or SOCK_PACKET)
-// to capture all traffic on the physical interface (`dhcpif`). This allows it
-// to inspect Ethernet headers and handle non-IP protocols like EAPOL and ARP,
-// as well as VLAN tags.
-//
-// The current Rust implementation's `DhcpServer` uses a `UdpSocket`, which
-// operates at a higher level and does not provide access to the Ethernet layer.
-// The `packet_loop` in this file only sees IP packets that have been routed
-// through the TUN/TAP device.
-//
-// To properly implement EAPOL and VLAN support, a significant refactoring is
-// required to introduce a raw packet capture mechanism. This would likely involve:
-// 1. Using a crate like `pnet` to open a raw socket on the `dhcpif`.
-// 2. Creating a new packet processing loop that receives raw Ethernet frames.
-// 3. Dispatching frames based on their EtherType (e.g., to an EAPOL handler,
-//    an ARP handler, or an IP handler).
-// 4. Modifying the `DhcpServer` to integrate with this new packet capture
-//    mechanism instead of using a `UdpSocket`.
-//
-// This work has been postponed in favor of completing other features.
-//
-
-//
-// FIXME: Architectural Limitation for EAPOL/VLAN support
-//
-// The current packet processing architecture, which relies on a TUN/TAP interface
-// for handling IP packets, is not suitable for implementing features that
-// require access to raw Ethernet frames from the physical interface, such as
-// 802.1x (EAPOL) and 802.1q (VLAN).
-//
-// The original C implementation of CoovaChilli uses raw sockets (pcap or SOCK_PACKET)
-// to capture all traffic on the physical interface (`dhcpif`). This allows it
-// to inspect Ethernet headers and handle non-IP protocols like EAPOL and ARP,
-// as well as VLAN tags.
-//
-// The current Rust implementation's `DhcpServer` uses a `UdpSocket`, which
-// operates at a higher level and does not provide access to the Ethernet layer.
-// The `packet_loop` in this file only sees IP packets that have been routed
-// through the TUN/TAP device.
-//
-// To properly implement EAPOL and VLAN support, a significant refactoring is
-// required to introduce a raw packet capture mechanism. This would likely involve:
-// 1. Using a crate like `pnet` to open a raw socket on the `dhcpif`.
-// 2. Creating a new packet processing loop that receives raw Ethernet frames.
-// 3. Dispatching frames based on their EtherType (e.g., to an EAPOL handler,
-//    an ARP handler, or an IP handler).
-// 4. Modifying the `DhcpServer` to integrate with this new packet capture
-//    mechanism instead of using a `UdpSocket`.
-//
-// This work has been postponed in favor of completing other features.
-//
 
 async fn arp_lookup(
     if_name: &str,
@@ -1389,10 +1330,10 @@ async fn process_eapol_state(
                     match result {
                         Ok(AuthResult::Challenge(eap_message, state)) => {
                             session.radius_state = state;
-                            session.state = EapolState::Md5ChallengeSent;
+                            session.state = EapolState::ChallengeSent;
                             session.eap_identifier = session.eap_identifier.wrapping_add(1);
 
-                            // The eap_message from RADIUS is a full EAP packet (Request/MD5-Challenge)
+                            // The eap_message from RADIUS is a full EAP packet (Request/Challenge)
                             // We just need to wrap it in EAPOL
                             return Ok(Some(build_eapol_response(eap_message)));
                         }
@@ -1411,14 +1352,15 @@ async fn process_eapol_state(
                 }
             }
         }
-        EapolState::Md5ChallengeSent => {
+        EapolState::ChallengeSent => {
              if let Some(eap_type) = eap_packet.data.get(0) {
-                if *eap_type == EapType::Md5Challenge as u8 {
-                    info!("Received EAP-Response/MD5-Challenge from client");
+                if *eap_type == EapType::Md5Challenge as u8 || *eap_type == EapType::MsChapV2 as u8 {
+                    info!("Received EAP-Response/Challenge from client (type: {})", eap_type);
                     match radius_client.send_eap_response(&eap_packet.to_bytes(), session.radius_state.as_deref()).await {
                         Ok(AuthResult::Success(_attributes)) => {
-                            info!("EAP-MD5 authentication successful");
+                            info!("EAP authentication successful");
                             session.state = EapolState::Authenticated;
+                            // TODO: Cache attributes for post-DHCP application
                             let eap_success = EapPacket {
                                 code: EapCode::Success,
                                 identifier: eap_packet.identifier,
@@ -1426,8 +1368,14 @@ async fn process_eapol_state(
                             };
                             return Ok(Some(build_eapol_response(eap_success.to_bytes())));
                         }
+                        Ok(AuthResult::Challenge(eap_message, state)) => {
+                            info!("Received another challenge from RADIUS (likely for EAP-MSCHAPv2 success message)");
+                            session.radius_state = state;
+                            session.state = EapolState::ChallengeSent; // Stay in this state
+                            return Ok(Some(build_eapol_response(eap_message)));
+                        }
                         _ => {
-                            warn!("EAP-MD5 authentication failed");
+                            warn!("EAP authentication failed");
                             session.state = EapolState::Failed;
                             let eap_failure = EapPacket {
                                 code: EapCode::Failure,
@@ -1468,6 +1416,7 @@ async fn handle_eapol_frame(
             }
 
             if let Some(mut session) = session_manager.get_eapol_session(&src_mac.octets()).await {
+                session.state = EapolState::Start; // Reset state on new Start
                 let response = build_eap_identity_request(&mut session);
                 session_manager.update_eapol_session(&src_mac.octets(), |s| *s = session).await;
                 Ok(Some(response))
