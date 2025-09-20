@@ -310,6 +310,7 @@ async fn test_eap_mschapv2_flow() {
     let server_addr = server_socket.local_addr().unwrap();
 
     let (config, session_manager, radius_client, dhcp_server, firewall, eapol_attribute_cache, auth_tx, _auth_rx, _config_tx) = initialize_services(Some(server_addr)).await;
+    let (upload_tx, _upload_rx) = tokio::sync::mpsc::channel(100);
     let secret = config.radiussecret.clone();
 
     let mock_server_handle = tokio::spawn(mock_radius_server_eap_mschapv2(server_socket, secret));
@@ -326,15 +327,42 @@ async fn test_eap_mschapv2_flow() {
     });
 
     info!("Starting DHCP Flow");
+    // --- DHCP Discover ---
     let discover_payload = build_dhcp_payload(client_mac, xid, DhcpMessageType::Discover, None, None);
     let discover_packet = build_full_dhcp_packet(client_mac, discover_payload);
-    process_ethernet_frame(&mut tx, our_mac, &discover_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx).await;
+    process_ethernet_frame(&mut tx, our_mac, &discover_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
+
+    // --- Capture and parse Offer ---
+    let offered_ip = {
+        let packets = sent_packets.lock().unwrap();
+        assert_eq!(packets.len(), 1, "Expected DHCP Offer packet");
+        let offer_eth_packet = EthernetPacket::new(&packets[0]).unwrap();
+        let offer_ip_packet = ipv4::Ipv4Packet::new(offer_eth_packet.payload()).unwrap();
+        let offer_udp_packet = udp::UdpPacket::new(offer_ip_packet.payload()).unwrap();
+        let offer_dhcp_packet = DhcpPacket::from_bytes(offer_udp_packet.payload()).unwrap();
+        let offered_ip = Ipv4Addr::from(u32::from_be(offer_dhcp_packet.yiaddr));
+        info!("Received offer for IP: {}", offered_ip);
+        offered_ip
+    };
     sent_packets.lock().unwrap().clear();
 
-    let offered_ip = Ipv4Addr::new(10, 1, 0, 1);
-    let request_payload = build_dhcp_payload(client_mac, xid, DhcpMessageType::Request, Some(offered_ip), Some(config.net));
+    // --- DHCP Request ---
+    let request_payload = build_dhcp_payload(client_mac, xid, DhcpMessageType::Request, Some(offered_ip), Some(config.dhcplisten));
     let request_packet = build_full_dhcp_packet(client_mac, request_payload);
-    process_ethernet_frame(&mut tx, our_mac, &request_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx).await;
+    process_ethernet_frame(&mut tx, our_mac, &request_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
+
+    // --- Wait for ACK to be sent ---
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let packets = sent_packets.lock().unwrap();
+            if !packets.is_empty() {
+                assert_eq!(packets.len(), 1, "Expected DHCP ACK packet");
+                break;
+            }
+            drop(packets);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("Timed out waiting for DHCP ACK");
     sent_packets.lock().unwrap().clear();
 
     assert!(session_manager.get_session(&offered_ip).await.is_some(), "Session should exist after DHCP");
@@ -342,7 +370,7 @@ async fn test_eap_mschapv2_flow() {
 
     info!("Sending EAPOL-Start");
     let start_packet = build_eapol_packet(client_mac, our_mac, EapolType::Start, None);
-    process_ethernet_frame(&mut tx, our_mac, &start_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx).await;
+    process_ethernet_frame(&mut tx, our_mac, &start_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
 
     info!("Verifying EAP-Request/Identity");
     let packets = sent_packets.lock().unwrap();
@@ -368,7 +396,7 @@ async fn test_eap_mschapv2_flow() {
         data: identity_resp_payload,
     };
     let identity_resp_packet = build_eapol_packet(client_mac, our_mac, EapolType::Eap, Some(identity_resp_eap.to_bytes()));
-    process_ethernet_frame(&mut tx, our_mac, &identity_resp_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx).await;
+    process_ethernet_frame(&mut tx, our_mac, &identity_resp_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
 
     info!("Waiting for EAP-Request/MS-CHAPv2-Challenge...");
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -428,6 +456,7 @@ async fn test_eap_mschapv2_flow() {
         &config,
         &eapol_attribute_cache,
         &auth_tx,
+        &upload_tx,
     )
     .await;
 
@@ -482,6 +511,7 @@ async fn test_eap_mschapv2_flow() {
         &config,
         &eapol_attribute_cache,
         &auth_tx,
+        &upload_tx,
     )
     .await;
 

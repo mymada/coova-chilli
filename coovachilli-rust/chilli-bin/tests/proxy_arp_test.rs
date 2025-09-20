@@ -80,7 +80,8 @@ async fn test_proxy_arp_reply() {
     // Simulate Client A sending an ARP request for Client B's IP
     let arp_request_packet = build_arp_request(client_a_mac, client_a_ip, client_b_ip);
 
-    process_ethernet_frame(&mut tx, our_mac, &arp_request_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx).await;
+    let (upload_tx, _) = tokio::sync::mpsc::channel(1);
+    process_ethernet_frame(&mut tx, our_mac, &arp_request_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
 
     // Verify that we sent a reply
     let packets = sent_packets.lock().unwrap();

@@ -249,11 +249,11 @@ impl DhcpServer {
     ) -> Result<DhcpAction> {
         let mac = req_packet.get_mac();
         let leases = self.leases.lock().await;
-        let mut pool = self.ip_pool.lock().await;
+        let pool = self.ip_pool.lock().await;
 
         let ip_to_offer = match leases.get(&mac) {
             Some(lease) => lease.ip,
-            None => match pool.pop() {
+            None => match pool.last().cloned() {
                 Some(ip) => ip,
                 None => {
                     error!("DHCP IP pool is empty!");
@@ -361,6 +361,11 @@ impl DhcpServer {
             expires: SystemTime::now() + lease_duration,
         };
         leases.insert(mac, lease.clone());
+
+        // Now that the lease is confirmed, remove the IP from the available pool
+        let mut pool = self.ip_pool.lock().await;
+        pool.retain(|&x| x != requested_ip);
+        drop(pool);
 
         let response = self.build_response(
             &config,
