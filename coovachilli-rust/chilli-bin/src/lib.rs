@@ -354,6 +354,8 @@ pub async fn run() -> Result<()> {
         Arc::new(Mutex::new(HashMap::<[u8; 6], RadiusAttributes>::new()));
 
     let (auth_tx, auth_rx) = tokio::sync::mpsc::channel(100);
+    let (upload_tx, upload_rx) = tokio::sync::mpsc::channel(100);
+    let (download_tx, download_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, MacAddr)>(100);
 
     let config_clone_http = config.clone();
     let auth_tx_http = auth_tx.clone();
@@ -469,6 +471,8 @@ pub async fn run() -> Result<()> {
         walled_garden_ips.clone(),
         eapol_attribute_cache.clone(),
         auth_tx.clone(),
+        upload_tx,
+        download_rx,
     ));
 
     let tun_loop_handle = tokio::spawn(tun_packet_loop(
@@ -477,6 +481,8 @@ pub async fn run() -> Result<()> {
         config_rx.clone(),
         radius_client.clone(),
         firewall.clone(),
+        upload_rx,
+        download_tx,
     ));
 
     let auth_loop_handle = tokio::spawn(auth_loop(
@@ -1168,71 +1174,173 @@ async fn handle_ethernet_frame(
     config: &Arc<chilli_core::Config>,
     eapol_attribute_cache: &Arc<Mutex<HashMap<[u8; 6], RadiusAttributes>>>,
     auth_tx: &tokio::sync::mpsc::Sender<chilli_core::AuthRequest>,
+    upload_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
     match ethernet_packet.get_ethertype() {
         EtherTypes::Ipv4 => {
-            if let Some(ipv4_packet) = Ipv4Packet::new(ethernet_packet.payload()) {
-                if ipv4_packet.get_next_level_protocol() == pnet::packet::ip::IpNextHeaderProtocols::Udp {
-                    if let Some(udp_packet) = UdpPacket::new(ipv4_packet.payload()) {
-                        if udp_packet.get_destination() == 67 {
-                            if let Some(dhcp_packet) =
-                                chilli_net::dhcp::DhcpPacket::from_bytes(udp_packet.payload())
-                            {
-                                let src_addr = std::net::SocketAddr::new(
-                                    std::net::IpAddr::V4(ipv4_packet.get_source()),
-                                    udp_packet.get_source(),
-                                );
-                                if let Ok(action) = dhcp_server
-                                    .handle_dhcp_packet(dhcp_packet, src_addr, vlan_id)
-                                    .await
-                                {
-                                    use chilli_net::dhcp::DhcpAction;
-                                    match action {
-                                        DhcpAction::Ack { response, client_ip, client_mac } => {
-                                            let broadcast_flag = dhcp_packet.flags & 0x8000 != 0;
-                                            build_and_send_dhcp_response(tx, &response, our_mac, MacAddr::from(client_mac), config.dhcplisten, client_ip, broadcast_flag);
-                                            session_manager.create_session(client_ip, client_mac, &config, vlan_id).await;
+            let payload = ethernet_packet.payload();
+            if let Some(ipv4_packet) = Ipv4Packet::new(payload) {
+                let is_dhcp =
+                    if ipv4_packet.get_next_level_protocol() == IpNextHeaderProtocols::Udp {
+                        if let Some(udp_packet) = UdpPacket::new(ipv4_packet.payload()) {
+                            udp_packet.get_destination() == 67
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
 
-                                            let mut cache = eapol_attribute_cache.lock().await;
-                                            if let Some(attributes) = cache.remove(&client_mac) {
-                                                info!("Applying cached EAPOL attributes to session for {}", client_ip);
-                                                chilli_net::radius::apply_radius_attributes(&attributes, &session_manager, &firewall, &client_ip).await;
+                if is_dhcp {
+                    if let Some(udp_packet) = UdpPacket::new(ipv4_packet.payload()) {
+                        if let Some(dhcp_packet) =
+                            chilli_net::dhcp::DhcpPacket::from_bytes(udp_packet.payload())
+                        {
+                            let src_addr = std::net::SocketAddr::new(
+                                std::net::IpAddr::V4(ipv4_packet.get_source()),
+                                udp_packet.get_source(),
+                            );
+                            if let Ok(action) = dhcp_server
+                                .handle_dhcp_packet(dhcp_packet, src_addr, vlan_id)
+                                .await
+                            {
+                                use chilli_net::dhcp::DhcpAction;
+                                match action {
+                                    DhcpAction::Ack {
+                                        response,
+                                        client_ip,
+                                        client_mac,
+                                    } => {
+                                        let broadcast_flag = dhcp_packet.flags & 0x8000 != 0;
+                                        build_and_send_dhcp_response(
+                                            tx,
+                                            &response,
+                                            our_mac,
+                                            MacAddr::from(client_mac),
+                                            config.dhcplisten,
+                                            client_ip,
+                                            broadcast_flag,
+                                        );
+                                        session_manager
+                                            .create_session(client_ip, client_mac, config, vlan_id)
+                                            .await;
+
+                                        let mut cache = eapol_attribute_cache.lock().await;
+                                        if let Some(attributes) = cache.remove(&client_mac) {
+                                            info!(
+                                                "Applying cached EAPOL attributes to session for {}",
+                                                client_ip
+                                            );
+                                            chilli_net::radius::apply_radius_attributes(
+                                                &attributes,
+                                                session_manager,
+                                                firewall,
+                                                &client_ip,
+                                            )
+                                            .await;
+                                        } else if config.macauth {
+                                            let mac_str = hex::encode(client_mac);
+                                            if config.macallowed.contains(&mac_str) {
+                                                info!(
+                                                    "MAC {} is in macallowed list, authenticating.",
+                                                    &mac_str
+                                                );
+                                                session_manager.authenticate_session(&client_ip).await;
                                             } else {
-                                                // MAC Auth logic moved from DhcpServer
-                                                if config.macauth {
-                                                    let mac_str = hex::encode(client_mac);
-                                                    if config.macallowed.contains(&mac_str) {
-                                                        info!("MAC {} is in macallowed list, authenticating.", &mac_str);
-                                                        session_manager.authenticate_session(&client_ip).await;
-                                                    } else {
-                                                        let (tx_auth, _rx_auth) = tokio::sync::oneshot::channel();
-                                                        let auth_req = chilli_core::AuthRequest {
-                                                            auth_type: chilli_core::AuthType::Pap,
-                                                            ip: client_ip,
-                                                            username: mac_str.clone(),
-                                                            password: config.macpasswd.clone(),
-                                                            tx: tx_auth,
-                                                        };
-                                                        auth_tx.send(auth_req).await.ok();
-                                                        // We don't block here, but macauthdeny is effectively handled
-                                                        // by not sending an ACK if the auth fails later.
-                                                        // This is a simplification. A real implementation might need to
-                                                        // delay the ACK or handle NAKs.
-                                                    }
-                                                }
+                                                let (tx_auth, _rx_auth) =
+                                                    tokio::sync::oneshot::channel();
+                                                let auth_req = chilli_core::AuthRequest {
+                                                    auth_type: chilli_core::AuthType::Pap,
+                                                    ip: client_ip,
+                                                    username: mac_str.clone(),
+                                                    password: config.macpasswd.clone(),
+                                                    tx: tx_auth,
+                                                };
+                                                auth_tx.send(auth_req).await.ok();
                                             }
                                         }
-                                        DhcpAction::Offer { response, client_ip, client_mac } => {
-                                            let broadcast_flag = dhcp_packet.flags & 0x8000 != 0;
-                                            build_and_send_dhcp_response(tx, &response, our_mac, MacAddr::from(client_mac), config.dhcplisten, client_ip, broadcast_flag);
-                                        }
-                                        DhcpAction::Nak(response) => {
-                                            // NAKs are sent to broadcast MAC, and broadcast IP
-                                            build_and_send_dhcp_response(tx, &response, our_mac, MacAddr::broadcast(), config.dhcplisten, Ipv4Addr::new(255,255,255,255), true);
-                                        }
-                                        DhcpAction::NoResponse => {}
                                     }
+                                    DhcpAction::Offer {
+                                        response,
+                                        client_ip,
+                                        client_mac,
+                                    } => {
+                                        let broadcast_flag = dhcp_packet.flags & 0x8000 != 0;
+                                        build_and_send_dhcp_response(
+                                            tx,
+                                            &response,
+                                            our_mac,
+                                            MacAddr::from(client_mac),
+                                            config.dhcplisten,
+                                            client_ip,
+                                            broadcast_flag,
+                                        );
+                                    }
+                                    DhcpAction::Nak(response) => {
+                                        build_and_send_dhcp_response(
+                                            tx,
+                                            &response,
+                                            our_mac,
+                                            MacAddr::broadcast(),
+                                            config.dhcplisten,
+                                            Ipv4Addr::new(255, 255, 255, 255),
+                                            true,
+                                        );
+                                    }
+                                    DhcpAction::NoResponse => {}
                                 }
+                            }
+                        }
+                    }
+                } else {
+                    // This is UPLOAD traffic
+                    let src_mac = ethernet_packet.get_source().octets();
+                    if let Some(session) = session_manager.get_session_by_mac(&src_mac).await {
+                        let packet_len = ethernet_packet.packet().len() as u64;
+                        if let Some(updated_session) = session_manager.update_session(&session.hisip, |s| {
+                            if s.state.authenticated {
+                                s.state.input_octets += packet_len;
+                                s.state.input_packets += 1;
+                            }
+                        }).await {
+                            if !updated_session.state.authenticated { return; }
+
+                            let mut terminate = false;
+                            if updated_session.params.maxinputoctets > 0
+                                && updated_session.state.input_octets >= updated_session.params.maxinputoctets
+                            {
+                                info!(
+                                    "Input quota exceeded for session {}",
+                                    updated_session.state.sessionid
+                                );
+                                terminate = true;
+                            }
+                            if !terminate
+                                && updated_session.params.maxtotaloctets > 0
+                                && (updated_session.state.input_octets + updated_session.state.output_octets)
+                                    >= updated_session.params.maxtotaloctets
+                            {
+                                info!(
+                                    "Total quota exceeded for session {}",
+                                    updated_session.state.sessionid
+                                );
+                                terminate = true;
+                            }
+
+                            if terminate {
+                                terminate_session(
+                                    &updated_session,
+                                    ACCT_TERMINATE_CAUSE_QUOTA_EXCEEDED,
+                                    config,
+                                    radius_client,
+                                    firewall,
+                                    session_manager,
+                                )
+                                .await;
+                            } else if let Err(e) =
+                                upload_tx.send(ipv4_packet.packet().to_vec()).await
+                            {
+                                error!("Failed to send upload packet to TUN loop: {}", e);
                             }
                         }
                     }
@@ -1259,7 +1367,9 @@ async fn handle_ethernet_frame(
                 .await
                 {
                     let mut ethernet_buffer = vec![0u8; 14 + response_payload.len()];
-                    let mut new_ethernet_packet = pnet::packet::ethernet::MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
+                    let mut new_ethernet_packet =
+                        pnet::packet::ethernet::MutableEthernetPacket::new(&mut ethernet_buffer)
+                            .unwrap();
                     new_ethernet_packet.set_destination(ethernet_packet.get_source());
                     new_ethernet_packet.set_source(our_mac);
                     new_ethernet_packet.set_ethertype(EtherType(0x888E));
@@ -1278,95 +1388,57 @@ pub async fn tun_packet_loop<T: PacketDevice + 'static>(
     config_rx: watch::Receiver<Arc<chilli_core::Config>>,
     radius_client: Arc<RadiusClient>,
     firewall: Arc<Firewall>,
+    mut upload_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    download_tx: tokio::sync::mpsc::Sender<(Vec<u8>, MacAddr)>,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; 1504];
     loop {
-        let n = iface.recv(&mut buf).await?;
-        let packet_bytes = &buf[..n];
+        tokio::select! {
+            // DOWNLOAD traffic from TUN
+            Ok(n) = iface.recv(&mut buf) => {
+                let packet_bytes = &buf[..n];
+                if let Some(ipv4_packet) = Ipv4Packet::new(packet_bytes) {
+                    let dst_ip = ipv4_packet.get_destination();
+                    let config = config_rx.borrow().clone();
 
-        if let Some(ipv4_packet) = Ipv4Packet::new(packet_bytes) {
-            let src_ip = ipv4_packet.get_source();
-            let config = config_rx.borrow().clone();
-
-            if let Some(mut session) = session_manager.get_session(&src_ip).await {
-                if !session.state.authenticated {
-                    continue; // Drop packet if session is not authenticated
-                }
-
-                // --- UPLOAD ACCOUNTING ---
-                session.state.input_octets += n as u64;
-                session.state.input_packets += 1;
-
-                let mut terminate = false;
-                if session.params.maxinputoctets > 0
-                    && session.state.input_octets >= session.params.maxinputoctets
-                {
-                    info!(
-                        "Input quota exceeded for session {}",
-                        session.state.sessionid
-                    );
-                    terminate = true;
-                }
-
-                if !terminate
-                    && session.params.maxtotaloctets > 0
-                    && (session.state.input_octets + session.state.output_octets)
-                        >= session.params.maxtotaloctets
-                {
-                    info!(
-                        "Total quota exceeded for session {}",
-                        session.state.sessionid
-                    );
-                    terminate = true;
-                }
-
-                // Update session with new counters before deciding to terminate or forward
-                session_manager
-                    .update_session(&src_ip, |s| {
-                        s.state.input_octets = session.state.input_octets;
-                        s.state.input_packets = session.state.input_packets;
-                    })
-                    .await;
-
-                if terminate {
-                    terminate_session(
-                        &session,
-                        ACCT_TERMINATE_CAUSE_QUOTA_EXCEEDED,
-                        &config,
-                        &radius_client,
-                        &firewall,
-                        &session_manager,
-                    )
-                    .await;
-                    continue; // Drop packet that caused the quota to be exceeded
-                }
-
-                // --- DOWNLOAD ACCOUNTING (Placeholder) ---
-                // The packet flow for download traffic is not clear in the current architecture.
-                // A proper implementation would need to intercept packets from the WAN destined
-                // for the client and account for them here before sending them to the TUN interface.
-                // The line below simply forwards/echoes the received packet.
-                // Download quota checks (maxoutputoctets) should be placed here.
-                iface.send(packet_bytes).await?;
-            } else {
-                // Handle packet for unknown session
-                if config.uamanyip {
-                    info!("[uamanyip] Attempting ARP lookup for unknown IP {}", src_ip);
-                    match arp_lookup(&config.dhcpif, src_ip).await {
-                        Ok(mac) => {
-                            info!("ARP lookup successful for {}: MAC is {}", src_ip, mac);
-                            session_manager
-                                .create_session(src_ip, mac.octets(), &config, None)
-                                .await;
+                    if let Some(updated_session) = session_manager.update_session(&dst_ip, |s| {
+                        if s.state.authenticated {
+                            s.state.output_octets += n as u64;
+                            s.state.output_packets += 1;
                         }
-                        Err(e) => {
-                            warn!("ARP lookup for {} failed: {}", src_ip, e);
+                    }).await {
+                        if !updated_session.state.authenticated { continue; }
+
+                        info!("[tun_packet_loop] IP: {}, output_octets: {}, max: {}", updated_session.hisip, updated_session.state.output_octets, updated_session.params.maxoutputoctets);
+
+                        let mut terminate = false;
+                        if updated_session.params.maxoutputoctets > 0 && updated_session.state.output_octets >= updated_session.params.maxoutputoctets {
+                            info!("Output quota exceeded for session {}", updated_session.state.sessionid);
+                            terminate = true;
                         }
+                        if !terminate && updated_session.params.maxtotaloctets > 0 && (updated_session.state.input_octets + updated_session.state.output_octets) >= updated_session.params.maxtotaloctets {
+                            info!("Total quota exceeded for session {}", updated_session.state.sessionid);
+                            terminate = true;
+                        }
+
+                        if terminate {
+                            terminate_session(&updated_session, ACCT_TERMINATE_CAUSE_QUOTA_EXCEEDED, &config, &radius_client, &firewall, &session_manager).await;
+                            continue;
+                        }
+
+                        // Send to physical interface via download channel
+                        let dest_mac = MacAddr::from(updated_session.hismac);
+                        if let Err(e) = download_tx.send((packet_bytes.to_vec(), dest_mac)).await {
+                            error!("Failed to send download packet to L2 loop: {}", e);
+                        }
+                    } else {
+                        warn!("Dropping packet for unknown session to IP {}", dst_ip);
                     }
-                    // Drop the packet, the next one will be redirected or handled
-                } else {
-                    warn!("Dropping packet for unknown session from IP {}", src_ip);
                 }
+            },
+            // UPLOAD traffic from L2 dispatcher
+            Some(packet) = upload_rx.recv() => {
+                iface.send(&packet).await?;
             }
         }
     }
@@ -1582,11 +1654,35 @@ async fn packet_loop(
     _walled_garden_ips: Arc<Mutex<HashSet<Ipv4Addr>>>,
     eapol_attribute_cache: Arc<Mutex<HashMap<[u8; 6], RadiusAttributes>>>,
     auth_tx: tokio::sync::mpsc::Sender<chilli_core::AuthRequest>,
+    upload_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    mut download_rx: tokio::sync::mpsc::Receiver<(Vec<u8>, MacAddr)>,
 ) {
-    let config = config_rx.borrow().clone();
     loop {
+        // Poll for download packets (from TUN to wire)
+        match download_rx.try_recv() {
+            Ok((packet, dest_mac)) => {
+                let mut eth_buf = vec![0u8; 14 + packet.len()];
+                let mut eth_packet = MutableEthernetPacket::new(&mut eth_buf).unwrap();
+                eth_packet.set_destination(dest_mac);
+                eth_packet.set_source(our_mac);
+                eth_packet.set_ethertype(EtherTypes::Ipv4);
+                eth_packet.set_payload(&packet);
+
+                if tx.send_to(eth_packet.packet(), None).is_none() {
+                    error!("Failed to send download packet to wire");
+                }
+            },
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => { /* Nothing to do */ },
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                error!("Download channel disconnected, exiting packet loop.");
+                break;
+            }
+        }
+
+        // Poll for upload packets (from wire to TUN)
         match rx.next() {
             Ok(packet) => {
+                let current_config = config_rx.borrow().clone(); // Get latest config
                 process_ethernet_frame(
                     &mut tx,
                     our_mac,
@@ -1595,15 +1691,22 @@ async fn packet_loop(
                     &radius_client,
                     &dhcp_server,
                     &firewall,
-                    &config,
+                    &current_config,
                     &eapol_attribute_cache,
                     &auth_tx,
+                    &upload_tx,
                 ).await;
             }
             Err(e) => {
-                error!("An error occurred while reading: {}", e);
+                if e.kind() != std::io::ErrorKind::TimedOut {
+                    error!("An error occurred while reading from datalink channel: {}", e);
+                }
+                // TimedOut is the expected case when no packets are coming in.
             }
         }
+
+        // The loop is naturally paced by the read_timeout on the datalink receiver,
+        // so no extra sleep is needed here to prevent busy-looping.
     }
 }
 
@@ -1618,6 +1721,7 @@ pub async fn process_ethernet_frame(
     config: &Arc<chilli_core::Config>,
     eapol_attribute_cache: &Arc<Mutex<HashMap<[u8; 6], RadiusAttributes>>>,
     auth_tx: &tokio::sync::mpsc::Sender<chilli_core::AuthRequest>,
+    upload_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
     if let Some(ethernet_packet) = EthernetPacket::new(packet) {
         if ethernet_packet.get_ethertype() == EtherTypes::Vlan {
@@ -1638,6 +1742,7 @@ pub async fn process_ethernet_frame(
                         config,
                         eapol_attribute_cache,
                         auth_tx,
+                        upload_tx,
                     )
                     .await;
                 }
@@ -1655,13 +1760,14 @@ pub async fn process_ethernet_frame(
                 config,
                 eapol_attribute_cache,
                 auth_tx,
+                upload_tx,
             )
             .await;
         }
     }
 }
 
-async fn l2_packet_dispatcher(
+pub async fn l2_packet_dispatcher(
     session_manager: Arc<SessionManager>,
     radius_client: Arc<RadiusClient>,
     dhcp_server: Arc<DhcpServer>,
@@ -1670,6 +1776,8 @@ async fn l2_packet_dispatcher(
     _walled_garden_ips: Arc<Mutex<HashSet<Ipv4Addr>>>,
     eapol_attribute_cache: Arc<Mutex<HashMap<[u8; 6], RadiusAttributes>>>,
     auth_tx: tokio::sync::mpsc::Sender<chilli_core::AuthRequest>,
+    upload_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    download_rx: tokio::sync::mpsc::Receiver<(Vec<u8>, MacAddr)>,
 ) -> anyhow::Result<()> {
     let config = config_rx.borrow().clone();
 
@@ -1680,7 +1788,11 @@ async fn l2_packet_dispatcher(
         .expect("Failed to find interface");
 
     let our_mac = interface.mac.expect("Failed to get MAC address from interface");
-    let (tx, rx) = match datalink::channel(&interface, Default::default()) {
+
+    let mut channel_config = datalink::Config::default();
+    channel_config.read_timeout = Some(Duration::from_millis(1));
+
+    let (tx, rx) = match datalink::channel(&interface, channel_config) {
         Ok(datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
         Ok(_) => panic!("Unhandled channel type"),
         Err(e) => panic!(
@@ -1701,6 +1813,8 @@ async fn l2_packet_dispatcher(
         _walled_garden_ips,
         eapol_attribute_cache,
         auth_tx,
+        upload_tx,
+        download_rx,
     ).await;
 
     Ok(())

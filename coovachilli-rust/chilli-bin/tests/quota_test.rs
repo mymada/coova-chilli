@@ -27,9 +27,7 @@ fn create_ipv4_packet(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, len: usize) -> Vec<u8>
 }
 
 struct MockTunDevice {
-    // Channel to send received packets to the test for assertion
     pub sent_packets_tx: mpsc::Sender<Vec<u8>>,
-    // Channel to receive packets from the test to simulate TUN reads
     pub packets_to_recv_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
 }
 
@@ -47,7 +45,6 @@ impl PacketDevice for MockTunDevice {
                 Ok(len)
             }
             None => {
-                // Channel closed, simulate end of stream by waiting
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 Ok(0)
             }
@@ -67,24 +64,24 @@ async fn test_quota_exceeded() {
 
     let client_ip = "10.1.0.10".parse().unwrap();
     let client_mac = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05];
-    let quota = 1000; // bytes
+    let quota = 1000;
 
-    // Create and authenticate a session for our test client
     session_manager
         .create_session(client_ip, client_mac, &config, None)
         .await;
     session_manager.authenticate_session(&client_ip).await;
 
-    // Manually set the quota, simulating what would happen after a RADIUS response
     session_manager
         .update_session(&client_ip, |session| {
-            session.params.maxinputoctets = quota;
+            session.params.maxoutputoctets = quota;
         })
-        .await;
+        .await
+        .unwrap();
 
-    // Create the mock TUN device and the channels for communication
     let (sent_tx, _sent_rx) = mpsc::channel(100);
     let (to_recv_tx, to_recv_rx) = mpsc::channel(100);
+    let (_upload_tx, upload_rx) = mpsc::channel(100);
+    let (download_tx, _download_rx) = mpsc::channel(100);
 
     let mock_iface = Arc::new(MockTunDevice {
         sent_packets_tx: sent_tx,
@@ -97,23 +94,34 @@ async fn test_quota_exceeded() {
         config_tx.subscribe(),
         radius_client.clone(),
         firewall.clone(),
+        upload_rx,
+        download_tx,
     ));
 
-    // Send enough packets to exceed the quota
-    let packet = create_ipv4_packet(client_ip, "8.8.8.8".parse().unwrap(), 150);
+    let packet = create_ipv4_packet("8.8.8.8".parse().unwrap(), client_ip, 150);
     let num_packets_to_exceed = (quota / packet.len() as u64) + 1;
 
     for _ in 0..num_packets_to_exceed {
         to_recv_tx.send(packet.clone()).await.unwrap();
     }
 
-    // Give the loop a moment to process the packets and terminate the session
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if session_manager.get_session(&client_ip).await.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
 
-    // Check if the session was removed
-    let session_after = session_manager.get_session(&client_ip).await;
     assert!(
-        session_after.is_none(),
+        result.is_ok(),
+        "Timed out waiting for session to be terminated"
+    );
+
+    assert!(
+        session_manager.get_session(&client_ip).await.is_none(),
         "Session should be terminated and removed after exceeding quota"
     );
 

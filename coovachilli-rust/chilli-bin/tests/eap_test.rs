@@ -244,6 +244,7 @@ async fn test_eap_md5_flow() {
     let server_addr = server_socket.local_addr().unwrap();
 
     let (config, session_manager, radius_client, dhcp_server, firewall, eapol_attribute_cache, auth_tx, _auth_rx, _config_tx) = initialize_services(Some(server_addr)).await;
+    let (upload_tx, _upload_rx) = tokio::sync::mpsc::channel(100);
     let secret = config.radiussecret.clone();
 
     let mock_server_handle = tokio::spawn(mock_radius_server_eap_md5(server_socket, secret));
@@ -262,13 +263,13 @@ async fn test_eap_md5_flow() {
     info!("Starting DHCP Flow");
     let discover_payload = build_dhcp_payload(client_mac, xid, DhcpMessageType::Discover, None, None);
     let discover_packet = build_full_dhcp_packet(client_mac, discover_payload);
-    process_ethernet_frame(&mut tx, our_mac, &discover_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx).await;
+    process_ethernet_frame(&mut tx, our_mac, &discover_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
     sent_packets.lock().unwrap().clear();
 
     let offered_ip = Ipv4Addr::new(10, 1, 0, 1);
     let request_payload = build_dhcp_payload(client_mac, xid, DhcpMessageType::Request, Some(offered_ip), Some(config.net));
     let request_packet = build_full_dhcp_packet(client_mac, request_payload);
-    process_ethernet_frame(&mut tx, our_mac, &request_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx).await;
+    process_ethernet_frame(&mut tx, our_mac, &request_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
     sent_packets.lock().unwrap().clear();
 
     assert!(session_manager.get_session(&offered_ip).await.is_some(), "Session should exist after DHCP");
@@ -276,7 +277,7 @@ async fn test_eap_md5_flow() {
 
     info!("Sending EAPOL-Start");
     let start_packet = build_eapol_packet(client_mac, our_mac, EapolType::Start, None);
-    process_ethernet_frame(&mut tx, our_mac, &start_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx).await;
+    process_ethernet_frame(&mut tx, our_mac, &start_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
 
     info!("Verifying EAP-Request/Identity");
     let packets = sent_packets.lock().unwrap();
@@ -302,7 +303,7 @@ async fn test_eap_md5_flow() {
         data: identity_resp_payload,
     };
     let identity_resp_packet = build_eapol_packet(client_mac, our_mac, EapolType::Eap, Some(identity_resp_eap.to_bytes()));
-    process_ethernet_frame(&mut tx, our_mac, &identity_resp_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx).await;
+    process_ethernet_frame(&mut tx, our_mac, &identity_resp_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
 
     info!("Waiting for EAP-Request/MD5-Challenge...");
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -342,7 +343,7 @@ async fn test_eap_md5_flow() {
         data: md5_resp_payload,
     };
     let md5_resp_packet = build_eapol_packet(client_mac, our_mac, EapolType::Eap, Some(md5_resp_eap.to_bytes()));
-    process_ethernet_frame(&mut tx, our_mac, &md5_resp_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx).await;
+    process_ethernet_frame(&mut tx, our_mac, &md5_resp_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
 
     info!("Waiting for EAP-Success...");
     tokio::time::sleep(Duration::from_millis(500)).await;

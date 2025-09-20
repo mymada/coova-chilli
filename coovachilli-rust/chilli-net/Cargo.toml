@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-async-trait = "0.1.89"
 pnet = "0.34.0"
 pnet_datalink = "0.34.0"
 pnet_packet = "0.34.0"
@@ -24,3 +23,4 @@ num-traits = "0.2"
 des = "0.8.1"
 md4 = "0.10.2"
 sha1 = "0.10.6"
+async-trait = "0.1.50"

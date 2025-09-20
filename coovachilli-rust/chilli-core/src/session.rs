@@ -275,13 +275,16 @@ impl SessionManager {
         sessions.values().cloned().collect()
     }
 
-    pub async fn update_session<F>(&self, ip: &Ipv4Addr, update_fn: F)
+    pub async fn update_session<F>(&self, ip: &Ipv4Addr, update_fn: F) -> Option<Session>
     where
         F: FnOnce(&mut Connection),
     {
         let mut sessions = self.sessions.lock().await;
         if let Some(session) = sessions.get_mut(ip) {
             update_fn(session);
+            Some(session.clone())
+        } else {
+            None
         }
     }
 
