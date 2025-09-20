@@ -1033,14 +1033,18 @@ async fn arp_lookup(
 
 async fn build_arp_reply(
     ethernet_packet: &EthernetPacket<'_>,
-    session_manager: &Arc<SessionManager>,
+    config: &Arc<chilli_core::Config>,
     our_mac: MacAddr,
 ) -> Option<Vec<u8>> {
     if let Some(arp_packet) = ArpPacket::new(ethernet_packet.payload()) {
         if arp_packet.get_operation() == ArpOperations::Request {
             let target_ip = arp_packet.get_target_proto_addr();
-            if session_manager.get_session(&target_ip).await.is_some() {
-                info!("Building ARP reply for our IP {}", target_ip);
+            let target_ip_u32 = u32::from(target_ip);
+            let dhcp_start_u32 = u32::from(config.dhcpstart);
+            let dhcp_end_u32 = u32::from(config.dhcpend);
+
+            if target_ip_u32 >= dhcp_start_u32 && target_ip_u32 <= dhcp_end_u32 {
+                info!("Building Proxy ARP reply for IP {}", target_ip);
 
                 let src_mac = ethernet_packet.get_source();
                 let src_ip = arp_packet.get_sender_proto_addr();
@@ -1211,7 +1215,7 @@ async fn handle_ethernet_frame(
             }
         }
         EtherTypes::Arp => {
-            if let Some(reply) = build_arp_reply(ethernet_packet, session_manager, our_mac).await {
+            if let Some(reply) = build_arp_reply(ethernet_packet, config, our_mac).await {
                 if tx.send_to(&reply, None).is_none() {
                     error!("Failed to send ARP reply");
                 }
@@ -1418,18 +1422,28 @@ async fn handle_eapol_frame(
     match eapol_packet.packet_type {
         chilli_net::eapol::EapolType::Start => {
             info!("Received EAPOL-Start from {}", src_mac);
-            if session_manager.get_eapol_session(&src_mac.octets()).await.is_none() {
-                session_manager.create_eapol_session(src_mac.octets()).await;
-            }
+            let mut session = match session_manager.get_eapol_session(&src_mac.octets()).await {
+                Some(s) => s,
+                None => {
+                    // Create a new session if one doesn't exist
+                    session_manager.create_eapol_session(src_mac.octets()).await;
+                    // This unwrap is safe because we just created it.
+                    session_manager.get_eapol_session(&src_mac.octets()).await.unwrap()
+                }
+            };
 
-            if let Some(mut session) = session_manager.get_eapol_session(&src_mac.octets()).await {
-                session.state = EapolState::Start; // Reset state on new Start
-                let response = build_eap_identity_request(&mut session);
-                session_manager.update_eapol_session(&src_mac.octets(), |s| *s = session).await;
-                Ok(Some(response))
-            } else {
-                error!("Failed to create or retrieve EAPOL session for {}", src_mac);
-                Ok(None)
+            match session.state {
+                EapolState::IdentitySent | EapolState::ChallengeSent => {
+                    warn!("Ignoring EAPOL-Start for MAC {} in state {:?}", src_mac, session.state);
+                    Ok(None)
+                }
+                _ => { // Start, Authenticated, or Failed state, it's safe to restart
+                    info!("Processing EAPOL-Start for MAC {}, (re)starting authentication.", src_mac);
+                    session.state = EapolState::Start;
+                    let response = build_eap_identity_request(&mut session);
+                    session_manager.update_eapol_session(&src_mac.octets(), |s| *s = session).await;
+                    Ok(Some(response))
+                }
             }
         }
         chilli_net::eapol::EapolType::Eap => {
@@ -1750,13 +1764,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_arp_reply() {
-        let session_manager = Arc::new(SessionManager::new());
-        let config = Config::default();
-        let our_mac = MacAddr::new(0x00, 0x01, 0x02, 0x03, 0x04, 0x05);
-        let client_ip = "10.0.0.10".parse().unwrap();
-        let client_mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let mut config = Config::default();
+        config.dhcpstart = "10.0.0.10".parse().unwrap();
+        config.dhcpend = "10.0.0.20".parse().unwrap();
+        let arc_config = Arc::new(config);
 
-        session_manager.create_session(client_ip, client_mac, &config, None).await;
+        let our_mac = MacAddr::new(0x00, 0x01, 0x02, 0x03, 0x04, 0x05);
+        let client_ip = "10.0.0.15".parse().unwrap(); // IP within the DHCP range
 
         let mut ethernet_buffer = [0u8; 42];
         let mut request_packet = MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
@@ -1777,7 +1791,7 @@ mod tests {
         arp_packet.set_target_proto_addr(client_ip);
         request_packet.set_payload(arp_packet.packet());
 
-        let reply = build_arp_reply(&request_packet.to_immutable(), &session_manager, our_mac).await;
+        let reply = build_arp_reply(&request_packet.to_immutable(), &arc_config, our_mac).await;
 
         assert!(reply.is_some());
         let reply_vec = reply.unwrap();
