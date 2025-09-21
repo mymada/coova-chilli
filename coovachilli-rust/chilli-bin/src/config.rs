@@ -10,15 +10,15 @@ pub struct Args {
     pub config_file: PathBuf,
 }
 
-use tracing::{info, warn};
 use std::collections::HashMap;
+use tracing::{info, warn};
 
 pub async fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     let args = Args::parse();
     load_config_from_path(&args.config_file).await
 }
 
-async fn load_config_from_path(path: &PathBuf) -> Result<Config, Box<dyn std::error::Error>> {
+pub async fn load_config_from_path(path: &PathBuf) -> Result<Config, Box<dyn std::error::Error>> {
     let config_contents = fs::read_to_string(path)?;
     let mut config: Config = toml::from_str(&config_contents)?;
 
@@ -46,7 +46,10 @@ async fn load_config_from_path(path: &PathBuf) -> Result<Config, Box<dyn std::er
                                 Err(e) => warn!("Failed to read remote config response text: {}", e),
                             }
                         } else {
-                            warn!("Remote config URL fetch failed with status: {}", response.status());
+                            warn!(
+                                "Remote config URL fetch failed with status: {}",
+                                response.status()
+                            );
                         }
                     }
                     Err(e) => {
