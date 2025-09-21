@@ -1154,46 +1154,110 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_attributes() {
-        // Standard attribute
+    fn test_parse_attributes_comprehensive() {
+        // This test expands on the original test_parse_attributes
         let mut payload = vec![
-            RadiusAttributeType::SessionTimeout as u8, 6, 0, 0, 14, 16, // Session-Timeout: 3600
+            // Standard attribute: Session-Timeout (u32)
+            RadiusAttributeType::SessionTimeout as u8, 6, 0, 0, 14, 16, // 3600
+            // Standard attribute: Framed-IP-Address (Ipv4Addr)
+            RadiusAttributeType::FramedIpAddress as u8, 6, 192, 168, 0, 100,
+            // Standard attribute: Filter-Id (String)
+            RadiusAttributeType::FilterId as u8, 11, b'u', b's', b'e', b'r', b'-', b'p', b'l', b'a', b'n',
         ];
-        // VSA
+        // VSA: WISPr Bandwidth-Max-Up
         payload.extend_from_slice(&[
             RadiusAttributeType::VendorSpecific as u8, 12,
             0, 0, 0x37, 0x2a, // Vendor ID: 14122 (WISPr)
             WISPR_BANDWIDTH_MAX_UP, 6,
             0, 0, 0xfa, 0, // 64000
         ]);
+        // VSA: Coova Max-Total-Octets
+         payload.extend_from_slice(&[
+            RadiusAttributeType::VendorSpecific as u8, 12,
+            0, 0, 0x38, 0xdf, // Vendor ID: 14559 (Coova)
+            COOVA_MAX_TOTAL_OCTETS, 6,
+            0x3b, 0x9a, 0xca, 0x00, // 1,000,000,000
+        ]);
+        // Malformed attribute at the end (length too short)
+        payload.extend_from_slice(&[ RadiusAttributeType::IdleTimeout as u8, 2 ]);
+
 
         let attributes = parse_attributes(&payload);
 
-        assert_eq!(attributes.standard.len(), 1);
-        assert_eq!(attributes.vsas.len(), 1);
+        // --- Assertions for Standard Attributes ---
+        // We expect 4 because the "malformed" attribute is actually a valid attribute with a zero-length value.
+        assert_eq!(attributes.standard.len(), 4);
 
-        let session_timeout = attributes
-            .get_standard(RadiusAttributeType::SessionTimeout)
-            .expect("Session-Timeout attribute not found");
-        assert_eq!(session_timeout, &vec![0, 0, 14, 16]);
-        let session_timeout_val = u32::from_be_bytes(
-            session_timeout
-                .clone()
-                .try_into()
-                .expect("Session-Timeout value has incorrect length"),
-        );
-        assert_eq!(session_timeout_val, 3600);
+        let session_timeout = attributes.get_standard(RadiusAttributeType::SessionTimeout).unwrap();
+        assert_eq!(u32::from_be_bytes(session_timeout.clone().try_into().unwrap()), 3600);
 
-        let bw_up = attributes
-            .get_vsa(VENDOR_ID_WISPR, WISPR_BANDWIDTH_MAX_UP)
-            .expect("WISPr-Bandwidth-Max-Up VSA not found");
-        assert_eq!(bw_up, &vec![0, 0, 0xfa, 0]);
-        let bw_up_val = u32::from_be_bytes(
-            bw_up
-                .clone()
-                .try_into()
-                .expect("WISPr-Bandwidth-Max-Up value has incorrect length"),
-        );
-        assert_eq!(bw_up_val, 64000);
+        let framed_ip = attributes.get_standard(RadiusAttributeType::FramedIpAddress).unwrap();
+        assert_eq!(Ipv4Addr::from(u32::from_be_bytes(framed_ip.clone().try_into().unwrap())), Ipv4Addr::new(192, 168, 0, 100));
+
+        let filter_id = attributes.get_standard(RadiusAttributeType::FilterId).unwrap();
+        assert_eq!(String::from_utf8(filter_id.clone()).unwrap(), "user-plan");
+
+        // --- Assertions for VSAs ---
+        assert_eq!(attributes.vsas.len(), 2);
+
+        let bw_up = attributes.get_vsa(VENDOR_ID_WISPR, WISPR_BANDWIDTH_MAX_UP).unwrap();
+        assert_eq!(u32::from_be_bytes(bw_up.clone().try_into().unwrap()), 64000);
+
+        let max_octets = attributes.get_vsa(VENDOR_ID_COOVA, COOVA_MAX_TOTAL_OCTETS).unwrap();
+        assert_eq!(u64::from(u32::from_be_bytes(max_octets.clone().try_into().unwrap())), 1_000_000_000);
+    }
+
+    #[test]
+    fn test_build_access_request() {
+        let mut attributes = RadiusAttributes::default();
+        attributes.standard.insert(RadiusAttributeType::UserName, vec!["testuser".as_bytes().to_vec()]);
+        attributes.standard.insert(RadiusAttributeType::UserPassword, vec![vec![0; 16]]); // Dummy encrypted password
+        attributes.standard.insert(RadiusAttributeType::NasIdentifier, vec!["chilli-test".as_bytes().to_vec()]);
+
+        let payload = serialize_attributes(&attributes);
+
+        // Verify UserName
+        let user_name_attr = find_attribute(&payload, RadiusAttributeType::UserName as u8).unwrap();
+        assert_eq!(user_name_attr, "testuser".as_bytes());
+
+        // Verify NasIdentifier
+        let nas_id_attr = find_attribute(&payload, RadiusAttributeType::NasIdentifier as u8).unwrap();
+        assert_eq!(nas_id_attr, "chilli-test".as_bytes());
+
+        // Verify UserPassword
+        let pass_attr = find_attribute(&payload, RadiusAttributeType::UserPassword as u8).unwrap();
+        assert_eq!(pass_attr, &[0; 16]);
+    }
+
+    #[test]
+    fn test_parse_access_reject() {
+        let reply_message = "Your session has been rejected.";
+        let payload = vec![
+            RadiusAttributeType::FilterId as u8, 10, // Example attribute
+            1, 2, 3, 4, 5, 6, 7, 8,
+            RadiusAttributeType::MessageAuthenticator as u8, (reply_message.len() + 2) as u8,
+        ];
+        // In a real packet, MessageAuthenticator would be a hash. Here it is just text for simplicity.
+        let mut payload_with_message = payload.clone();
+        payload_with_message.extend_from_slice(reply_message.as_bytes());
+
+
+        let attributes = parse_attributes(&payload_with_message);
+        let message = attributes.get_standard(RadiusAttributeType::MessageAuthenticator).unwrap();
+        assert_eq!(String::from_utf8(message.clone()).unwrap(), reply_message);
+    }
+
+    // Helper to find an attribute in a serialized payload for testing
+    fn find_attribute<'a>(payload: &'a [u8], code: u8) -> Option<&'a [u8]> {
+        let mut offset = 0;
+        while offset < payload.len() {
+            let type_code = payload[offset];
+            let length = payload[offset + 1] as usize;
+            if type_code == code {
+                return Some(&payload[offset + 2..offset + length]);
+            }
+            offset += length;
+        }
+        None
     }
 }

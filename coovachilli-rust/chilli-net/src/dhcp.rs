@@ -236,6 +236,7 @@ impl DhcpServer {
         match msg_type {
             DhcpMessageType::Discover => self.handle_discover(packet).await,
             DhcpMessageType::Request => self.handle_request(packet).await,
+            DhcpMessageType::Release => self.handle_release(packet).await,
             _ => {
                 warn!("Unhandled DHCP message type: {:?}", msg_type);
                 Ok(DhcpAction::NoResponse)
@@ -382,6 +383,22 @@ impl DhcpServer {
         })
     }
 
+    async fn handle_release(
+        &self,
+        req_packet: &DhcpPacket,
+    ) -> Result<DhcpAction> {
+        let mac = req_packet.get_mac();
+        let mut leases = self.leases.lock().await;
+        if let Some(lease) = leases.remove(&mac) {
+            info!("DHCPRELEASE: Released IP {} for MAC {}", lease.ip, hex::encode(mac));
+            let mut pool = self.ip_pool.lock().await;
+            pool.push(lease.ip);
+        } else {
+            warn!("DHCPRELEASE: Received for unknown MAC {}", hex::encode(mac));
+        }
+        Ok(DhcpAction::NoResponse)
+    }
+
     fn build_response(
         &self,
         config: &Config,
@@ -522,5 +539,150 @@ mod tests {
         } else {
             panic!("Expected DhcpAction::Ack");
         }
+    }
+
+    fn build_discover_packet(buf: &mut [u8; 512], mac: [u8; 6]) -> &DhcpPacket {
+        let packet = DhcpPacket::from_bytes_mut(buf).unwrap();
+        packet.op = BootpMessageType::BootRequest as u8;
+        packet.chaddr[..6].copy_from_slice(&mac);
+        packet.options[0..4].copy_from_slice(&DHCP_MAGIC_COOKIE);
+        packet.options[4..7].copy_from_slice(&[DHCP_OPTION_MESSAGE_TYPE, 1, DhcpMessageType::Discover as u8]);
+        packet.options[7] = DHCP_OPTION_END;
+        packet
+    }
+
+    fn build_request_packet<'a>(buf: &'a mut [u8; 512], mac: [u8; 6], requested_ip: Ipv4Addr, server_id: Ipv4Addr) -> &'a DhcpPacket {
+        let packet = DhcpPacket::from_bytes_mut(buf).unwrap();
+        packet.op = BootpMessageType::BootRequest as u8;
+        packet.chaddr[..6].copy_from_slice(&mac);
+        packet.options[0..4].copy_from_slice(&DHCP_MAGIC_COOKIE);
+        let mut cursor = 4;
+        packet.options[cursor..cursor + 3].copy_from_slice(&[DHCP_OPTION_MESSAGE_TYPE, 1, DhcpMessageType::Request as u8]);
+        cursor += 3;
+        packet.options[cursor..cursor + 6].copy_from_slice(&[DHCP_OPTION_REQUESTED_IP, 4, requested_ip.octets()[0], requested_ip.octets()[1], requested_ip.octets()[2], requested_ip.octets()[3]]);
+        cursor += 6;
+        packet.options[cursor..cursor + 6].copy_from_slice(&[DHCP_OPTION_SERVER_ID, 4, server_id.octets()[0], server_id.octets()[1], server_id.octets()[2], server_id.octets()[3]]);
+        cursor += 6;
+        packet.options[cursor] = DHCP_OPTION_END;
+        packet
+    }
+
+    #[tokio::test]
+    async fn test_discover_offers_available_ip() {
+        let config = Arc::new(Config::default());
+        let (_config_tx, config_rx) = watch::channel(config);
+        let dhcp_server = DhcpServer::new(config_rx).await.unwrap();
+        let mac = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+        let mut packet_buf = [0u8; 512];
+        let discover_packet = build_discover_packet(&mut packet_buf, mac);
+
+        let action = dhcp_server.handle_dhcp_packet(discover_packet, "0.0.0.0:68".parse().unwrap(), None).await.unwrap();
+
+        match action {
+            DhcpAction::Offer { response, client_ip, .. } => {
+                let offer_packet = DhcpPacket::from_bytes(&response).unwrap();
+                assert_eq!(offer_packet.get_message_type(), Some(DhcpMessageType::Offer));
+                assert_eq!(client_ip, Ipv4Addr::new(192, 168, 182, 254)); // The last IP in the default pool
+            },
+            _ => panic!("Expected DhcpAction::Offer"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_discover_when_pool_is_full() {
+        let mut config = Config::default();
+        config.dhcpstart = "192.168.1.10".parse().unwrap();
+        config.dhcpend = "192.168.1.10".parse().unwrap(); // Pool of 1
+        let config = Arc::new(config);
+        let (_config_tx, config_rx) = watch::channel(config);
+        let dhcp_server = DhcpServer::new(config_rx).await.unwrap();
+
+        // Take the only IP
+        dhcp_server.ip_pool.lock().await.pop();
+
+        let mac = [0x01, 0x02, 0x03, 0x04, 0x05, 0x07];
+        let mut packet_buf = [0u8; 512];
+        let discover_packet = build_discover_packet(&mut packet_buf, mac);
+
+        let action = dhcp_server.handle_dhcp_packet(discover_packet, "0.0.0.0:68".parse().unwrap(), None).await.unwrap();
+
+        match action {
+            DhcpAction::NoResponse => { /* This is the correct behavior */ },
+            _ => panic!("Expected DhcpAction::NoResponse when pool is empty"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_allocates_ip() {
+        let config = Arc::new(Config::default());
+        let server_id = config.dhcplisten;
+        let (_config_tx, config_rx) = watch::channel(config);
+        let dhcp_server = DhcpServer::new(config_rx).await.unwrap();
+        let mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let offered_ip = dhcp_server.ip_pool.lock().await.last().unwrap().clone();
+
+        let mut request_buf = [0u8; 512];
+        let request_packet = build_request_packet(&mut request_buf, mac, offered_ip, server_id);
+
+        let action = dhcp_server.handle_dhcp_packet(request_packet, "0.0.0.0:68".parse().unwrap(), None).await.unwrap();
+
+        match action {
+            DhcpAction::Ack { client_ip, .. } => {
+                assert_eq!(client_ip, offered_ip);
+            },
+            _ => panic!("Expected DhcpAction::Ack"),
+        }
+
+        // Verify the IP is no longer in the pool
+        let pool = dhcp_server.ip_pool.lock().await;
+        assert!(!pool.contains(&offered_ip));
+
+        // Verify a lease was created
+        let leases = dhcp_server.leases.lock().await;
+        assert!(leases.contains_key(&mac));
+        assert_eq!(leases.get(&mac).unwrap().ip, offered_ip);
+    }
+
+    fn build_release_packet(buf: &mut [u8; 512], mac: [u8; 6], client_ip: Ipv4Addr) -> &DhcpPacket {
+        let packet = DhcpPacket::from_bytes_mut(buf).unwrap();
+        packet.op = BootpMessageType::BootRequest as u8;
+        packet.chaddr[..6].copy_from_slice(&mac);
+        packet.ciaddr = u32::from(client_ip).to_be();
+        packet.options[0..4].copy_from_slice(&DHCP_MAGIC_COOKIE);
+        packet.options[4..7].copy_from_slice(&[DHCP_OPTION_MESSAGE_TYPE, 1, DhcpMessageType::Release as u8]);
+        packet.options[7] = DHCP_OPTION_END;
+        packet
+    }
+
+    #[tokio::test]
+    async fn test_release_returns_ip_to_pool() {
+        let config = Arc::new(Config::default());
+        let (_config_tx, config_rx) = watch::channel(config);
+        let dhcp_server = DhcpServer::new(config_rx).await.unwrap();
+        let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let ip_to_lease = dhcp_server.ip_pool.lock().await.last().unwrap().clone();
+
+        // Manually create a lease and remove IP from pool
+        let lease_duration = Duration::from_secs(3600);
+        let lease = Lease { ip: ip_to_lease, mac, expires: SystemTime::now() + lease_duration };
+        dhcp_server.leases.lock().await.insert(mac, lease);
+        dhcp_server.ip_pool.lock().await.pop();
+
+        let pool_size_before = dhcp_server.ip_pool.lock().await.len();
+
+        // Send release packet
+        let mut release_buf = [0u8; 512];
+        let release_packet = build_release_packet(&mut release_buf, mac, ip_to_lease);
+        let action = dhcp_server.handle_dhcp_packet(release_packet, "0.0.0.0:68".parse().unwrap(), None).await.unwrap();
+
+        assert!(matches!(action, DhcpAction::NoResponse));
+
+        // Verify the lease is gone
+        assert!(!dhcp_server.leases.lock().await.contains_key(&mac));
+
+        // Verify the IP is back in the pool
+        let pool = dhcp_server.ip_pool.lock().await;
+        assert_eq!(pool.len(), pool_size_before + 1);
+        assert!(pool.contains(&ip_to_lease));
     }
 }
