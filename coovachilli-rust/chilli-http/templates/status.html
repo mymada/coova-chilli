@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+    <head><title>Status</title></head>
+    <body>
+        <h1>Authenticated</h1>
+        <p>Username: {{ username }}</p>
+        <p>Session Time: {{ session_time }}s</p>
+        <p>Idle Time: {{ idle_time }}s</p>
+        <p>Uploaded: {{ uploaded }} bytes</p>
+        <p>Downloaded: {{ downloaded }} bytes</p>
+        <form action="/logoff" method="get"><input type="submit" value="Log Off"></form>
+    </body>
+</html>

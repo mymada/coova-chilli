@@ -1,18 +1,48 @@
 use axum::{
     extract::{ConnectInfo, Query, State},
-    http::Uri,
-    response::{Html, Redirect},
+    http::StatusCode,
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Form, Router,
 };
 use chilli_core::{AuthRequest, AuthType, Config, CoreRequest, LogoffRequest, SessionManager};
 use md5::{Digest, Md5};
-use serde::Deserialize;
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use hex;
 use std::sync::Arc;
+use tera::{Context, Tera};
 use tokio::sync::{mpsc, oneshot};
+use tower_http::services::ServeDir;
 use tracing::{info, warn};
+
+pub static TEMPLATES: Lazy<Tera> = Lazy::new(|| {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let template_path = format!("{}/templates/**/*.html", manifest_dir);
+    let mut tera = match Tera::new(&template_path) {
+        Ok(t) => t,
+        Err(e) => {
+            panic!("Tera parsing error(s): {}", e);
+        }
+    };
+    tera.autoescape_on(vec![".html"]);
+    tera
+});
+
+struct TeraTemplate(String, Context);
+
+impl IntoResponse for TeraTemplate {
+    fn into_response(self) -> Response {
+        match TEMPLATES.render(&self.0, &self.1) {
+            Ok(html) => Html(html).into_response(),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to render template: {}", err),
+            )
+                .into_response(),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -21,10 +51,26 @@ struct AppState {
     config: Arc<Config>,
 }
 
-#[derive(Deserialize)]
-struct LoginQuery {
-    username: String,
-    challenge: String,
+#[derive(Deserialize, Serialize, Debug, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum Res {
+    Success,
+    Failed,
+    Logoff,
+    Already,
+    NotYet,
+}
+
+#[derive(Deserialize, Debug)]
+struct PortalParams {
+    res: Option<Res>,
+    reply: Option<String>,
+    challenge: Option<String>,
+    uamip: Option<String>,
+    uamport: Option<u16>,
+    userurl: Option<String>,
+    username: Option<String>,
+    popup: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -32,56 +78,114 @@ struct LoginForm {
     password: String,
 }
 
-async fn login_form() -> Html<&'static str> {
-    Html(
-        r#"
-        <!doctype html>
-        <html>
-            <head><title>Login</title></head>
-            <body>
-                <h1>Login</h1>
-                <form action="/login" method="post">
-                    <label for="username">Username:</label><br>
-                    <input type="text" id="username" name="username"><br>
-                    <label for="password">Password:</label><br>
-                    <input type="password" id="password" name="password"><br><br>
-                    <input type="submit" value="Submit">
-                </form>
-            </body>
-        </html>
-        "#,
-    )
+fn render_error(title: &str, message: &str) -> TeraTemplate {
+    let mut context = Context::new();
+    context.insert("title", title);
+    context.insert("message", message);
+    TeraTemplate("error.html".to_string(), context)
 }
+
+async fn portal(Query(params): Query<PortalParams>) -> impl IntoResponse {
+    let mut context = Context::new();
+    let res = params.res.unwrap_or(Res::NotYet);
+
+    context.insert("uamip", &params.uamip.unwrap_or_default());
+    context.insert("uamport", &params.uamport.unwrap_or_default());
+    context.insert("userurl", &params.userurl.unwrap_or_default());
+    context.insert("username", &params.username.unwrap_or_default());
+    context.insert("challenge", &params.challenge.unwrap_or_default());
+    context.insert("reply", params.reply.as_deref().unwrap_or_default());
+    context.insert("is_popup", &params.popup.unwrap_or(false));
+    context.insert("res", &format!("{:?}", res).to_lowercase());
+
+
+    match res {
+        Res::NotYet => TeraTemplate("login.html".to_string(), context),
+        Res::Failed => {
+            context.insert(
+                "error_message",
+                params.reply.as_deref().unwrap_or("Login Failed"),
+            );
+            TeraTemplate("login.html".to_string(), context)
+        }
+        Res::Success | Res::Already => {
+            if params.popup.unwrap_or(false) {
+                TeraTemplate("success_popup.html".to_string(), context)
+            } else {
+                TeraTemplate("success.html".to_string(), context)
+            }
+        }
+        Res::Logoff => TeraTemplate("logoff.html".to_string(), context),
+    }
+}
+
+async fn status(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, Redirect> {
+    info!("Status request from {}", addr.ip());
+
+    let ip = match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip,
+        _ => return Ok(render_error("Error", "IPv6 not supported.").into_response()),
+    };
+
+    if let Some(session) = state.session_manager.get_session(&ip).await {
+        if session.state.authenticated {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let session_time = now.saturating_sub(session.state.start_time);
+            let idle_time = now.saturating_sub(session.state.last_up_time);
+
+            let mut context = Context::new();
+            context.insert("username", &session.state.redir.username.as_deref().unwrap_or("N/A"));
+            context.insert("session_time", &session_time);
+            context.insert("idle_time", &idle_time);
+            context.insert("uploaded", &session.state.input_octets);
+            context.insert("downloaded", &session.state.output_octets);
+
+            return Ok(TeraTemplate("status.html".to_string(), context).into_response());
+        }
+    }
+
+    Err(Redirect::to("/portal"))
+}
+
 
 async fn login(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Query(query): Query<LoginQuery>,
+    Query(portal_params): Query<PortalParams>,
     Form(form): Form<LoginForm>,
-) -> Result<Redirect, Html<String>> {
+) -> Result<Redirect, impl IntoResponse> {
+    let username = portal_params.username.unwrap_or_default();
+    let challenge = portal_params.challenge.unwrap_or_default();
+
     info!(
         "Login attempt from {} for user '{}'",
         addr.ip(),
-        query.username
+        username
     );
 
     let ip = match addr.ip() {
         std::net::IpAddr::V4(ip) => ip,
-        _ => return Err(Html("<h1>Error</h1><p>IPv6 not supported.</p>".to_string())),
+        _ => return Err(render_error("Error", "IPv6 not supported.")),
     };
 
     let session = match state.session_manager.get_session(&ip).await {
         Some(s) => s,
-        None => return Err(Html("<h1>Login Failed</h1><p>Session not found.</p>".to_string())),
+        None => return Err(render_error("Login Failed", "Session not found.")),
     };
 
-    if hex::encode(session.state.redir.uamchal) != query.challenge {
-        return Err(Html("<h1>Login Failed</h1><p>Invalid challenge.</p>".to_string()));
+    if hex::encode(session.state.redir.uamchal) != challenge {
+        return Err(render_error("Login Failed", "Invalid challenge."));
     }
 
     let hashed_password = match hex::decode(form.password) {
         Ok(p) => p,
-        Err(_) => return Err(Html("<h1>Login Failed</h1><p>Invalid password format.</p>".to_string())),
+        Err(_) => return Err(render_error("Login Failed", "Invalid password format.")),
     };
 
     let mut chap_hasher = Md5::new();
@@ -100,7 +204,7 @@ async fn login(
     let auth_request = AuthRequest {
         auth_type: AuthType::UamPap,
         ip,
-        username: query.username,
+        username: username.clone(),
         password: Some(radius_password),
         tx: oneshot_tx,
     };
@@ -112,81 +216,68 @@ async fn login(
         .is_err()
     {
         warn!("Failed to send auth request to main task");
-        return Err(Html("<h1>Login Failed</h1><p>Internal server error.</p>".to_string()));
+        return Err(render_error("Login Failed", "Internal server error."));
     }
 
-    match tokio::time::timeout(tokio::time::Duration::from_secs(10), oneshot_rx).await {
-        Ok(Ok(true)) => {
-            let user_url = session
-                .state
-                .redir
-                .userurl
-                .unwrap_or_else(|| "/status".to_string());
-            Ok(Redirect::to(&user_url))
-        }
-        Ok(Ok(false)) => Err(Html("<h1>Login Failed</h1><p>Invalid credentials.</p>".to_string())),
-        _ => Err(Html("<h1>Login Failed</h1><p>Internal server error.</p>".to_string())),
-    }
-}
-
-async fn status(
-    State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-) -> Result<Html<String>, Redirect> {
-    info!("Status request from {}", addr.ip());
-
-    let ip = match addr.ip() {
-        std::net::IpAddr::V4(ip) => ip,
-        _ => return Ok(Html("<h1>Error</h1><p>IPv6 not supported.</p>".to_string())),
+    let success = match tokio::time::timeout(tokio::time::Duration::from_secs(10), oneshot_rx).await
+    {
+        Ok(Ok(success)) => success,
+        _ => false,
     };
 
-    if let Some(session) = state.session_manager.get_session(&ip).await {
-        if session.state.authenticated {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let session_time = now.saturating_sub(session.state.start_time);
-            let idle_time = now.saturating_sub(session.state.last_up_time);
+    if success {
+        let user_url = session
+            .state
+            .redir
+            .userurl
+            .clone()
+            .unwrap_or_else(|| "/status".to_string());
 
-            let body = format!(
-                r#"
-                <!doctype html>
-                <html>
-                    <head><title>Status</title></head>
-                    <body>
-                        <h1>Authenticated</h1>
-                        <p>Username: {}</p>
-                        <p>Session Time: {}s</p>
-                        <p>Idle Time: {}s</p>
-                        <p>Uploaded: {} bytes</p>
-                        <p>Downloaded: {} bytes</p>
-                        <form action="/logoff" method="get"><input type="submit" value="Log Off"></form>
-                    </body>
-                </html>
-                "#,
-                session.state.redir.username.as_deref().unwrap_or("N/A"),
-                session_time,
-                idle_time,
-                session.state.input_octets,
-                session.state.output_octets,
-            );
-            return Ok(Html(body));
+        let success_url = if portal_params.popup.unwrap_or(false) {
+            format!("/portal?res=success&popup=true&userurl={}", urlencoding::encode(&user_url))
+        } else {
+            user_url
+        };
+        Ok(Redirect::to(&success_url))
+    } else {
+        let reply = "Invalid credentials.";
+        let mut query_params = vec![
+            ("res", "failed"),
+            ("reply", reply),
+            ("username", &username),
+            ("challenge", &challenge),
+        ];
+
+        let uamip_str = state.config.uamlisten.to_string();
+        let uamport_str = state.config.uamport.to_string();
+
+        query_params.push(("uamip", &uamip_str));
+        query_params.push(("uamport", &uamport_str));
+
+        if portal_params.popup.unwrap_or(false) {
+            query_params.push(("popup", "true"));
         }
-    }
 
-    Err(Redirect::to("/"))
+        if let Some(userurl) = &session.state.redir.userurl {
+             query_params.push(("userurl", userurl));
+        }
+
+        let query_string = serde_urlencoded::to_string(query_params).unwrap_or_default();
+        let redirect_url = format!("/portal?{}", query_string);
+
+        Ok(Redirect::to(&redirect_url))
+    }
 }
 
 async fn logoff(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-) -> Result<Redirect, Html<String>> {
+) -> Result<Redirect, impl IntoResponse> {
     info!("Logoff attempt from {}", addr.ip());
 
     let ip = match addr.ip() {
         std::net::IpAddr::V4(ip) => ip,
-        _ => return Err(Html("<h1>Error</h1><p>IPv6 not supported.</p>".to_string())),
+        _ => return Err(render_error("Error", "IPv6 not supported.")),
     };
 
     let (oneshot_tx, oneshot_rx) = oneshot::channel();
@@ -203,31 +294,31 @@ async fn logoff(
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), oneshot_rx).await;
     }
 
-    Ok(Redirect::to("/"))
+    Ok(Redirect::to("/portal?res=logoff"))
 }
 
 pub async fn run_server(
+    listener: tokio::net::TcpListener,
     config: Arc<Config>,
     core_tx: mpsc::Sender<CoreRequest>,
     session_manager: Arc<SessionManager>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app_state = AppState {
         core_tx,
         session_manager,
-        config: config.clone(),
+        config,
     };
 
     let app = Router::new()
-        .route("/", get(login_form))
+        .route("/portal", get(portal))
+        .route("/status", get(status))
         .route("/login", post(login))
         .route("/logoff", get(logoff))
-        .route("/status", get(status))
+        .nest_service("/static", ServeDir::new("chilli-http/static"))
+        .fallback(Redirect::permanent("/portal"))
         .with_state(app_state);
 
-    let addr = SocketAddr::new(config.uamlisten.into(), config.uamport);
-    info!("UAM server listening on {}", addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!("UAM server listening on {}", listener.local_addr()?);
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
 
     Ok(())

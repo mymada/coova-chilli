@@ -1,3 +1,6 @@
+use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use reqwest;
 // TODO: THIS TEST IS KNOWN TO BE BROKEN AND CAUSES A PANIC.
 //
 // The code review for this feature identified several critical issues:
@@ -13,20 +16,19 @@
 
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
-use tracing::info;
 
 use pnet::datalink::{self, MacAddr, NetworkInterface};
-use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
+use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
-use pnet::packet::ipv4::{self, Ipv4Packet, MutableIpv4Packet};
+use pnet::packet::ipv4::{self, MutableIpv4Packet};
 use pnet::packet::udp::{self, MutableUdpPacket};
 use pnet::packet::Packet;
-
 use chilli_bin::{initialize_services, process_ethernet_frame};
 use chilli_net::dhcp::{
     BootpMessageType, DhcpMessageType, DhcpPacket, DHCP_MAGIC_COOKIE,
     DHCP_OPTION_END, DHCP_OPTION_MESSAGE_TYPE, DHCP_OPTION_REQUESTED_IP, DHCP_OPTION_SERVER_ID,
 };
+use tracing::info;
 
 // A mock sender that captures packets instead of sending them to a real network interface.
 struct MockDataLinkSender {
@@ -141,13 +143,15 @@ fn build_full_dhcp_packet(chaddr: MacAddr, payload: Vec<u8>) -> Vec<u8> {
     eth_packet.packet().to_vec()
 }
 
-/*
 #[tokio::test]
 async fn test_uam_flow() {
+    println!("[UAM_TEST] Start of test");
     tracing_subscriber::fmt::try_init().ok();
     info!("Starting test_uam_flow");
 
+    println!("[UAM_TEST] Initializing services...");
     let (config, session_manager, radius_client, dhcp_server, firewall, eapol_attribute_cache, core_tx, _core_rx, _config_tx) = initialize_services(None, Some(0)).await.expect("initialize_services failed");
+    println!("[UAM_TEST] Services initialized.");
     let (upload_tx, mut upload_rx) = tokio::sync::mpsc::channel(100);
 
     let our_mac = MacAddr::new(0x00, 0x01, 0x02, 0x03, 0x04, 0x05);
@@ -159,62 +163,62 @@ async fn test_uam_flow() {
         packets: Arc::clone(&sent_packets),
     });
 
-    info!("Starting DHCP Flow for UAM test");
+    println!("[UAM_TEST] Processing DHCP Discover...");
     let discover_payload = build_dhcp_payload(client_mac, xid, DhcpMessageType::Discover, None, None);
     let discover_packet = build_full_dhcp_packet(client_mac, discover_payload);
     process_ethernet_frame(&mut tx, our_mac, &discover_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &core_tx, &upload_tx).await;
     sent_packets.lock().unwrap().clear();
+    println!("[UAM_TEST] DHCP Discover processed.");
 
+    println!("[UAM_TEST] Processing DHCP Request...");
     let offered_ip = Ipv4Addr::new(10, 1, 0, 1);
     let request_payload = build_dhcp_payload(client_mac, xid, DhcpMessageType::Request, Some(offered_ip), Some(config.net));
     let request_packet = build_full_dhcp_packet(client_mac, request_payload);
     process_ethernet_frame(&mut tx, our_mac, &request_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &core_tx, &upload_tx).await;
     sent_packets.lock().unwrap().clear();
+    println!("[UAM_TEST] DHCP Request processed.");
 
     assert!(session_manager.get_session(&offered_ip).await.is_some(), "Session should exist after DHCP");
     info!("DHCP Flow complete, session created for {}", offered_ip);
 
-    // 2. Client tries to access an external website
-    info!("Simulating HTTP GET from unauthenticated client");
+
+    println!("[UAM_TEST] Processing unauthenticated HTTP GET...");
     let http_get_payload = b"GET / HTTP/1.1\r\nHost: www.google.com\r\n\r\n";
     let http_get_packet = build_http_packet(client_mac, our_mac, offered_ip, "8.8.8.8".parse().unwrap(), 12345, 80, http_get_payload);
     process_ethernet_frame(&mut tx, our_mac, &http_get_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &core_tx, &upload_tx).await;
+    println!("[UAM_TEST] Unauthenticated HTTP GET processed.");
 
-    // 3. Verify we sent a redirect packet back
     let packets = sent_packets.lock().unwrap();
     assert_eq!(packets.len(), 1, "Expected one redirect packet");
-    let redirect_packet = EthernetPacket::new(&packets[0]).unwrap();
+    let redirect_packet = pnet::packet::ethernet::EthernetPacket::new(&packets[0]).unwrap();
     assert_eq!(redirect_packet.get_destination(), client_mac);
-    // TODO: Deeper inspection of the redirect packet to verify the Location header
 
-    // 4. Authenticate the session
-    info!("Simulating successful authentication");
+    println!("[UAM_TEST] Authenticating session...");
     session_manager.authenticate_session(&offered_ip).await;
-    // In a test environment, this might fail, which is okay for this test's purpose.
     firewall.add_authenticated_ip(offered_ip).ok();
     sent_packets.lock().unwrap().clear();
+    println!("[UAM_TEST] Session authenticated.");
 
-    // 5. Client tries to access the same website again
-    info!("Simulating HTTP GET from now-authenticated client");
-    // Create a new packet to avoid any side effects from the first processing run
+    println!("[UAM_TEST] Processing authenticated HTTP GET...");
     let http_get_packet_authed = build_http_packet(client_mac, our_mac, offered_ip, "8.8.4.4".parse().unwrap(), 12345, 80, http_get_payload);
     process_ethernet_frame(&mut tx, our_mac, &http_get_packet_authed, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &core_tx, &upload_tx).await;
+    println!("[UAM_TEST] Authenticated HTTP GET processed.");
 
-    // 6. Verify the packet was sent to the TUN interface (via the upload_tx channel)
-    info!("[UAM_TEST] Waiting for packet on upload channel...");
+    println!("[UAM_TEST] Waiting for packet on upload channel...");
     let tun_packet = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         upload_rx.recv()
     ).await.expect("Test timed out waiting for TUN packet").expect("Did not receive packet on upload channel");
-    info!("[UAM_TEST] Received packet on upload channel.");
-    let tun_ipv4 = Ipv4Packet::new(&tun_packet).unwrap();
+    println!("[UAM_TEST] Received packet on upload channel.");
+    let tun_ipv4 = pnet::packet::ipv4::Ipv4Packet::new(&tun_packet).unwrap();
     assert_eq!(tun_ipv4.get_source(), offered_ip);
     assert_eq!(tun_ipv4.get_destination(), "8.8.8.8".parse::<Ipv4Addr>().unwrap());
 
-    // And verify no packets were sent back to the client
     assert!(sent_packets.lock().unwrap().is_empty(), "No packets should be sent back to the client after authentication");
+
+    println!("[UAM_TEST] End of test.");
 }
-*/
+
 
 fn build_http_packet(src_mac: MacAddr, dst_mac: MacAddr, src_ip: Ipv4Addr, dst_ip: Ipv4Addr, src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
     let mut tcp_buf = vec![0u8; 20 + payload.len()];
