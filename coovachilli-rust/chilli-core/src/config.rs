@@ -44,6 +44,20 @@ pub struct Config {
     /// The path to the state directory.
     pub statedir: String,
 
+    // Remote configuration settings
+    /// The remote configuration mode ('off', 'url', 'on').
+    #[serde(default)]
+    pub radconf: Option<String>,
+    /// The URL to fetch remote configuration from.
+    #[serde(default)]
+    pub radconf_url: Option<String>,
+    /// The username for remote configuration authentication.
+    #[serde(default)]
+    pub radconf_user: Option<String>,
+    /// The password for remote configuration authentication.
+    #[serde(default)]
+    pub radconf_pwd: Option<String>,
+
     /// The network address of the TUN/TAP interface.
     pub net: Ipv4Addr,
     /// The netmask of the TUN/TAP interface.
@@ -180,6 +194,10 @@ impl Default for Config {
             interval: 3600,
             pidfile: "/var/run/chilli.pid".to_string(),
             statedir: "/var/run".to_string(),
+            radconf: Some("off".to_string()),
+            radconf_url: None,
+            radconf_user: None,
+            radconf_pwd: None,
             net: "192.168.182.0".parse().expect("Default IP is invalid"),
             mask: "255.255.255.0".parse().expect("Default IP is invalid"),
             tundev: Some("tun0".to_string()),
