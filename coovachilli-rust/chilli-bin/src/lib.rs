@@ -475,7 +475,7 @@ async fn sighup_handler(config_tx: watch::Sender<Arc<chilli_core::Config>>) {
 
     while stream.recv().await.is_some() {
         info!("SIGHUP received, reloading configuration...");
-        match config::load_config() {
+        match config::load_config().await {
             Ok(new_config) => {
                 if config_tx.send(Arc::new(new_config)).is_err() {
                     error!("Config receiver dropped, cannot reload config.");
@@ -498,7 +498,7 @@ pub async fn run() -> Result<()> {
     set_process_priority();
     set_io_priority();
 
-    let initial_config = match config::load_config() {
+    let initial_config = match config::load_config().await {
         Ok(config) => Arc::new(config),
         Err(e) => {
             eprintln!("Error loading config: {}", e);
