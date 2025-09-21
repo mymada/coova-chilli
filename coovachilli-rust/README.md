@@ -10,10 +10,16 @@ The project is organized as a Rust workspace with the following crates:
 
 - `chilli-core`: Contains the core logic, data structures, and configuration management for the application.
 - `chilli-net`: Provides the networking components, including the TUN/TAP interface, DHCP server, and RADIUS client.
-- `chilli-http`: Implements the UAM/captive portal HTTP server using the `axum` framework.
+- `chilli-http`: Implements the UAM/captive portal HTTP server using the `axum` framework and the `Tera` templating engine.
 - `chilli-bin`: The main binary crate that integrates all the other components and runs the application.
 - `chilli-query`: A command-line tool to query the state of the main daemon.
 - `chilli-ipc`: Handles Inter-Process Communication between the daemon and query tool.
+
+## Web Interface
+
+The web interface for the captive portal is built using the `axum` web framework and the `Tera` templating engine. This modern approach replaces the traditional CGI scripts used in the original CoovaChilli, providing better performance, security, and easier customization.
+
+Portal pages are located in the `chilli-http/templates` directory. You can customize the look and feel of the portal by editing these HTML files. The templates use Tera's syntax for dynamic content.
 
 ## Building
 

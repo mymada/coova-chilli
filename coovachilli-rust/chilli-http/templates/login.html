@@ -1,0 +1,40 @@
+<!doctype html>
+<html>
+<head>
+    <title>Login</title>
+    <script src="/static/portal.js"></script>
+</head>
+<body onload="doOnLoad('{{ res | default(value='notyet') }}', {{ is_popup }}, '{{ userurl }}')">
+
+    <h1>
+        {% if is_popup %}
+            Login
+        {% else %}
+            Login Required
+        {% endif %}
+    </h1>
+
+    {% if not is_popup %}
+        <p>Please log in using the form below. A popup window will open to complete the process.</p>
+    {% endif %}
+
+    {% if error_message %}
+        <p style="color: red;">{{ error_message }}</p>
+    {% endif %}
+
+    <form name="login" method="post" action="/login?username={{ username }}&challenge={{ challenge }}&popup=true" onsubmit="return login(this);">
+        <input type="hidden" name="uamip" value="{{ uamip }}">
+        <input type="hidden" name="uamport" value="{{ uamport }}">
+        <input type="hidden" name="userurl" value="{{ userurl }}">
+
+        <label for="username">Username:</label><br>
+        <input type="text" id="username" name="username" value="{{ username }}"><br>
+
+        <label for="password">Password:</label><br>
+        <input type="password" id="password" name="password"><br><br>
+
+        <input type="submit" value="Login">
+    </form>
+
+</body>
+</html>

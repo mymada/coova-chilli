@@ -3,6 +3,9 @@ name = "chilli-core"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+test-helpers = []
+
 [dependencies]
 rand = "0.8.5"
 serde = { version = "1.0", features = ["derive"] }

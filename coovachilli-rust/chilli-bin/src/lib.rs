@@ -25,8 +25,7 @@ use tokio::process::Command;
 use pnet::datalink::{self, NetworkInterface};
 use pnet::packet::arp::{ArpPacket, ArpOperations, ArpHardwareTypes};
 use pnet::packet::ethernet::{MutableEthernetPacket, EthernetPacket, EtherType, EtherTypes};
-use pnet::packet::ipv4::{checksum, Ipv4Packet, MutableIpv4Packet};
-use pnet::packet::tcp::{self, MutableTcpPacket, TcpFlags};
+use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::udp::UdpPacket;
 use pnet::packet::vlan::VlanPacket;
 use pnet::packet::Packet;
@@ -38,11 +37,7 @@ use tracing::{error, info, warn};
 use chilli_net::eap::{EapCode, EapPacket, EapType};
 use chilli_net::eapol::EapolPacket;
 use chilli_net::{PacketDevice, TunWrapper};
-use md5::{Digest, Md5};
 use pnet_base::MacAddr;
-use rand::Rng;
-use url::Url;
-
 use std::net::SocketAddr;
 
 pub async fn initialize_services(
@@ -293,6 +288,7 @@ async fn handle_uam_pap_auth(
     }
 }
 
+/*
 fn build_redirect_url(
     session: &mut Session,
     config: &Arc<chilli_core::Config>,
@@ -344,9 +340,11 @@ fn build_redirect_url(
 
     Some(url.to_string())
 }
+*/
 
 use std::env;
 
+/*
 fn build_http_redirect_packet(
     redirect_url: &str,
     ethernet_packet: &EthernetPacket,
@@ -405,6 +403,7 @@ fn build_http_redirect_packet(
 
     Some(eth_buffer)
 }
+*/
 
 
 // Constants for ioprio_set
@@ -543,16 +542,26 @@ pub async fn run() -> Result<()> {
 
     let radius_client = Arc::new(RadiusClient::new(config_rx.clone()).await?);
 
-    let config_clone_http = config.clone();
-    let core_tx_http = core_tx.clone();
-    let session_manager_http = session_manager.clone();
-    let _http_server_handle = tokio::spawn(async move {
-        if let Err(e) =
-            server::run_server(config_clone_http, core_tx_http, session_manager_http).await
-        {
-            error!("HTTP server error: {}", e);
-        }
-    });
+    let http_server_handle = {
+        let config = config.clone();
+        let core_tx = core_tx.clone();
+        let session_manager = session_manager.clone();
+        tokio::spawn(async move {
+            let addr = SocketAddr::new(config.uamlisten.into(), config.uamport);
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    error!("Failed to bind UAM server: {}", e);
+                    return;
+                }
+            };
+            if let Err(e) =
+                server::run_server(listener, config, core_tx, session_manager).await
+            {
+                error!("HTTP server error: {}", e);
+            }
+        })
+    };
 
     let dhcp_server = Arc::new(DhcpServer::new(config_rx.clone()).await?);
 
@@ -726,7 +735,7 @@ pub async fn run() -> Result<()> {
         _ = async { if let Some(h) = cmdsock_handle { h.await.ok(); } } => {
             info!("Cmdsock listener finished.");
         }
-        _ = _http_server_handle => {
+        _ = http_server_handle => {
             info!("HTTP server finished.");
         }
         _ = tun_loop_handle => {
@@ -1410,31 +1419,9 @@ async fn handle_ethernet_frame(
                     let src_mac = ethernet_packet.get_source().octets();
                     if let Some(session) = session_manager.get_session_by_mac(&src_mac).await {
                         if !session.state.authenticated {
-                             if ipv4_packet.get_next_level_protocol() == pnet::packet::ip::IpNextHeaderProtocols::Tcp {
-                                if let Some(tcp_packet) = pnet::packet::tcp::TcpPacket::new(ipv4_packet.payload()) {
-                                    if tcp_packet.get_destination() == 80 {
-                                        info!("Intercepted HTTP request from unauthenticated user {}", session.hisip);
-
-                                                let payload = tcp_packet.payload();
-                                                if !payload.is_empty() && payload.starts_with(b"GET") {
-                                                    let original_uri = String::from_utf8_lossy(payload).lines().next().unwrap_or("").to_string();
-
-                                                        let mut mutable_session = session.clone();
-                                                        if let Some(redirect_url) = build_redirect_url(&mut mutable_session, config, &original_uri) {
-                                                            info!("Redirecting to {}", redirect_url);
-                                                            if let Some(packet) = build_http_redirect_packet(&redirect_url, ethernet_packet, &ipv4_packet, &tcp_packet, our_mac) {
-                                                                if tx.send_to(&packet, None).is_none() {
-                                                                    error!("Failed to send redirect packet");
-                                                                }
-                                                            }
-                                                            session_manager.update_session(&session.hisip, |s| *s = mutable_session).await;
-                                                        }
-                                                }
-
-                                        return Ok(()); // Drop the original packet
-                                    }
-                                }
-                            }
+                            // The firewall is now responsible for redirecting unauthenticated users to the captive portal.
+                            // This L2 interception logic is no longer needed. We just drop the packet.
+                            return Ok(());
                         }
 
                         let packet_len = ethernet_packet.packet().len() as u64;
@@ -1981,6 +1968,7 @@ mod tests {
     use std::net::Ipv4Addr;
     use tokio::net::UdpSocket;
     use tokio::sync::oneshot;
+    use md5::{Digest, Md5};
 
     async fn mock_radius_server(socket: UdpSocket, secret: String) {
         let mut buf = [0u8; 1504];

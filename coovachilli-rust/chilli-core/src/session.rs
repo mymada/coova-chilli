@@ -334,4 +334,10 @@ impl SessionManager {
             session.state.last_up_time = get_current_time_secs();
         }
     }
+
+    #[cfg(feature = "test-helpers")]
+    pub async fn add_session(&self, session: Session) {
+        let mut sessions = self.sessions.lock().await;
+        sessions.insert(session.hisip, session);
+    }
 }

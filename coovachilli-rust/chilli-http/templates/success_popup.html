@@ -1,0 +1,11 @@
+<!doctype html>
+<html>
+    <head>
+        <title>Success</title>
+        <script src="/static/portal.js"></script>
+    </head>
+    <body onload="doOnLoad('success', true, '{{ userurl | default(value='/status') }}')">
+        <h1>Login Successful</h1>
+        <p>This window should close automatically.</p>
+    </body>
+</html>
