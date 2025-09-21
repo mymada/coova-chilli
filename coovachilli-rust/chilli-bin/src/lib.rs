@@ -2,7 +2,7 @@ pub mod config;
 pub mod cmdsock;
 
 use anyhow::Result;
-use chilli_core::{AuthType, CoreRequest, Session, SessionManager, eapol_session::{EapolSession, EapolState}};
+use chilli_core::{AuthType, CoreRequest, Session, SessionManager, eapol_session::{EapolSession, EapolState}, local_users::LocalUsers};
 use chilli_http::server;
 use chilli_net::dhcp::DhcpServer;
 use chilli_net::eap_mschapv2;
@@ -532,6 +532,13 @@ pub async fn run() -> Result<()> {
         warn!("Failed to load status file: {}", e);
     }
 
+    let local_users = Arc::new(LocalUsers::new());
+    if let Some(path) = &config.localusers {
+        if let Err(e) = local_users.load(path) {
+            warn!("Failed to load local users file: {}", e);
+        }
+    }
+
     let walled_garden_ips = Arc::new(Mutex::new(HashSet::new()));
 
     let eapol_attribute_cache =
@@ -688,6 +695,7 @@ pub async fn run() -> Result<()> {
         session_manager.clone(),
         firewall.clone(),
         config_rx.clone(),
+        local_users.clone(),
     ));
 
     let interim_update_handle = tokio::spawn(interim_update_loop(
@@ -945,10 +953,32 @@ async fn handle_pap_auth(
     session_manager: Arc<SessionManager>,
     firewall: Arc<Firewall>,
     config: Arc<chilli_core::Config>,
+    local_users: Arc<LocalUsers>,
 ) {
     info!("Processing PAP auth request for user '{}'", req.username);
-    let password_bytes = req.password.unwrap_or_default();
+    let password_bytes = req.password.clone().unwrap_or_default();
     let password_str = String::from_utf8_lossy(&password_bytes);
+
+    // 1. Check local users first
+    if local_users.verify_password(&req.username, &password_str) {
+        info!("Authentication successful for local user '{}'", req.username);
+        session_manager.authenticate_session(&req.ip).await;
+
+        if let Some(session) = session_manager.get_session(&req.ip).await {
+            if let Some(ref conup) = config.conup {
+                run_script(conup.clone(), &session, &config, None).await;
+            }
+            if let Err(e) = firewall.add_authenticated_ip(req.ip) {
+                error!("Failed to add authenticated IP to firewall: {}", e);
+            }
+            // Note: RADIUS accounting is not performed for local users in this basic implementation.
+        }
+        req.tx.send(true).ok();
+        return;
+    }
+
+    // 2. Fallback to RADIUS
+    info!("Local user not found or password incorrect, falling back to RADIUS for user '{}'", req.username);
     match radius_client
         .send_access_request(&req.username, &password_str)
         .await
@@ -1112,6 +1142,7 @@ async fn core_loop(
     session_manager: Arc<SessionManager>,
     firewall: Arc<Firewall>,
     config_rx: watch::Receiver<Arc<chilli_core::Config>>,
+    local_users: Arc<LocalUsers>,
 ) {
     while let Some(core_req) = rx.recv().await {
         let config = config_rx.borrow().clone();
@@ -1124,6 +1155,7 @@ async fn core_loop(
                         session_manager.clone(),
                         firewall.clone(),
                         config.clone(),
+                        local_users.clone(),
                     ));
                 }
                 AuthType::Eap => {

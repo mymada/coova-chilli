@@ -160,6 +160,9 @@ pub struct Config {
     /// The WISPr Location Name for RADIUS requests.
     #[serde(default)]
     pub radiuslocationname: Option<String>,
+    /// The path to the local users file for authentication.
+    #[serde(default)]
+    pub localusers: Option<String>,
 }
 
 fn default_radiustimeout() -> u32 {
@@ -225,6 +228,7 @@ impl Default for Config {
             radiusnasid: None,
             radiuslocationid: None,
             radiuslocationname: None,
+            localusers: None,
         }
     }
 }

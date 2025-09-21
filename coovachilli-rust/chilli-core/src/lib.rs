@@ -1,4 +1,5 @@
 pub mod config;
+pub mod local_users;
 pub mod session;
 pub mod eapol_session;
 
