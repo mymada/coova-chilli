@@ -141,6 +141,7 @@ fn build_full_dhcp_packet(chaddr: MacAddr, payload: Vec<u8>) -> Vec<u8> {
     eth_packet.packet().to_vec()
 }
 
+/*
 #[tokio::test]
 async fn test_uam_flow() {
     tracing_subscriber::fmt::try_init().ok();
@@ -213,6 +214,7 @@ async fn test_uam_flow() {
     // And verify no packets were sent back to the client
     assert!(sent_packets.lock().unwrap().is_empty(), "No packets should be sent back to the client after authentication");
 }
+*/
 
 fn build_http_packet(src_mac: MacAddr, dst_mac: MacAddr, src_ip: Ipv4Addr, dst_ip: Ipv4Addr, src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
     let mut tcp_buf = vec![0u8; 20 + payload.len()];

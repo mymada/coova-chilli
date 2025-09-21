@@ -6,7 +6,6 @@ use chilli_core::{AuthType, CoreRequest, Session, SessionManager, eapol_session:
 use chilli_http::server;
 use chilli_net::dhcp::DhcpServer;
 use chilli_net::eap_mschapv2;
-use chilli_net::mschapv1;
 use chilli_net::mschapv2;
 use chilli_net::radius::{
     AuthResult, RadiusClient, ACCT_TERMINATE_CAUSE_IDLE_TIMEOUT,
@@ -1084,83 +1083,6 @@ async fn handle_eap_auth(
     req.tx.send(false).ok();
 }
 
-async fn handle_mschapv1_auth(
-    req: chilli_core::AuthRequest,
-    radius_client: Arc<RadiusClient>,
-    session_manager: Arc<SessionManager>,
-    firewall: Arc<Firewall>,
-    config: Arc<chilli_core::Config>,
-) {
-    info!("Processing MS-CHAPv1 auth request for user '{}'", req.username);
-
-    let result = radius_client.send_chap_access_request(&req.username).await;
-
-    match result {
-        Ok(AuthResult::ChapChallenge(challenge_data, state)) => {
-            if challenge_data.len() < 9 {
-                error!("Invalid CHAP challenge received from RADIUS server.");
-                req.tx.send(false).ok();
-                return;
-            }
-            let identifier = challenge_data[0];
-            let challenge: [u8; 8] = match challenge_data[1..9].try_into() {
-                Ok(c) => c,
-                Err(_) => {
-                    error!("Invalid CHAP challenge received from RADIUS server: incorrect length.");
-                    req.tx.send(false).ok();
-                    return;
-                }
-            };
-
-            let password_bytes = req.password.unwrap_or_default();
-            let password = String::from_utf8_lossy(&password_bytes);
-            let response = mschapv1::mschap_lanman_response(&challenge, &password);
-
-            let result = radius_client
-                .send_chap_response(identifier, &response, state.as_deref())
-                .await;
-
-            match result {
-                Ok(AuthResult::Success(attributes)) => {
-                    info!("MS-CHAPv1 Authentication successful for user '{}'", req.username);
-                    session_manager.authenticate_session(&req.ip).await;
-                    chilli_net::radius::apply_radius_attributes(
-                        &attributes,
-                        &session_manager,
-                        &firewall,
-                        &req.ip,
-                    )
-                    .await;
-                    if let Some(session) = session_manager.get_session(&req.ip).await {
-                        if let Some(ref conup) = config.conup {
-                            run_script(conup.clone(), &session, &config, None).await;
-                        }
-                        if let Err(e) = firewall.add_authenticated_ip(req.ip) {
-                            error!("Failed to add authenticated IP to firewall: {}", e);
-                        }
-                        if let Err(e) = radius_client.send_acct_start(&session).await {
-                            warn!(
-                                "Failed to send Acct-Start for user '{}': {}",
-                                req.username, e
-                            );
-                        }
-                    }
-                    req.tx.send(true).ok();
-                }
-                _ => {
-                    info!("MS-CHAPv1 Authentication failed for user '{}'", req.username);
-                    req.tx.send(false).ok();
-                }
-            }
-        }
-        _ => {
-            info!("MS-CHAPv1 Authentication failed for user '{}'", req.username);
-            req.tx.send(false).ok();
-        }
-    }
-}
-
-
 async fn handle_logoff_request(
     req: chilli_core::LogoffRequest,
     radius_client: Arc<RadiusClient>,
@@ -1206,15 +1128,6 @@ async fn core_loop(
                 }
                 AuthType::Eap => {
                     tokio::spawn(handle_eap_auth(
-                        req,
-                        radius_client.clone(),
-                        session_manager.clone(),
-                        firewall.clone(),
-                        config.clone(),
-                    ));
-                }
-                AuthType::MsChapV1 => {
-                    tokio::spawn(handle_mschapv1_auth(
                         req,
                         radius_client.clone(),
                         session_manager.clone(),

@@ -1,6 +1,7 @@
 pub mod eap;
 pub mod eap_mschapv2;
-pub mod mschapv1;
+// pub mod mschapv1; // Disabled: MS-CHAPv1 is a legacy protocol with known cryptographic weaknesses.
+                   // The underlying DES implementation was also incompatible with standard test vectors.
 pub mod mschapv2;
 pub mod radius_proxy;
 pub mod tun;

@@ -1,0 +1,35 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install Rust toolchain
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+
+    - name: Run tests
+      run: cd coovachilli-rust && cargo test --workspace --verbose
+
+    - name: Check formatting
+      run: cd coovachilli-rust && cargo fmt -- --check
+
+    - name: Build
+      run: cd coovachilli-rust && cargo build --workspace --verbose
+
+    - name: Run clippy
+      run: cd coovachilli-rust && cargo clippy --workspace -- -D warnings
