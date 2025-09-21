@@ -127,3 +127,84 @@ impl Firewall {
         Ok(())
     }
 }
+
+#[cfg(test)]
+pub mod tests {
+    use std::net::Ipv4Addr;
+    use std::sync::{Arc, Mutex};
+    use chilli_core::Config;
+
+    #[derive(Debug, PartialEq, Eq, Clone)]
+    pub enum MockFirewallAction {
+        Initialize,
+        AddAuthenticatedIp(Ipv4Addr),
+        RemoveAuthenticatedIp(Ipv4Addr),
+        ApplyUserFilter(Ipv4Addr, String),
+        RemoveUserFilter(Ipv4Addr),
+        Cleanup,
+    }
+
+    #[derive(Clone)]
+    pub struct MockFirewall {
+        pub actions: Arc<Mutex<Vec<MockFirewallAction>>>,
+    }
+
+    impl MockFirewall {
+        pub fn new(_config: Config) -> Self {
+            MockFirewall {
+                actions: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        pub fn initialize(&self) -> Result<(), std::io::Error> {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(MockFirewallAction::Initialize);
+            Ok(())
+        }
+
+        pub fn add_authenticated_ip(&self, ip: Ipv4Addr) -> Result<(), std::io::Error> {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(MockFirewallAction::AddAuthenticatedIp(ip));
+            Ok(())
+        }
+
+        pub fn remove_authenticated_ip(&self, ip: Ipv4Addr) -> Result<(), std::io::Error> {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(MockFirewallAction::RemoveAuthenticatedIp(ip));
+            Ok(())
+        }
+
+        pub fn apply_user_filter(
+            &self,
+            ip: Ipv4Addr,
+            filter_id: &str,
+        ) -> Result<(), std::io::Error> {
+            self.actions.lock().unwrap().push(
+                MockFirewallAction::ApplyUserFilter(ip, filter_id.to_string()),
+            );
+            Ok(())
+        }
+
+        pub fn remove_user_filter(&self, ip: Ipv4Addr) -> Result<(), std::io::Error> {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(MockFirewallAction::RemoveUserFilter(ip));
+            Ok(())
+        }
+
+        pub fn cleanup(&self) -> Result<(), std::io::Error> {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(MockFirewallAction::Cleanup);
+            Ok(())
+        }
+    }
+}

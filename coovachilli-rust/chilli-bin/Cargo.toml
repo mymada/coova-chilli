@@ -31,3 +31,8 @@ reqwest = { version = "0.12", features = ["json"] }
 async-trait = "0.1.50"
 wiremock = "0.6"
 tempfile = "3.10"
+axum = "0.7"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+url = "2.5"
+md-5 = "0.10"
+chilli-http = { path = "../chilli-http" }
