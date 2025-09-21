@@ -2,6 +2,8 @@
 
 This is a rewrite of the CoovaChilli captive portal in Rust. The goal is to create a more modern, secure, and maintainable implementation of the original C-based project.
 
+This port is functional and implements many of the core features of CoovaChilli, including DHCP, RADIUS (PAP, EAP-MD5, EAP-MSCHAPv2), UAM, and session management.
+
 ## Project Structure
 
 The project is organized as a Rust workspace with the following crates:
@@ -10,22 +12,50 @@ The project is organized as a Rust workspace with the following crates:
 - `chilli-net`: Provides the networking components, including the TUN/TAP interface, DHCP server, and RADIUS client.
 - `chilli-http`: Implements the UAM/captive portal HTTP server using the `axum` framework.
 - `chilli-bin`: The main binary crate that integrates all the other components and runs the application.
+- `chilli-query`: A command-line tool to query the state of the main daemon.
+- `chilli-ipc`: Handles Inter-Process Communication between the daemon and query tool.
 
-## Building and Running
+## Building
 
-**Note:** This project is still in the early stages of development and is not yet functional.
+To build the project, you will need to have Rust and Cargo installed. You can then build the entire workspace by running the following command from the `coovachilli-rust` directory:
 
-To build the project, you will need to have Rust and Cargo installed. You can then build the project by running the following command from the root of the workspace:
-
+```bash
+cargo build --workspace
 ```
-cargo build
+
+## Testing
+
+The project includes a suite of unit and integration tests. To run all tests, use the following command from the `coovachilli-rust` directory:
+
+```bash
+cargo test --workspace
 ```
 
-To run the application, you will need to create a `chilli.toml` configuration file. An example configuration file can be found in `chilli-core/tests/chilli.toml`. You can then run the application with the following command:
+## Running
 
+To run the application, you will need to create a `chilli.toml` configuration file. An example configuration file can be found in `chilli-core/tests/chilli.toml`.
+
+You can then run the application with the following command:
+
+```bash
+# You will likely need to run this with sudo to allow for TUN device creation
+# and firewall rule manipulation.
+sudo cargo run -p chilli-bin -- --config-file /path/to/your/chilli.toml
 ```
-cargo run -p chilli-bin -- --config-file /path/to/your/chilli.toml
-```
+
+## Feature Status
+
+- **Working:**
+  - DHCP Server
+  - RADIUS Client (PAP, EAP-MD5, EAP-MSCHAPv2)
+  - TUN device integration
+  - Session Management (including basic quota support)
+  - HTTP UAM Server (for captive portal redirect)
+  - Command Socket for IPC
+
+- **Disabled / To-Do:**
+  - **MS-CHAPv1:** This legacy authentication protocol has been disabled due to cryptographic dependency issues and its known security vulnerabilities.
+  - **UAM Authentication Flow:** The integration test for the full web-based login flow is currently disabled as the feature is incomplete.
 
 ## Contributing
 
