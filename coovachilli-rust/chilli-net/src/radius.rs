@@ -376,7 +376,16 @@ pub enum AuthResult {
     Failure,
 }
 
-type PendingRequest = oneshot::Sender<AuthResult>;
+struct PendingRequest {
+    packet: Vec<u8>,
+    tx: Option<oneshot::Sender<Result<AuthResult>>>,
+    is_acct_packet: bool,
+
+    // Retry state
+    next_attempt_at: SystemTime,
+    attempt_count: u8,
+    current_server_index: usize,
+}
 
 fn encrypt_password(password: &[u8], secret: &[u8], authenticator: &[u8; 16]) -> Vec<u8> {
     // Per RFC 2865, the password must be padded to a multiple of 16 octets.
@@ -415,17 +424,12 @@ fn encrypt_password(password: &[u8], secret: &[u8], authenticator: &[u8; 16]) ->
 pub struct RadiusClient {
     socket: Arc<UdpSocket>,
     pub coa_socket: Arc<UdpSocket>,
-    config: Arc<Mutex<Arc<Config>>>,
-    config_rx: Arc<Mutex<watch::Receiver<Arc<Config>>>>,
+    config_rx: watch::Receiver<Arc<Config>>,
     next_id: Arc<Mutex<u8>>,
     pending_requests: Arc<Mutex<HashMap<u8, PendingRequest>>>,
 }
 
 impl RadiusClient {
-    pub fn config(&self) -> Arc<Mutex<Arc<Config>>> {
-        self.config.clone()
-    }
-
     pub async fn new(config_rx: watch::Receiver<Arc<Config>>) -> Result<Self> {
         let config = config_rx.borrow().clone();
         let addr = format!("{}:0", config.radiuslisten);
@@ -439,8 +443,7 @@ impl RadiusClient {
         Ok(RadiusClient {
             socket: Arc::new(socket),
             coa_socket: Arc::new(coa_socket),
-            config: Arc::new(Mutex::new(config)),
-            config_rx: Arc::new(Mutex::new(config_rx)),
+            config_rx,
             next_id: Arc::new(Mutex::new(0)),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -448,8 +451,9 @@ impl RadiusClient {
 
     pub async fn run(&self) {
         let mut buf = [0u8; RADIUS_MAX_LEN];
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+
         loop {
-            let mut config_rx = self.config_rx.lock().await;
             tokio::select! {
                 res = self.socket.recv_from(&mut buf) => {
                     if let Ok((len, _src)) = res {
@@ -461,7 +465,7 @@ impl RadiusClient {
                                         RadiusCode::AccessAccept => {
                                             let payload_len = (u16::from_be(packet.length) as usize) - RADIUS_HDR_LEN;
                                             let attributes = parse_attributes(&packet.payload[..payload_len]);
-                                            AuthResult::Success(attributes)
+                                            Ok(AuthResult::Success(attributes))
                                         }
                                         RadiusCode::AccessChallenge => {
                                             let payload_len = (u16::from_be(packet.length) as usize) - RADIUS_HDR_LEN;
@@ -470,20 +474,25 @@ impl RadiusClient {
                                             let chap_challenge = attributes.get_standard(RadiusAttributeType::ChapChallenge).cloned();
                                             let state = attributes.get_standard(RadiusAttributeType::State).cloned();
                                             if let Some(eap) = eap_message {
-                                                AuthResult::Challenge(eap, state)
+                                                Ok(AuthResult::Challenge(eap, state))
                                             } else if let Some(chap) = chap_challenge {
-                                                AuthResult::ChapChallenge(chap, state)
+                                                Ok(AuthResult::ChapChallenge(chap, state))
                                             } else {
-                                                AuthResult::Failure
+                                                Ok(AuthResult::Failure)
                                             }
                                         }
-                                        _ => AuthResult::Failure,
+                                        _ => Ok(AuthResult::Failure),
                                     };
-                                    if let Err(_) = sender.send(result) {
-                                        warn!("Failed to send RADIUS response to waiting task");
+                                    if let Some(tx) = sender.tx {
+                                        if tx.send(result).is_err() {
+                                            warn!("Failed to send RADIUS response to waiting task for id {}", packet.id);
+                                        }
                                     }
                                 } else if code == RadiusCode::AccountingResponse {
                                     info!("Received Accounting-Response for packet id {}", packet.id);
+                                    // This acknowledges the packet, so we can remove it from the queue.
+                                    let mut pending = self.pending_requests.lock().await;
+                                    pending.remove(&packet.id);
                                 }
                             }
                         }
@@ -491,15 +500,83 @@ impl RadiusClient {
                         warn!("RADIUS socket error: {}", e);
                     }
                 }
-                res = config_rx.changed() => {
-                    if res.is_ok() {
-                        let new_config = config_rx.borrow().clone();
-                        let mut config = self.config.lock().await;
-                        *config = new_config;
-                        info!("RADIUS client reloaded configuration.");
-                    } else {
-                        info!("Config channel closed, ending RADIUS client loop.");
-                        return;
+                _ = interval.tick() => {
+                    let now = SystemTime::now();
+                    let mut packets_to_send = Vec::new();
+                    let mut timed_out_senders = Vec::new();
+                    let config = self.config_rx.borrow().clone();
+
+                    let mut auth_servers = vec![config.radiusserver1.to_string()];
+                    if let Some(s2) = &config.radiusserver2 {
+                        auth_servers.push(s2.to_string());
+                    }
+                    let acct_servers = auth_servers.clone(); // In this implementation, they are the same.
+
+                    let mut pending = self.pending_requests.lock().await;
+
+                    pending.retain(|id, req| {
+                        if now < req.next_attempt_at {
+                            return true; // Not time yet, keep it.
+                        }
+
+                        let (servers, port) = if req.is_acct_packet {
+                            (&acct_servers, config.radiusacctport)
+                        } else {
+                            (&auth_servers, config.radiusauthport)
+                        };
+
+                        // Check if we've exhausted all servers
+                        if req.current_server_index >= servers.len() {
+                            warn!("RADIUS request id {} timed out completely.", id);
+                            if let Some(tx) = req.tx.take() {
+                                timed_out_senders.push(tx);
+                            }
+                            return false; // Remove from pending requests
+                        }
+
+                        let server_ip = &servers[req.current_server_index];
+                        let addr = format!("{}:{}", server_ip, port);
+                        packets_to_send.push((addr, req.packet.clone()));
+
+                        req.attempt_count += 1;
+
+                        let max_retries = config.radiusretry as u8;
+                        let base_timeout = Duration::from_secs(config.radiustimeout as u64);
+
+                        if req.attempt_count > max_retries {
+                            // Move to next server
+                            req.current_server_index += 1;
+                            req.attempt_count = 0;
+                            // Try next server immediately
+                            req.next_attempt_at = now;
+                        } else {
+                            // Exponential backoff for next attempt on the *same* server
+                            let backoff_factor = 2u64.pow(req.attempt_count as u32 - 1);
+                            let next_delay = base_timeout * backoff_factor as u32;
+                            req.next_attempt_at = now + next_delay;
+                        }
+
+                        true // Keep request in pending map
+                    });
+
+                    drop(pending); // Release lock before I/O
+
+                    for (addr, packet) in packets_to_send {
+                        let socket = self.socket.clone();
+                        let id = packet[1];
+                        tokio::spawn(async move {
+                            if let Err(e) = socket.send_to(&packet, &addr).await {
+                                error!("Failed to send RADIUS request id {}: {}", id, e);
+                            } else {
+                                info!("Sent RADIUS request id {} to {}", id, addr);
+                            }
+                        });
+                    }
+
+                    for tx in timed_out_senders {
+                        if tx.send(Err(anyhow!("RADIUS request timed out"))).is_err() {
+                             warn!("Failed to send timeout to waiting task (receiver dropped).");
+                        }
                     }
                 }
             }
@@ -507,7 +584,7 @@ impl RadiusClient {
     }
 
     pub async fn handle_coa_request(&self, packet: &RadiusPacket, src: SocketAddr, session_manager: &Arc<SessionManager>, firewall: &Arc<Firewall>) -> Result<()> {
-        let config = self.config.lock().await;
+        let config = self.config_rx.borrow().clone();
         info!("Handling CoA/Disconnect request from {}", src);
 
         if !config.coanoipcheck {
@@ -617,11 +694,36 @@ impl RadiusClient {
         Ok(())
     }
 
+    async fn send_request(
+        &self,
+        packet_bytes: Vec<u8>,
+        tx: Option<oneshot::Sender<Result<AuthResult>>>,
+        is_acct_packet: bool,
+    ) -> Result<()> {
+        let packet_id = packet_bytes[1];
+
+        let pending_request = PendingRequest {
+            packet: packet_bytes,
+            tx,
+            is_acct_packet,
+            next_attempt_at: SystemTime::now(), // Send immediately
+            attempt_count: 0,
+            current_server_index: 0,
+        };
+
+        self.pending_requests
+            .lock()
+            .await
+            .insert(packet_id, pending_request);
+
+        Ok(())
+    }
+
     pub async fn send_access_request(
         &self,
         username: &str,
         password: &str,
-    ) -> Result<Option<RadiusAttributes>> {
+    ) -> Result<AuthResult> {
         let packet_id = {
             let mut id = self.next_id.lock().await;
             let packet_id = *id;
@@ -630,7 +732,6 @@ impl RadiusClient {
         };
 
         let (tx, rx) = oneshot::channel();
-        self.pending_requests.lock().await.insert(packet_id, tx);
 
         let mut authenticator = [0u8; RADIUS_AUTH_LEN];
         getrandom::getrandom(&mut authenticator)
@@ -641,7 +742,7 @@ impl RadiusClient {
             type_code: RadiusAttributeType::UserName,
             value: username.as_bytes().to_vec(),
         });
-        let config = self.config.lock().await;
+        let config = self.config_rx.borrow().clone();
         let encrypted_pass = encrypt_password(
             password.as_bytes(),
             config.radiussecret.as_bytes(),
@@ -668,17 +769,58 @@ impl RadiusClient {
         packet_bytes.extend_from_slice(&authenticator);
         packet_bytes.extend_from_slice(&payload);
 
-        let server_addr = format!("{}:{}", config.radiusserver1, config.radiusauthport);
-        self.socket.send_to(&packet_bytes, &server_addr).await?;
+        self.send_request(packet_bytes, Some(tx), false).await?;
 
-        info!("Sent Access-Request for user '{}' to {}", username, server_addr);
+        rx.await?
+    }
 
-        match tokio::time::timeout(Duration::from_secs(5), rx).await {
-            Ok(Ok(AuthResult::Success(attrs))) => Ok(Some(attrs)),
-            Ok(Ok(_)) => Ok(None),
-            Ok(Err(_)) => Err(anyhow!("RADIUS request channel closed unexpectedly")),
-            Err(_) => Err(anyhow!("RADIUS request timed out")),
+    pub async fn send_preencrypted_access_request(
+        &self,
+        username: &str,
+        encrypted_password: Vec<u8>,
+    ) -> Result<AuthResult> {
+        let packet_id = {
+            let mut id = self.next_id.lock().await;
+            let packet_id = *id;
+            *id = id.wrapping_add(1);
+            packet_id
+        };
+
+        let (tx, rx) = oneshot::channel();
+
+        let mut authenticator = [0u8; RADIUS_AUTH_LEN];
+        getrandom::getrandom(&mut authenticator)
+            .map_err(|e| anyhow::anyhow!("getrandom failed: {}", e))?;
+
+        let mut attributes = Vec::new();
+        attributes.push(RadiusAttributeValue {
+            type_code: RadiusAttributeType::UserName,
+            value: username.as_bytes().to_vec(),
+        });
+        attributes.push(RadiusAttributeValue {
+            type_code: RadiusAttributeType::UserPassword,
+            value: encrypted_password,
+        });
+
+        let mut payload = Vec::new();
+        for attr in attributes {
+            payload.push(attr.type_code as u8);
+            payload.push((attr.value.len() + 2) as u8);
+            payload.extend_from_slice(&attr.value);
         }
+
+        let length = (RADIUS_HDR_LEN + payload.len()) as u16;
+
+        let mut packet_bytes = Vec::with_capacity(length as usize);
+        packet_bytes.push(RadiusCode::AccessRequest as u8);
+        packet_bytes.push(packet_id);
+        packet_bytes.extend_from_slice(&length.to_be_bytes());
+        packet_bytes.extend_from_slice(&authenticator);
+        packet_bytes.extend_from_slice(&payload);
+
+        self.send_request(packet_bytes, Some(tx), false).await?;
+
+        rx.await?
     }
 
     pub async fn send_eap_response(
@@ -694,7 +836,6 @@ impl RadiusClient {
         };
 
         let (tx, rx) = oneshot::channel();
-        self.pending_requests.lock().await.insert(packet_id, tx);
 
         let mut authenticator = [0u8; RADIUS_AUTH_LEN];
         getrandom::getrandom(&mut authenticator)
@@ -728,17 +869,9 @@ impl RadiusClient {
         packet_bytes.extend_from_slice(&authenticator);
         packet_bytes.extend_from_slice(&payload);
 
-        let config = self.config.lock().await;
-        let server_addr = format!("{}:{}", config.radiusserver1, config.radiusauthport);
-        self.socket.send_to(&packet_bytes, &server_addr).await?;
+        self.send_request(packet_bytes, Some(tx), false).await?;
 
-        info!("Sent EAP-Response to {}", server_addr);
-
-        match tokio::time::timeout(Duration::from_secs(5), rx).await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(_)) => Err(anyhow!("RADIUS request channel closed unexpectedly")),
-            Err(_) => Err(anyhow!("RADIUS request timed out")),
-        }
+        rx.await?
     }
 
     pub async fn send_chap_access_request(&self, username: &str) -> Result<AuthResult> {
@@ -750,7 +883,6 @@ impl RadiusClient {
         };
 
         let (tx, rx) = oneshot::channel();
-        self.pending_requests.lock().await.insert(packet_id, tx);
 
         let mut authenticator = [0u8; RADIUS_AUTH_LEN];
         getrandom::getrandom(&mut authenticator)
@@ -778,17 +910,9 @@ impl RadiusClient {
         packet_bytes.extend_from_slice(&authenticator);
         packet_bytes.extend_from_slice(&payload);
 
-        let config = self.config.lock().await;
-        let server_addr = format!("{}:{}", config.radiusserver1, config.radiusauthport);
-        self.socket.send_to(&packet_bytes, &server_addr).await?;
+        self.send_request(packet_bytes, Some(tx), false).await?;
 
-        info!("Sent CHAP Access-Request for user '{}' to {}", username, server_addr);
-
-        match tokio::time::timeout(Duration::from_secs(5), rx).await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(_)) => Err(anyhow!("RADIUS request channel closed unexpectedly")),
-            Err(_) => Err(anyhow!("RADIUS request timed out")),
-        }
+        rx.await?
     }
 
     pub async fn send_chap_response(
@@ -805,7 +929,6 @@ impl RadiusClient {
         };
 
         let (tx, rx) = oneshot::channel();
-        self.pending_requests.lock().await.insert(packet_id, tx);
 
         let mut authenticator = [0u8; RADIUS_AUTH_LEN];
         getrandom::getrandom(&mut authenticator)
@@ -842,17 +965,9 @@ impl RadiusClient {
         packet_bytes.extend_from_slice(&authenticator);
         packet_bytes.extend_from_slice(&payload);
 
-        let config = self.config.lock().await;
-        let server_addr = format!("{}:{}", config.radiusserver1, config.radiusauthport);
-        self.socket.send_to(&packet_bytes, &server_addr).await?;
+        self.send_request(packet_bytes, Some(tx), false).await?;
 
-        info!("Sent CHAP-Response to {}", server_addr);
-
-        match tokio::time::timeout(Duration::from_secs(5), rx).await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(_)) => Err(anyhow!("RADIUS request channel closed unexpectedly")),
-            Err(_) => Err(anyhow!("RADIUS request timed out")),
-        }
+        rx.await?
     }
 
     pub async fn send_acct_start(&self, session: &chilli_core::Session) -> Result<()> {
@@ -945,12 +1060,9 @@ impl RadiusClient {
             });
         }
 
-        let session_time_bytes = ((SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            - session.state.start_time) as u32)
-            .to_be_bytes();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+        let session_time_bytes =
+            ((now.as_secs() - session.state.start_time) as u32).to_be_bytes();
         attributes.push(RadiusAttributeValue {
             type_code: RadiusAttributeType::AcctSessionTime,
             value: session_time_bytes.to_vec(),
@@ -970,7 +1082,7 @@ impl RadiusClient {
         packet_header.push(packet_id);
         packet_header.extend_from_slice(&length.to_be_bytes());
 
-        let config = self.config.lock().await;
+        let config = self.config_rx.borrow().clone();
         let mut to_hash = Vec::new();
         to_hash.extend_from_slice(&packet_header);
         to_hash.extend_from_slice(&[0; 16]); // Request Authenticator is zeroed for Acct-Request
@@ -986,9 +1098,9 @@ impl RadiusClient {
         final_packet.extend_from_slice(&authenticator);
         final_packet.extend_from_slice(&payload);
 
-        let server_addr =
-            format!("{}:{}", config.radiusserver1, config.radiusacctport);
-        self.socket.send_to(&final_packet, &server_addr).await?;
+        // Accounting packets are 'fire and forget' from the caller's perspective,
+        // but the client will handle retries internally.
+        self.send_request(final_packet, None, true).await?;
 
         Ok(())
     }
@@ -1060,14 +1172,28 @@ mod tests {
         assert_eq!(attributes.standard.len(), 1);
         assert_eq!(attributes.vsas.len(), 1);
 
-        let session_timeout = attributes.get_standard(RadiusAttributeType::SessionTimeout).unwrap();
+        let session_timeout = attributes
+            .get_standard(RadiusAttributeType::SessionTimeout)
+            .expect("Session-Timeout attribute not found");
         assert_eq!(session_timeout, &vec![0, 0, 14, 16]);
-        let session_timeout_val = u32::from_be_bytes(session_timeout.clone().try_into().unwrap());
+        let session_timeout_val = u32::from_be_bytes(
+            session_timeout
+                .clone()
+                .try_into()
+                .expect("Session-Timeout value has incorrect length"),
+        );
         assert_eq!(session_timeout_val, 3600);
 
-        let bw_up = attributes.get_vsa(VENDOR_ID_WISPR, WISPR_BANDWIDTH_MAX_UP).unwrap();
+        let bw_up = attributes
+            .get_vsa(VENDOR_ID_WISPR, WISPR_BANDWIDTH_MAX_UP)
+            .expect("WISPr-Bandwidth-Max-Up VSA not found");
         assert_eq!(bw_up, &vec![0, 0, 0xfa, 0]);
-        let bw_up_val = u32::from_be_bytes(bw_up.clone().try_into().unwrap());
+        let bw_up_val = u32::from_be_bytes(
+            bw_up
+                .clone()
+                .try_into()
+                .expect("WISPr-Bandwidth-Max-Up value has incorrect length"),
+        );
         assert_eq!(bw_up_val, 64000);
     }
 }

@@ -26,7 +26,8 @@ fn create_upload_packet(our_mac: MacAddr, src_mac: MacAddr, src_ip: Ipv4Addr, ds
 
     let mut udp_buf = vec![0u8; udp_len];
     {
-        let mut udp_packet = MutableUdpPacket::new(&mut udp_buf).unwrap();
+        let mut udp_packet =
+            MutableUdpPacket::new(&mut udp_buf).expect("Failed to create udp packet buffer");
         udp_packet.set_source(12345);
         udp_packet.set_destination(80);
         udp_packet.set_length(udp_len as u16);
@@ -36,7 +37,8 @@ fn create_upload_packet(our_mac: MacAddr, src_mac: MacAddr, src_ip: Ipv4Addr, ds
 
     let mut ip_buf = vec![0u8; ip_len];
     {
-        let mut ip_packet = MutableIpv4Packet::new(&mut ip_buf).unwrap();
+        let mut ip_packet =
+            MutableIpv4Packet::new(&mut ip_buf).expect("Failed to create ipv4 packet buffer");
         ip_packet.set_version(4);
         ip_packet.set_header_length(5);
         ip_packet.set_total_length(ip_len as u16);
@@ -51,7 +53,8 @@ fn create_upload_packet(our_mac: MacAddr, src_mac: MacAddr, src_ip: Ipv4Addr, ds
 
     let mut eth_buf = vec![0u8; total_len];
     {
-        let mut eth_packet = MutableEthernetPacket::new(&mut eth_buf).unwrap();
+        let mut eth_packet =
+            MutableEthernetPacket::new(&mut eth_buf).expect("Failed to create ethernet packet buffer");
         eth_packet.set_destination(our_mac);
         eth_packet.set_source(src_mac);
         eth_packet.set_ethertype(EtherTypes::Ipv4);
@@ -72,7 +75,8 @@ fn create_download_packet(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, total_len: usize) 
 
     let mut udp_buf = vec![0u8; udp_len];
     {
-        let mut udp_packet = MutableUdpPacket::new(&mut udp_buf).unwrap();
+        let mut udp_packet =
+            MutableUdpPacket::new(&mut udp_buf).expect("Failed to create udp packet buffer");
         udp_packet.set_source(80);
         udp_packet.set_destination(12345);
         udp_packet.set_length(udp_len as u16);
@@ -82,7 +86,8 @@ fn create_download_packet(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, total_len: usize) 
 
     let mut ip_buf = vec![0u8; total_len];
     {
-        let mut ip_packet = MutableIpv4Packet::new(&mut ip_buf).unwrap();
+        let mut ip_packet =
+            MutableIpv4Packet::new(&mut ip_buf).expect("Failed to create ipv4 packet buffer");
         ip_packet.set_version(4);
         ip_packet.set_header_length(5);
         ip_packet.set_total_length(total_len as u16);
@@ -134,10 +139,19 @@ impl PacketDevice for MockTun {
     }
 }
 
-async fn setup_test_session(quota_type: &str, quota_value: u64) -> (Arc<chilli_core::Config>, Arc<chilli_core::SessionManager>, Ipv4Addr, MacAddr) {
-    let (config, session_manager, ..) = initialize_services(None).await;
+async fn setup_test_session(
+    quota_type: &str,
+    quota_value: u64,
+) -> (
+    Arc<chilli_core::Config>,
+    Arc<chilli_core::SessionManager>,
+    Ipv4Addr,
+    MacAddr,
+) {
+    let (config, session_manager, ..) =
+        initialize_services(None, Some(0)).await.expect("initialize_services failed");
 
-    let client_ip = "10.1.0.10".parse().unwrap();
+    let client_ip = "10.1.0.10".parse().expect("Failed to parse IP");
     let client_mac_arr = [0x10, 0x11, 0x12, 0x13, 0x14, 0x15];
     let client_mac = MacAddr::from(client_mac_arr);
 
@@ -155,7 +169,7 @@ async fn setup_test_session(quota_type: &str, quota_value: u64) -> (Arc<chilli_c
             }
         })
         .await
-        .unwrap();
+        .expect("Failed to update session");
 
     (config, session_manager, client_ip, client_mac)
 }
@@ -165,7 +179,8 @@ async fn test_upload_quota_exceeded() {
     let quota = 1000;
     let (config, session_manager, client_ip, client_mac) = setup_test_session("input", quota).await;
 
-    let (_, _, radius_client, dhcp_server, firewall, eapol_attribute_cache, auth_tx, _, _) = initialize_services(None).await;
+    let (_, _, radius_client, dhcp_server, firewall, eapol_attribute_cache, auth_tx, _, _) =
+        initialize_services(None, Some(0)).await.expect("initialize_services failed");
 
     let (upload_tx, _upload_rx) = mpsc::channel(100);
 
@@ -173,7 +188,13 @@ async fn test_upload_quota_exceeded() {
     let mut mock_tx: Box<dyn datalink::DataLinkSender> = Box::new(MockDataLinkSender);
 
     let packet_len = 150;
-    let packet = create_upload_packet(our_mac, client_mac, client_ip, "8.8.8.8".parse().unwrap(), packet_len);
+    let packet = create_upload_packet(
+        our_mac,
+        client_mac,
+        client_ip,
+        "8.8.8.8".parse().expect("Failed to parse IP"),
+        packet_len,
+    );
     let num_packets_to_exceed = (quota as usize / packet.len()) + 1;
 
     for i in 0..num_packets_to_exceed {
@@ -198,7 +219,8 @@ async fn test_download_quota_exceeded() {
     let quota = 1000;
     let (_config, session_manager, client_ip, _) = setup_test_session("output", quota).await;
 
-    let (_, _, radius_client, _, firewall, _, _, _, config_tx) = initialize_services(None).await;
+    let (_, _, radius_client, _, firewall, _, _, _, config_tx) =
+        initialize_services(None, Some(0)).await.expect("initialize_services failed");
 
     let (tun_tx, tun_rx) = mpsc::channel(100);
     let (upload_rx_tx, upload_rx_rx) = mpsc::channel(100);
@@ -220,11 +242,15 @@ async fn test_download_quota_exceeded() {
     ));
 
     let packet_len = 150;
-    let packet = create_download_packet("8.8.8.8".parse().unwrap(), client_ip, packet_len);
+    let packet =
+        create_download_packet("8.8.8.8".parse().expect("Failed to parse IP"), client_ip, packet_len);
     let num_packets_to_exceed = (quota as usize / packet.len()) + 1;
 
     for _ in 0..num_packets_to_exceed {
-        tun_tx.send(packet.clone()).await.unwrap();
+        tun_tx
+            .send(packet.clone())
+            .await
+            .expect("Failed to send packet to mock tun");
     }
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -239,7 +265,8 @@ async fn test_total_quota_exceeded() {
     let quota = 1000;
     let (config, session_manager, client_ip, client_mac) = setup_test_session("total", quota).await;
 
-    let (_, _, radius_client, dhcp_server, firewall, eapol_attribute_cache, auth_tx, _, config_tx) = initialize_services(None).await;
+    let (_, _, radius_client, dhcp_server, firewall, eapol_attribute_cache, auth_tx, _, config_tx) =
+        initialize_services(None, Some(0)).await.expect("initialize_services failed");
 
     let (upload_tx, upload_rx) = mpsc::channel(100);
     let (download_tx, _) = mpsc::channel(100);
@@ -264,8 +291,15 @@ async fn test_total_quota_exceeded() {
     ));
 
     let packet_len = 80;
-    let upload_packet = create_upload_packet(our_mac, client_mac, client_ip, "8.8.8.8".parse().unwrap(), packet_len);
-    let download_packet = create_download_packet("8.8.8.8".parse().unwrap(), client_ip, packet_len);
+    let upload_packet = create_upload_packet(
+        our_mac,
+        client_mac,
+        client_ip,
+        "8.8.8.8".parse().expect("Failed to parse IP"),
+        packet_len,
+    );
+    let download_packet =
+        create_download_packet("8.8.8.8".parse().expect("Failed to parse IP"), client_ip, packet_len);
 
     let num_packets = (quota as usize / (packet_len * 2)) + 1;
 
@@ -275,7 +309,10 @@ async fn test_total_quota_exceeded() {
             &session_manager, &radius_client, &dhcp_server,
             &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx
         ).await;
-        tun_tx.send(download_packet.clone()).await.unwrap();
+        tun_tx
+            .send(download_packet.clone())
+            .await
+            .expect("Failed to send download packet to mock tun");
 
         if i == num_packets -1 {
              tokio::time::sleep(Duration::from_millis(50)).await;

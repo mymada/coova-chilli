@@ -1,4 +1,5 @@
 use std::net::Ipv4Addr;
+use md5::{Digest, Md5};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::info;
@@ -31,7 +32,10 @@ impl datalink::DataLinkSender for MockDataLinkSender {
         packet: &[u8],
         _dst_iface: Option<NetworkInterface>,
     ) -> Option<std::io::Result<()>> {
-        self.packets.lock().unwrap().push(packet.to_vec());
+        self.packets
+            .lock()
+            .expect("Failed to lock mock sender packets")
+            .push(packet.to_vec());
         Some(Ok(()))
     }
 
@@ -53,7 +57,8 @@ fn build_dhcp_payload(
     server_ip: Option<Ipv4Addr>,
 ) -> Vec<u8> {
     let mut dhcp_buf = vec![0u8; 512];
-    let packet = DhcpPacket::from_bytes_mut(&mut dhcp_buf).unwrap();
+    let packet =
+        DhcpPacket::from_bytes_mut(&mut dhcp_buf).expect("Failed to create dhcp packet buffer");
 
     packet.op = BootpMessageType::BootRequest as u8;
     packet.htype = 1; // Ethernet
@@ -91,14 +96,16 @@ fn build_dhcp_payload(
 
 fn build_full_dhcp_packet(chaddr: MacAddr, payload: Vec<u8>) -> Vec<u8> {
     let mut udp_buf = vec![0u8; 8 + payload.len()];
-    let mut udp_packet = MutableUdpPacket::new(&mut udp_buf).unwrap();
+    let mut udp_packet =
+        MutableUdpPacket::new(&mut udp_buf).expect("Failed to create udp packet buffer");
     udp_packet.set_source(68);
     udp_packet.set_destination(67);
     udp_packet.set_length((8 + payload.len()) as u16);
     udp_packet.set_payload(&payload);
 
     let mut ip_buf = vec![0u8; 20 + udp_packet.packet().len()];
-    let mut ip_packet = MutableIpv4Packet::new(&mut ip_buf).unwrap();
+    let mut ip_packet =
+        MutableIpv4Packet::new(&mut ip_buf).expect("Failed to create ipv4 packet buffer");
     ip_packet.set_version(4);
     ip_packet.set_header_length(5);
     ip_packet.set_total_length((20 + udp_packet.packet().len()) as u16);
@@ -109,11 +116,16 @@ fn build_full_dhcp_packet(chaddr: MacAddr, payload: Vec<u8>) -> Vec<u8> {
     ip_packet.set_payload(udp_packet.packet());
     let checksum = ipv4::checksum(&ip_packet.to_immutable());
     ip_packet.set_checksum(checksum);
-    let udp_checksum = udp::ipv4_checksum(&udp_packet.to_immutable(), &ip_packet.get_source(), &ip_packet.get_destination());
+    let udp_checksum = udp::ipv4_checksum(
+        &udp_packet.to_immutable(),
+        &ip_packet.get_source(),
+        &ip_packet.get_destination(),
+    );
     udp_packet.set_checksum(udp_checksum);
 
     let mut eth_buf = vec![0u8; 14 + ip_packet.packet().len()];
-    let mut eth_packet = MutableEthernetPacket::new(&mut eth_buf).unwrap();
+    let mut eth_packet =
+        MutableEthernetPacket::new(&mut eth_buf).expect("Failed to create ethernet packet buffer");
     eth_packet.set_destination(MacAddr::broadcast());
     eth_packet.set_source(chaddr);
     eth_packet.set_ethertype(EtherTypes::Ipv4);
@@ -129,7 +141,7 @@ fn build_eapol_packet(
     eapol_type: EapolType,
     eap_payload: Option<Vec<u8>>,
 ) -> Vec<u8> {
-    let payload = eap_payload.unwrap_or_default();
+    let payload = eap_payload.unwrap_or_default(); // This is safe, not a panic on error
     let eapol_len = payload.len();
     let mut eapol_buf = vec![0u8; 4 + eapol_len];
     eapol_buf[0] = 1; // Version
@@ -140,7 +152,8 @@ fn build_eapol_packet(
     }
 
     let mut eth_buf = vec![0u8; 14 + eapol_buf.len()];
-    let mut eth_packet = MutableEthernetPacket::new(&mut eth_buf).unwrap();
+    let mut eth_packet =
+        MutableEthernetPacket::new(&mut eth_buf).expect("Failed to create ethernet packet buffer");
     eth_packet.set_destination(dst_mac);
     eth_packet.set_source(src_mac);
     eth_packet.set_ethertype(EtherType(0x888E));
@@ -162,11 +175,13 @@ fn create_radius_response(code: RadiusCode, id: u8, req_authenticator: &[u8; 16]
     to_hash.extend_from_slice(payload);
     to_hash.extend_from_slice(secret.as_bytes());
 
-    let response_auth = md5::compute(&to_hash);
+    let mut hasher = Md5::new();
+    hasher.update(&to_hash);
+    let response_auth = hasher.finalize();
 
     let mut final_packet = Vec::new();
     final_packet.extend_from_slice(&response_header);
-    final_packet.extend_from_slice(&response_auth.0);
+    final_packet.extend_from_slice(&response_auth);
     final_packet.extend_from_slice(payload);
 
     final_packet
@@ -178,9 +193,13 @@ async fn mock_radius_server_eap_md5(socket: UdpSocket, secret: String) {
 
     // 1. Receive Identity Response, send MD5 Challenge
     info!("[mock_radius] waiting for Identity-Response");
-    let (len, src) = socket.recv_from(&mut buf).await.unwrap();
+    let (len, src) = socket
+        .recv_from(&mut buf)
+        .await
+        .expect("Mock RADIUS failed to receive");
     info!("[mock_radius] received Identity-Response, sending Challenge");
-    let req_packet = RadiusPacket::from_bytes(&buf[..len]).unwrap();
+    let req_packet =
+        RadiusPacket::from_bytes(&buf[..len]).expect("Failed to parse RADIUS packet");
 
     let challenge_value = b"thisisthechallenge";
     let mut eap_md5_challenge_data = vec![EapType::Md5Challenge as u8];
@@ -198,39 +217,64 @@ async fn mock_radius_server_eap_md5(socket: UdpSocket, secret: String) {
     attributes.standard.insert(RadiusAttributeType::State, vec![b"eap_state_123".to_vec()]);
 
     let response_payload = chilli_net::radius::serialize_attributes(&attributes);
-    let mut response = create_radius_response(RadiusCode::AccessChallenge, req_packet.id, &req_packet.authenticator, &response_payload, &secret);
-    socket.send_to(&mut response, src).await.unwrap();
+    let mut response = create_radius_response(
+        RadiusCode::AccessChallenge,
+        req_packet.id,
+        &req_packet.authenticator,
+        &response_payload,
+        &secret,
+    );
+    socket
+        .send_to(&mut response, src)
+        .await
+        .expect("Mock RADIUS failed to send challenge");
     info!("[mock_radius] sent Challenge");
 
     // 2. Receive MD5 Challenge Response, send Success
     info!("[mock_radius] waiting for Challenge-Response");
-    let (len, src) = socket.recv_from(&mut buf).await.unwrap();
+    let (len, src) = socket
+        .recv_from(&mut buf)
+        .await
+        .expect("Mock RADIUS failed to receive challenge response");
     info!("[mock_radius] received Challenge-Response, sending Success");
-    let req_packet = RadiusPacket::from_bytes(&buf[..len]).unwrap();
+    let req_packet =
+        RadiusPacket::from_bytes(&buf[..len]).expect("Failed to parse RADIUS packet");
 
     let req_attributes = chilli_net::radius::parse_attributes(&req_packet.payload[..len - 20]);
-    let eap_response_msg = req_attributes.get_standard(RadiusAttributeType::EapMessage).unwrap();
-    let eap_response_packet = EapPacket::from_bytes(eap_response_msg).unwrap();
+    let eap_response_msg = req_attributes
+        .get_standard(RadiusAttributeType::EapMessage)
+        .expect("EAP-Message attribute not found");
+    let eap_response_packet =
+        EapPacket::from_bytes(eap_response_msg).expect("Failed to parse EAP packet");
 
     let mut to_hash = Vec::new();
     to_hash.push(eap_response_packet.identifier);
     to_hash.extend_from_slice(password.as_bytes());
     to_hash.extend_from_slice(challenge_value);
     let expected_hash = {
-        let mut ctx = md5::Context::new();
-        ctx.consume(&to_hash);
-        ctx.finalize()
+        let mut hasher = Md5::new();
+        hasher.update(&to_hash);
+        hasher.finalize()
     };
 
     let value_len = eap_response_packet.data[1] as usize;
     let client_hash = &eap_response_packet.data[2..2+value_len];
 
-    assert_eq!(client_hash, &expected_hash.0[..], "EAP-MD5 Response from client did not match expected hash");
+    assert_eq!(client_hash, &expected_hash[..], "EAP-MD5 Response from client did not match expected hash");
 
     let success_attributes = RadiusAttributes::default();
     let success_payload = chilli_net::radius::serialize_attributes(&success_attributes);
-    let mut success_response = create_radius_response(RadiusCode::AccessAccept, req_packet.id, &req_packet.authenticator, &success_payload, &secret);
-    socket.send_to(&mut success_response, src).await.unwrap();
+    let mut success_response = create_radius_response(
+        RadiusCode::AccessAccept,
+        req_packet.id,
+        &req_packet.authenticator,
+        &success_payload,
+        &secret,
+    );
+    socket
+        .send_to(&mut success_response, src)
+        .await
+        .expect("Mock RADIUS failed to send success");
     info!("[mock_radius] sent Success");
 }
 
@@ -240,10 +284,14 @@ async fn test_eap_md5_flow() {
     tracing_subscriber::fmt::try_init().ok();
     info!("Starting test_eap_md5_flow");
 
-    let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let server_addr = server_socket.local_addr().unwrap();
+    let server_socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind mock RADIUS socket");
+    let server_addr = server_socket
+        .local_addr()
+        .expect("Failed to get mock RADIUS local address");
 
-    let (config, session_manager, radius_client, dhcp_server, firewall, eapol_attribute_cache, auth_tx, _auth_rx, _config_tx) = initialize_services(Some(server_addr)).await;
+    let (config, session_manager, radius_client, dhcp_server, firewall, eapol_attribute_cache, core_tx, _core_rx, _config_tx) = initialize_services(Some(server_addr), Some(0)).await.expect("initialize_services failed");
     let (upload_tx, _upload_rx) = tokio::sync::mpsc::channel(100);
     let secret = config.radiussecret.clone();
 
@@ -263,37 +311,43 @@ async fn test_eap_md5_flow() {
     info!("Starting DHCP Flow");
     let discover_payload = build_dhcp_payload(client_mac, xid, DhcpMessageType::Discover, None, None);
     let discover_packet = build_full_dhcp_packet(client_mac, discover_payload);
-    process_ethernet_frame(&mut tx, our_mac, &discover_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
-    sent_packets.lock().unwrap().clear();
+    process_ethernet_frame(&mut tx, our_mac, &discover_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &core_tx, &upload_tx).await;
+    sent_packets.lock().expect("Failed to lock sent_packets").clear();
 
     let offered_ip = Ipv4Addr::new(10, 1, 0, 1);
     let request_payload = build_dhcp_payload(client_mac, xid, DhcpMessageType::Request, Some(offered_ip), Some(config.net));
     let request_packet = build_full_dhcp_packet(client_mac, request_payload);
-    process_ethernet_frame(&mut tx, our_mac, &request_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
-    sent_packets.lock().unwrap().clear();
+    process_ethernet_frame(&mut tx, our_mac, &request_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &core_tx, &upload_tx).await;
+    sent_packets.lock().expect("Failed to lock sent_packets").clear();
 
-    assert!(session_manager.get_session(&offered_ip).await.is_some(), "Session should exist after DHCP");
+    assert!(
+        session_manager.get_session(&offered_ip).await.is_some(),
+        "Session should exist after DHCP"
+    );
     info!("DHCP Flow complete, session created for {}", offered_ip);
 
     info!("Sending EAPOL-Start");
     let start_packet = build_eapol_packet(client_mac, our_mac, EapolType::Start, None);
-    process_ethernet_frame(&mut tx, our_mac, &start_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
+    process_ethernet_frame(&mut tx, our_mac, &start_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &core_tx, &upload_tx).await;
 
     info!("Verifying EAP-Request/Identity");
-    let packets = sent_packets.lock().unwrap();
+    let packets = sent_packets.lock().expect("Failed to lock sent_packets");
     assert_eq!(packets.len(), 1, "Expected one packet (EAP-Request/Identity)");
-    let identity_req_eth = EthernetPacket::new(&packets[0]).unwrap();
+    let identity_req_eth =
+        EthernetPacket::new(&packets[0]).expect("Failed to parse ethernet packet");
     assert_eq!(identity_req_eth.get_destination(), client_mac);
-    let identity_req_eapol = EapolPacket::from_bytes(identity_req_eth.payload()).unwrap();
+    let identity_req_eapol =
+        EapolPacket::from_bytes(identity_req_eth.payload()).expect("Failed to parse EAPOL packet");
     assert_eq!(identity_req_eapol.packet_type, EapolType::Eap);
-    let identity_req_eap = EapPacket::from_bytes(identity_req_eapol.payload).unwrap();
+    let identity_req_eap =
+        EapPacket::from_bytes(identity_req_eapol.payload).expect("Failed to parse EAP packet");
     assert_eq!(identity_req_eap.code, EapCode::Request);
     assert_eq!(identity_req_eap.data[0], EapType::Identity as u8);
     let identity_req_id = identity_req_eap.identifier;
     drop(packets);
 
     info!("Sending EAP-Response/Identity");
-    sent_packets.lock().unwrap().clear();
+    sent_packets.lock().expect("Failed to lock sent_packets").clear();
     let username = "test-eap-user";
     let mut identity_resp_payload = vec![EapType::Identity as u8];
     identity_resp_payload.extend_from_slice(username.as_bytes());
@@ -303,39 +357,45 @@ async fn test_eap_md5_flow() {
         data: identity_resp_payload,
     };
     let identity_resp_packet = build_eapol_packet(client_mac, our_mac, EapolType::Eap, Some(identity_resp_eap.to_bytes()));
-    process_ethernet_frame(&mut tx, our_mac, &identity_resp_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
+    process_ethernet_frame(&mut tx, our_mac, &identity_resp_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &core_tx, &upload_tx).await;
 
     info!("Waiting for EAP-Request/MD5-Challenge...");
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     info!("Verifying EAP-Request/MD5-Challenge");
-    let packets = sent_packets.lock().unwrap();
-    assert_eq!(packets.len(), 1, "Expected one packet (EAP-Request/MD5-Challenge)");
-    let md5_req_eth = EthernetPacket::new(&packets[0]).unwrap();
-    let md5_req_eapol = EapolPacket::from_bytes(md5_req_eth.payload()).unwrap();
-    let md5_req_eap = EapPacket::from_bytes(md5_req_eapol.payload).unwrap();
+    let packets = sent_packets.lock().expect("Failed to lock sent_packets");
+    assert_eq!(
+        packets.len(),
+        1,
+        "Expected one packet (EAP-Request/MD5-Challenge)"
+    );
+    let md5_req_eth = EthernetPacket::new(&packets[0]).expect("Failed to parse ethernet packet");
+    let md5_req_eapol =
+        EapolPacket::from_bytes(md5_req_eth.payload()).expect("Failed to parse EAPOL packet");
+    let md5_req_eap =
+        EapPacket::from_bytes(md5_req_eapol.payload).expect("Failed to parse EAP packet");
     assert_eq!(md5_req_eap.code, EapCode::Request);
     assert_eq!(md5_req_eap.data[0], EapType::Md5Challenge as u8);
     let md5_req_id = md5_req_eap.identifier;
     let challenge_len = md5_req_eap.data[1] as usize;
-    let challenge_val = &md5_req_eap.data[2..2+challenge_len];
+    let challenge_val = &md5_req_eap.data[2..2 + challenge_len];
     drop(packets);
 
     info!("Sending EAP-Response/MD5-Challenge");
-    sent_packets.lock().unwrap().clear();
+    sent_packets.lock().expect("Failed to lock sent_packets").clear();
     let mut to_hash = Vec::new();
     to_hash.push(md5_req_id);
     to_hash.extend_from_slice(b"password123");
     to_hash.extend_from_slice(challenge_val);
     let md5_hash = {
-        let mut ctx = md5::Context::new();
-        ctx.consume(&to_hash);
-        ctx.finalize()
+        let mut hasher = Md5::new();
+        hasher.update(&to_hash);
+        hasher.finalize()
     };
 
     let mut md5_resp_payload = vec![EapType::Md5Challenge as u8];
-    md5_resp_payload.push(md5_hash.0.len() as u8);
-    md5_resp_payload.extend_from_slice(&md5_hash.0);
+    md5_resp_payload.push(md5_hash.len() as u8);
+    md5_resp_payload.extend_from_slice(&md5_hash);
 
     let md5_resp_eap = EapPacket {
         code: EapCode::Response,
@@ -343,23 +403,31 @@ async fn test_eap_md5_flow() {
         data: md5_resp_payload,
     };
     let md5_resp_packet = build_eapol_packet(client_mac, our_mac, EapolType::Eap, Some(md5_resp_eap.to_bytes()));
-    process_ethernet_frame(&mut tx, our_mac, &md5_resp_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
+    process_ethernet_frame(&mut tx, our_mac, &md5_resp_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &core_tx, &upload_tx).await;
 
     info!("Waiting for EAP-Success...");
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     info!("Verifying EAP-Success");
-    let packets = sent_packets.lock().unwrap();
+    let packets = sent_packets.lock().expect("Failed to lock sent_packets");
     assert_eq!(packets.len(), 1, "Expected one packet (EAP-Success)");
-    let success_eth = EthernetPacket::new(&packets[0]).unwrap();
-    let success_eapol = EapolPacket::from_bytes(success_eth.payload()).unwrap();
-    let success_eap = EapPacket::from_bytes(success_eapol.payload).unwrap();
+    let success_eth = EthernetPacket::new(&packets[0]).expect("Failed to parse ethernet packet");
+    let success_eapol =
+        EapolPacket::from_bytes(success_eth.payload()).expect("Failed to parse EAPOL packet");
+    let success_eap =
+        EapPacket::from_bytes(success_eapol.payload).expect("Failed to parse EAP packet");
     assert_eq!(success_eap.code, EapCode::Success);
     drop(packets);
 
     info!("Verifying session state");
-    let eapol_session = session_manager.get_eapol_session(&client_mac.octets()).await.unwrap();
-    assert_eq!(eapol_session.state, chilli_core::eapol_session::EapolState::Authenticated);
+    let eapol_session = session_manager
+        .get_eapol_session(&client_mac.octets())
+        .await
+        .expect("EAPOL session not found");
+    assert_eq!(
+        eapol_session.state,
+        chilli_core::eapol_session::EapolState::Authenticated
+    );
 
     mock_server_handle.abort();
     radius_client_handle.abort();

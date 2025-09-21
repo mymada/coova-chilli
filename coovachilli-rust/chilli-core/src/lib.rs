@@ -14,6 +14,7 @@ pub enum AuthType {
     Pap,
     Eap,
     MsChapV1,
+    UamPap,
 }
 
 #[derive(Debug)]
@@ -21,6 +22,18 @@ pub struct AuthRequest {
     pub auth_type: AuthType,
     pub ip: Ipv4Addr,
     pub username: String,
-    pub password: Option<String>,
+    pub password: Option<Vec<u8>>,
     pub tx: oneshot::Sender<bool>,
+}
+
+#[derive(Debug)]
+pub struct LogoffRequest {
+    pub ip: Ipv4Addr,
+    pub tx: oneshot::Sender<bool>,
+}
+
+#[derive(Debug)]
+pub enum CoreRequest {
+    Auth(AuthRequest),
+    Logoff(LogoffRequest),
 }

@@ -2,7 +2,7 @@ pub mod config;
 pub mod cmdsock;
 
 use anyhow::Result;
-use chilli_core::{AuthType, Session, SessionManager, eapol_session::{EapolSession, EapolState}};
+use chilli_core::{AuthType, CoreRequest, Session, SessionManager, eapol_session::{EapolSession, EapolState}};
 use chilli_http::server;
 use chilli_net::dhcp::DhcpServer;
 use chilli_net::eap_mschapv2;
@@ -26,10 +26,12 @@ use tokio::process::Command;
 use pnet::datalink::{self, NetworkInterface};
 use pnet::packet::arp::{ArpPacket, ArpOperations, ArpHardwareTypes};
 use pnet::packet::ethernet::{MutableEthernetPacket, EthernetPacket, EtherType, EtherTypes};
-use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
+use pnet::packet::ipv4::{checksum, Ipv4Packet, MutableIpv4Packet};
+use pnet::packet::tcp::{self, MutableTcpPacket, TcpFlags};
 use pnet::packet::udp::UdpPacket;
 use pnet::packet::vlan::VlanPacket;
 use pnet::packet::Packet;
+use pnet::packet::MutablePacket;
 use chilli_net::radius::RadiusAttributes;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{watch, Mutex};
@@ -37,21 +39,27 @@ use tracing::{error, info, warn};
 use chilli_net::eap::{EapCode, EapPacket, EapType};
 use chilli_net::eapol::EapolPacket;
 use chilli_net::{PacketDevice, TunWrapper};
+use md5::{Digest, Md5};
 use pnet_base::MacAddr;
+use rand::Rng;
+use url::Url;
 
 use std::net::SocketAddr;
 
-pub async fn initialize_services(radius_server: Option<SocketAddr>) -> (
+pub async fn initialize_services(
+    radius_server: Option<SocketAddr>,
+    coa_port: Option<u16>,
+) -> anyhow::Result<(
     Arc<chilli_core::Config>,
     Arc<SessionManager>,
     Arc<RadiusClient>,
     Arc<DhcpServer>,
     Arc<Firewall>,
     Arc<Mutex<HashMap<[u8; 6], RadiusAttributes>>>,
-    tokio::sync::mpsc::Sender<chilli_core::AuthRequest>,
-    tokio::sync::mpsc::Receiver<chilli_core::AuthRequest>,
+    tokio::sync::mpsc::Sender<chilli_core::CoreRequest>,
+    tokio::sync::mpsc::Receiver<chilli_core::CoreRequest>,
     tokio::sync::watch::Sender<Arc<chilli_core::Config>>,
-) {
+)> {
     let mut config = chilli_core::Config::default();
     config.dhcpif = "lo".to_string();
     config.net = Ipv4Addr::new(10, 1, 0, 1);
@@ -59,6 +67,10 @@ pub async fn initialize_services(radius_server: Option<SocketAddr>) -> (
     config.dhcplisten = Ipv4Addr::new(10, 1, 0, 1);
     config.dhcpstart = Ipv4Addr::new(10, 1, 0, 1);
     config.dhcpend = Ipv4Addr::new(10, 1, 0, 1);
+
+    if let Some(port) = coa_port {
+        config.coaport = port;
+    }
 
     if let Some(addr) = radius_server {
         if let std::net::IpAddr::V4(ip) = addr.ip() {
@@ -74,11 +86,21 @@ pub async fn initialize_services(radius_server: Option<SocketAddr>) -> (
     let firewall = Arc::new(Firewall::new((*config_clone).clone()));
     let session_manager = Arc::new(SessionManager::new());
     let eapol_attribute_cache = Arc::new(Mutex::new(HashMap::new()));
-    let (auth_tx, auth_rx) = tokio::sync::mpsc::channel(100);
-    let dhcp_server = Arc::new(DhcpServer::new(config_rx.clone()).await.unwrap());
-    let radius_client = Arc::new(RadiusClient::new(config_rx.clone()).await.unwrap());
+    let (core_tx, core_rx) = tokio::sync::mpsc::channel(100);
+    let dhcp_server = Arc::new(DhcpServer::new(config_rx.clone()).await?);
+    let radius_client = Arc::new(RadiusClient::new(config_rx.clone()).await?);
 
-    (config_clone, session_manager, radius_client, dhcp_server, firewall, eapol_attribute_cache, auth_tx, auth_rx, config_tx)
+    Ok((
+        config_clone,
+        session_manager,
+        radius_client,
+        dhcp_server,
+        firewall,
+        eapol_attribute_cache,
+        core_tx,
+        core_rx,
+        config_tx,
+    ))
 }
 
 fn load_status(
@@ -121,10 +143,16 @@ async fn run_script(
     );
     let mut cmd = Command::new(&script_path);
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(e) => {
+            warn!(
+                "Failed to get system time, script execution may be incorrect: {}",
+                e
+            );
+            return;
+        }
+    };
     let session_time = now - session.state.start_time;
     let idle_time = now - session.state.last_up_time;
 
@@ -221,7 +249,164 @@ async fn run_script(
     }
 }
 
+async fn handle_uam_pap_auth(
+    req: chilli_core::AuthRequest,
+    radius_client: Arc<RadiusClient>,
+    session_manager: Arc<SessionManager>,
+    firewall: Arc<Firewall>,
+    config: Arc<chilli_core::Config>,
+) {
+    info!("Processing UAM PAP auth request for user '{}'", req.username);
+    match radius_client
+        .send_preencrypted_access_request(&req.username, req.password.unwrap_or_default())
+        .await
+    {
+        Ok(AuthResult::Success(attributes)) => {
+            info!("Authentication successful for user '{}'", req.username);
+            session_manager.authenticate_session(&req.ip).await;
+
+            chilli_net::radius::apply_radius_attributes(&attributes, &session_manager, &firewall, &req.ip).await;
+
+            if let Some(session) = session_manager.get_session(&req.ip).await {
+                if let Some(ref conup) = config.conup {
+                    run_script(conup.clone(), &session, &config, None).await;
+                }
+                if let Err(e) = firewall.add_authenticated_ip(req.ip) {
+                    error!("Failed to add authenticated IP to firewall: {}", e);
+                }
+                if let Err(e) = radius_client.send_acct_start(&session).await {
+                    warn!(
+                        "Failed to send Acct-Start for user '{}': {}",
+                        req.username, e
+                    );
+                }
+            }
+            req.tx.send(true).ok();
+        }
+        Ok(_) => {
+            info!("Authentication failed for user '{}'", req.username);
+            req.tx.send(false).ok();
+        }
+        Err(e) => {
+            warn!("RADIUS request failed for user '{}': {}", req.username, e);
+            req.tx.send(false).ok();
+        }
+    }
+}
+
+fn build_redirect_url(
+    session: &mut Session,
+    config: &Arc<chilli_core::Config>,
+    original_uri: &str,
+) -> Option<String> {
+    let challenge_bytes = rand::thread_rng().gen::<[u8; 16]>();
+    let challenge_hex = hex::encode(challenge_bytes);
+
+    session.state.redir.uamchal = challenge_bytes;
+    session.state.redir.userurl = Some(original_uri.to_string());
+    session.state.uamtime = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let uam_url = match &config.uamurl {
+        Some(url) => url,
+        None => {
+            warn!("uamurl is not configured, cannot redirect.");
+            return None;
+        }
+    };
+
+    let mut url = match Url::parse(uam_url) {
+        Ok(url) => url,
+        Err(e) => {
+            warn!("Failed to parse uamurl: {}", e);
+            return None;
+        }
+    };
+
+    url.query_pairs_mut()
+        .append_pair("res", "notyet")
+        .append_pair("challenge", &challenge_hex)
+        .append_pair("userurl", original_uri)
+        .append_pair("uamip", &config.uamlisten.to_string())
+        .append_pair("uamport", &config.uamport.to_string());
+
+    if let Some(secret) = &config.uamsecret {
+        if !secret.is_empty() {
+            let query_str = url.query().unwrap_or("").to_owned();
+            let mut hasher = Md5::new();
+            hasher.update(query_str.as_bytes());
+            hasher.update(secret.as_bytes());
+            let md5_hex = hex::encode(hasher.finalize());
+            url.query_pairs_mut().append_pair("md", &md5_hex);
+        }
+    }
+
+    Some(url.to_string())
+}
+
 use std::env;
+
+fn build_http_redirect_packet(
+    redirect_url: &str,
+    ethernet_packet: &EthernetPacket,
+    ipv4_packet: &Ipv4Packet,
+    tcp_packet: &pnet::packet::tcp::TcpPacket,
+    our_mac: MacAddr,
+) -> Option<Vec<u8>> {
+    let http_payload = format!(
+        "HTTP/1.0 302 Found\r\nLocation: {}\r\nConnection: close\r\n\r\n",
+        redirect_url
+    );
+    let http_payload_bytes = http_payload.as_bytes();
+
+    let tcp_payload_len = http_payload_bytes.len();
+    let tcp_header_len = 20;
+    let ip_header_len = 20;
+    let eth_header_len = 14;
+
+    let mut tcp_buffer = vec![0u8; tcp_header_len + tcp_payload_len];
+    let mut new_tcp_packet = MutableTcpPacket::new(&mut tcp_buffer)?;
+
+    new_tcp_packet.set_source(tcp_packet.get_destination());
+    new_tcp_packet.set_destination(tcp_packet.get_source());
+    new_tcp_packet.set_sequence(tcp_packet.get_acknowledgement());
+    new_tcp_packet.set_acknowledgement(tcp_packet.get_sequence().wrapping_add(tcp_packet.payload().len() as u32));
+    new_tcp_packet.set_data_offset(5);
+    new_tcp_packet.set_reserved(0);
+    new_tcp_packet.set_flags(TcpFlags::FIN | TcpFlags::ACK);
+    new_tcp_packet.set_window(0);
+    new_tcp_packet.set_urgent_ptr(0);
+    new_tcp_packet.set_payload(http_payload_bytes);
+
+    let tcp_checksum = tcp::ipv4_checksum(&new_tcp_packet.to_immutable(), &ipv4_packet.get_destination(), &ipv4_packet.get_source());
+    new_tcp_packet.set_checksum(tcp_checksum);
+
+    let mut ip_buffer = vec![0u8; ip_header_len + tcp_buffer.len()];
+    let mut new_ip_packet = MutableIpv4Packet::new(&mut ip_buffer)?;
+    new_ip_packet.set_version(4);
+    new_ip_packet.set_header_length(5);
+    new_ip_packet.set_total_length((ip_header_len + tcp_buffer.len()) as u16);
+    new_ip_packet.set_ttl(64);
+    new_ip_packet.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
+    new_ip_packet.set_source(ipv4_packet.get_destination());
+    new_ip_packet.set_destination(ipv4_packet.get_source());
+    new_ip_packet.set_payload(&tcp_buffer);
+
+    let ip_checksum = checksum(&new_ip_packet.to_immutable());
+    new_ip_packet.set_checksum(ip_checksum);
+
+    let mut eth_buffer = vec![0u8; eth_header_len + ip_buffer.len()];
+    let mut new_eth_packet = MutableEthernetPacket::new(&mut eth_buffer)?;
+    new_eth_packet.set_destination(ethernet_packet.get_source());
+    new_eth_packet.set_source(our_mac);
+    new_eth_packet.set_ethertype(EtherTypes::Ipv4);
+    new_eth_packet.set_payload(&ip_buffer);
+
+    Some(eth_buffer)
+}
+
 
 // Constants for ioprio_set
 const IOPRIO_CLASS_SHIFT: i32 = 13;
@@ -353,25 +538,27 @@ pub async fn run() -> Result<()> {
     let eapol_attribute_cache =
         Arc::new(Mutex::new(HashMap::<[u8; 6], RadiusAttributes>::new()));
 
-    let (auth_tx, auth_rx) = tokio::sync::mpsc::channel(100);
+    let (core_tx, core_rx) = tokio::sync::mpsc::channel::<CoreRequest>(100);
     let (upload_tx, upload_rx) = tokio::sync::mpsc::channel(100);
     let (download_tx, download_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, MacAddr)>(100);
 
+    let radius_client = Arc::new(RadiusClient::new(config_rx.clone()).await?);
+
     let config_clone_http = config.clone();
-    let auth_tx_http = auth_tx.clone();
+    let core_tx_http = core_tx.clone();
+    let session_manager_http = session_manager.clone();
     let _http_server_handle = tokio::spawn(async move {
-        if let Err(e) = server::run_server(&config_clone_http, auth_tx_http).await {
+        if let Err(e) =
+            server::run_server(config_clone_http, core_tx_http, session_manager_http).await
+        {
             error!("HTTP server error: {}", e);
         }
     });
 
-    let dhcp_server = Arc::new(
-        DhcpServer::new(config_rx.clone()).await?,
-    );
+    let dhcp_server = Arc::new(DhcpServer::new(config_rx.clone()).await?);
 
     let dhcp_reaper_handle = tokio::spawn(dhcp_reaper_loop(dhcp_server.clone()));
 
-    let radius_client = Arc::new(RadiusClient::new(config_rx.clone()).await?);
     let radius_run_client = radius_client.clone();
     let _radius_client_handle = tokio::spawn(async move {
         radius_run_client.run().await;
@@ -386,8 +573,13 @@ pub async fn run() -> Result<()> {
             loop {
                 match radius_client.coa_socket.recv_from(&mut buf).await {
                     Ok((len, src)) => {
-                        if let Some(packet) = chilli_net::radius::RadiusPacket::from_bytes(&buf[..len]) {
-                            if let Err(e) = radius_client.handle_coa_request(packet, src, &session_manager, &firewall).await {
+                        if let Some(packet) =
+                            chilli_net::radius::RadiusPacket::from_bytes(&buf[..len])
+                        {
+                            if let Err(e) = radius_client
+                                .handle_coa_request(packet, src, &session_manager, &firewall)
+                                .await
+                            {
                                 error!("Error handling CoA request: {}", e);
                             }
                         }
@@ -434,12 +626,18 @@ pub async fn run() -> Result<()> {
                             }
                         }
                         Err(e) => {
-                            error!("Failed to bind RADIUS proxy acct socket on {}: {}", acct_addr, e);
+                            error!(
+                                "Failed to bind RADIUS proxy acct socket on {}: {}",
+                                acct_addr, e
+                            );
                         }
                     }
                 }
                 Err(e) => {
-                    error!("Failed to bind RADIUS proxy auth socket on {}: {}", auth_addr, e);
+                    error!(
+                        "Failed to bind RADIUS proxy auth socket on {}: {}",
+                        auth_addr, e
+                    );
                 }
             }
         }))
@@ -470,7 +668,7 @@ pub async fn run() -> Result<()> {
         config_rx.clone(),
         walled_garden_ips.clone(),
         eapol_attribute_cache.clone(),
-        auth_tx.clone(),
+        core_tx.clone(),
         upload_tx,
         download_rx,
     ));
@@ -485,8 +683,8 @@ pub async fn run() -> Result<()> {
         download_tx,
     ));
 
-    let auth_loop_handle = tokio::spawn(auth_loop(
-        auth_rx,
+    let core_loop_handle = tokio::spawn(core_loop(
+        core_rx,
         radius_client.clone(),
         session_manager.clone(),
         firewall.clone(),
@@ -502,12 +700,14 @@ pub async fn run() -> Result<()> {
 
     tokio::select! {
         res = l2_dispatcher_handle => {
-            if let Err(e) = res.unwrap() {
-                error!("L2 dispatcher failed: {}", e);
+            match res {
+                Ok(Ok(())) => info!("L2 dispatcher task finished successfully."),
+                Ok(Err(e)) => error!("L2 dispatcher task returned an error: {}", e),
+                Err(join_err) => error!("L2 dispatcher task failed (panicked or cancelled): {}", join_err),
             }
         }
-        _ = auth_loop_handle => {
-            info!("Auth loop finished.");
+        _ = core_loop_handle => {
+            info!("Core loop finished.");
         }
         _ = interim_update_handle => {
             info!("Interim update loop finished.");
@@ -689,10 +889,13 @@ async fn interim_update_loop(
         for session in session_manager.get_all_sessions().await {
             if session.state.authenticated {
                 let mut terminate_cause = None;
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
+                let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                    Ok(d) => d.as_secs(),
+                    Err(e) => {
+                        error!("Failed to get system time, cannot check session expiry: {}", e);
+                        continue;
+                    }
+                };
 
                 if session.params.sessiontimeout > 0 {
                     if session.state.start_time + session.params.sessiontimeout <= now {
@@ -745,11 +948,13 @@ async fn handle_pap_auth(
     config: Arc<chilli_core::Config>,
 ) {
     info!("Processing PAP auth request for user '{}'", req.username);
+    let password_bytes = req.password.unwrap_or_default();
+    let password_str = String::from_utf8_lossy(&password_bytes);
     match radius_client
-        .send_access_request(&req.username, &req.password.unwrap_or_default())
+        .send_access_request(&req.username, &password_str)
         .await
     {
-        Ok(Some(attributes)) => {
+        Ok(AuthResult::Success(attributes)) => {
             info!("Authentication successful for user '{}'", req.username);
             session_manager.authenticate_session(&req.ip).await;
 
@@ -771,7 +976,7 @@ async fn handle_pap_auth(
             }
             req.tx.send(true).ok();
         }
-        Ok(None) => {
+        Ok(_) => {
             info!("Authentication failed for user '{}'", req.username);
             req.tx.send(false).ok();
         }
@@ -793,6 +998,9 @@ async fn handle_eap_auth(
 
     let mut eap_state = None;
 
+    let password_bytes = req.password.unwrap_or_default();
+    let password_str = String::from_utf8_lossy(&password_bytes);
+
     // 1. Start with an EAP-Response/Identity
     let eap_packet = eap_mschapv2::create_identity_response(1, &req.username);
     info!("Sending EAP Identity Response: {:?}", eap_packet);
@@ -806,15 +1014,29 @@ async fn handle_eap_auth(
                 if let Some(eap_request) = EapPacket::from_bytes(eap_message) {
                     info!("Received EAP Challenge: {:?}", eap_request);
                     if let Some((challenge, identifier)) = eap_mschapv2::parse_challenge_request(&eap_request) {
-                        let password = req.password.as_deref().unwrap_or_default();
-                        let peer_challenge = mschapv2::generate_challenge();
-                        if let Some(nt_response) = mschapv2::verify_response_and_generate_nt_response(&challenge, &peer_challenge, &req.username, password) {
-                            let response_packet = eap_mschapv2::create_challenge_response_packet(eap_request.identifier, identifier, &peer_challenge, &nt_response, &req.username);
-                            info!("Sending EAP Challenge Response: {:?}", response_packet);
-                            result = radius_client.send_eap_response(&response_packet.to_bytes(), eap_state.as_deref()).await;
-                        } else {
-                            info!("Password verification failed");
-                            break;
+                        let password = &password_str;
+                        let peer_challenge = match mschapv2::generate_challenge() {
+                            Ok(pc) => pc,
+                            Err(e) => {
+                                error!("Failed to generate peer challenge: {}", e);
+                                break;
+                            }
+                        };
+                        match mschapv2::verify_response_and_generate_nt_response(
+                            &challenge,
+                            &peer_challenge,
+                            &req.username,
+                            password,
+                        ) {
+                            Ok(nt_response) => {
+                                let response_packet = eap_mschapv2::create_challenge_response_packet(eap_request.identifier, identifier, &peer_challenge, &nt_response, &req.username);
+                                info!("Sending EAP Challenge Response: {:?}", response_packet);
+                                result = radius_client.send_eap_response(&response_packet.to_bytes(), eap_state.as_deref()).await;
+                            }
+                            Err(e) => {
+                                info!("Password verification failed: {}", e);
+                                break;
+                            }
                         }
                     } else if let Some(_auth_response) = eap_mschapv2::parse_success_request(&eap_request) {
                         info!("Received EAP Success Request");
@@ -890,8 +1112,9 @@ async fn handle_mschapv1_auth(
                 }
             };
 
-            let password = req.password.as_deref().unwrap_or_default();
-            let response = mschapv1::mschap_lanman_response(&challenge, password);
+            let password_bytes = req.password.unwrap_or_default();
+            let password = String::from_utf8_lossy(&password_bytes);
+            let response = mschapv1::mschap_lanman_response(&challenge, &password);
 
             let result = radius_client
                 .send_chap_response(identifier, &response, state.as_deref())
@@ -938,41 +1161,83 @@ async fn handle_mschapv1_auth(
 }
 
 
-async fn auth_loop(
-    mut rx: tokio::sync::mpsc::Receiver<chilli_core::AuthRequest>,
+async fn handle_logoff_request(
+    req: chilli_core::LogoffRequest,
+    radius_client: Arc<RadiusClient>,
+    session_manager: Arc<SessionManager>,
+    firewall: Arc<Firewall>,
+) {
+    if let Some(session) = session_manager.get_session(&req.ip).await {
+        if session.state.authenticated {
+            if let Err(e) = radius_client.send_acct_stop(&session, None).await {
+                warn!(
+                    "Failed to send Acct-Stop for session {}: {}",
+                    session.state.sessionid, e
+                );
+            }
+            if let Err(e) = firewall.remove_authenticated_ip(req.ip) {
+                error!("Failed to remove authenticated IP from firewall: {}", e);
+            }
+            session_manager.remove_session(&req.ip).await;
+        }
+    }
+    let _ = req.tx.send(true);
+}
+
+async fn core_loop(
+    mut rx: tokio::sync::mpsc::Receiver<chilli_core::CoreRequest>,
     radius_client: Arc<RadiusClient>,
     session_manager: Arc<SessionManager>,
     firewall: Arc<Firewall>,
     config_rx: watch::Receiver<Arc<chilli_core::Config>>,
 ) {
-    while let Some(req) = rx.recv().await {
+    while let Some(core_req) = rx.recv().await {
         let config = config_rx.borrow().clone();
-        match req.auth_type {
-            AuthType::Pap => {
-                tokio::spawn(handle_pap_auth(
+        match core_req {
+            chilli_core::CoreRequest::Auth(req) => match req.auth_type {
+                AuthType::Pap => {
+                    tokio::spawn(handle_pap_auth(
+                        req,
+                        radius_client.clone(),
+                        session_manager.clone(),
+                        firewall.clone(),
+                        config.clone(),
+                    ));
+                }
+                AuthType::Eap => {
+                    tokio::spawn(handle_eap_auth(
+                        req,
+                        radius_client.clone(),
+                        session_manager.clone(),
+                        firewall.clone(),
+                        config.clone(),
+                    ));
+                }
+                AuthType::MsChapV1 => {
+                    tokio::spawn(handle_mschapv1_auth(
+                        req,
+                        radius_client.clone(),
+                        session_manager.clone(),
+                        firewall.clone(),
+                        config.clone(),
+                    ));
+                }
+                AuthType::UamPap => {
+                    tokio::spawn(handle_uam_pap_auth(
+                        req,
+                        radius_client.clone(),
+                        session_manager.clone(),
+                        firewall.clone(),
+                        config.clone(),
+                    ));
+                }
+            },
+            chilli_core::CoreRequest::Logoff(req) => {
+                tokio::spawn(handle_logoff_request(
                     req,
                     radius_client.clone(),
                     session_manager.clone(),
                     firewall.clone(),
-                    config.clone(),
-                ));
-            }
-            AuthType::Eap => {
-                tokio::spawn(handle_eap_auth(
-                    req,
-                    radius_client.clone(),
-                    session_manager.clone(),
-                    firewall.clone(),
-                    config.clone(),
-                ));
-            }
-            AuthType::MsChapV1 => {
-                tokio::spawn(handle_mschapv1_auth(
-                    req,
-                    radius_client.clone(),
-                    session_manager.clone(),
-                    firewall.clone(),
-                    config.clone(),
                 ));
             }
         }
@@ -999,14 +1264,14 @@ async fn build_arp_reply(
                 let src_ip = arp_packet.get_sender_proto_addr();
 
                 let mut ethernet_buffer = vec![0u8; 42];
-                let mut arp_reply_packet = MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
+                let mut arp_reply_packet = MutableEthernetPacket::new(&mut ethernet_buffer)?;
 
                 arp_reply_packet.set_destination(src_mac);
                 arp_reply_packet.set_source(our_mac);
                 arp_reply_packet.set_ethertype(EtherTypes::Arp);
 
                 let mut arp_payload = [0u8; 28];
-                let mut arp_packet_payload = pnet::packet::arp::MutableArpPacket::new(&mut arp_payload).unwrap();
+                let mut arp_packet_payload = pnet::packet::arp::MutableArpPacket::new(&mut arp_payload)?;
 
                 arp_packet_payload.set_hardware_type(ArpHardwareTypes::Ethernet);
                 arp_packet_payload.set_protocol_type(EtherTypes::Ipv4);
@@ -1038,16 +1303,18 @@ fn build_and_send_dhcp_response(
     server_ip: Ipv4Addr,
     offered_ip: Ipv4Addr,
     broadcast_flag: bool,
-) {
+) -> anyhow::Result<()> {
     let mut udp_buf = vec![0u8; 8 + dhcp_payload.len()];
-    let mut udp_packet = MutableUdpPacket::new(&mut udp_buf).unwrap();
+    let mut udp_packet = MutableUdpPacket::new(&mut udp_buf)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create UDP packet buffer"))?;
     udp_packet.set_source(67);
     udp_packet.set_destination(68);
     udp_packet.set_length((8 + dhcp_payload.len()) as u16);
     udp_packet.set_payload(dhcp_payload);
 
     let mut ip_buf = vec![0u8; 20 + udp_packet.packet().len()];
-    let mut ip_packet = MutableIpv4Packet::new(&mut ip_buf).unwrap();
+    let mut ip_packet = MutableIpv4Packet::new(&mut ip_buf)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create IPv4 packet buffer"))?;
     ip_packet.set_version(4);
     ip_packet.set_header_length(5);
     ip_packet.set_total_length((20 + udp_packet.packet().len()) as u16);
@@ -1065,11 +1332,18 @@ fn build_and_send_dhcp_response(
     ip_packet.set_payload(udp_packet.packet());
     let checksum = pnet::packet::ipv4::checksum(&ip_packet.to_immutable());
     ip_packet.set_checksum(checksum);
-    let udp_checksum = pnet::packet::udp::ipv4_checksum(&udp_packet.to_immutable(), &ip_packet.get_source(), &ip_packet.get_destination());
+    let mut udp_packet = MutableUdpPacket::new(ip_packet.payload_mut())
+        .ok_or_else(|| anyhow::anyhow!("Failed to create mutable UDP packet for checksum"))?;
+    let udp_checksum = pnet::packet::udp::ipv4_checksum(
+        &udp_packet.to_immutable(),
+        &server_ip,
+        &dest_ip,
+    );
     udp_packet.set_checksum(udp_checksum);
 
     let mut eth_buf = vec![0u8; 14 + ip_packet.packet().len()];
-    let mut eth_packet = MutableEthernetPacket::new(&mut eth_buf).unwrap();
+    let mut eth_packet = MutableEthernetPacket::new(&mut eth_buf)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create Ethernet packet buffer"))?;
     eth_packet.set_destination(client_mac);
     eth_packet.set_source(our_mac);
     eth_packet.set_ethertype(EtherTypes::Ipv4);
@@ -1078,6 +1352,8 @@ fn build_and_send_dhcp_response(
     if tx.send_to(eth_packet.packet(), None).is_none() {
         error!("Failed to send DHCP response packet");
     }
+
+    Ok(())
 }
 
 async fn handle_ethernet_frame(
@@ -1091,9 +1367,9 @@ async fn handle_ethernet_frame(
     firewall: &Arc<Firewall>,
     config: &Arc<chilli_core::Config>,
     eapol_attribute_cache: &Arc<Mutex<HashMap<[u8; 6], RadiusAttributes>>>,
-    auth_tx: &tokio::sync::mpsc::Sender<chilli_core::AuthRequest>,
+    core_tx: &tokio::sync::mpsc::Sender<chilli_core::CoreRequest>,
     upload_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
-) {
+) -> anyhow::Result<()> {
     match ethernet_packet.get_ethertype() {
         EtherTypes::Ipv4 => {
             let payload = ethernet_packet.payload();
@@ -1130,7 +1406,7 @@ async fn handle_ethernet_frame(
                                         client_mac,
                                     } => {
                                         let broadcast_flag = dhcp_packet.flags & 0x8000 != 0;
-                                        build_and_send_dhcp_response(
+                                        if let Err(e) = build_and_send_dhcp_response(
                                             tx,
                                             &response,
                                             our_mac,
@@ -1138,7 +1414,9 @@ async fn handle_ethernet_frame(
                                             config.dhcplisten,
                                             client_ip,
                                             broadcast_flag,
-                                        );
+                                        ) {
+                                            error!("Failed to send DHCP ACK: {}", e);
+                                        }
                                         session_manager
                                             .create_session(client_ip, client_mac, config, vlan_id)
                                             .await;
@@ -1171,10 +1449,10 @@ async fn handle_ethernet_frame(
                                                     auth_type: chilli_core::AuthType::Pap,
                                                     ip: client_ip,
                                                     username: mac_str.clone(),
-                                                    password: config.macpasswd.clone(),
+                                                    password: config.macpasswd.clone().map(|s| s.into_bytes()),
                                                     tx: tx_auth,
                                                 };
-                                                auth_tx.send(auth_req).await.ok();
+                                                core_tx.send(CoreRequest::Auth(auth_req)).await.ok();
                                             }
                                         }
                                     }
@@ -1184,7 +1462,7 @@ async fn handle_ethernet_frame(
                                         client_mac,
                                     } => {
                                         let broadcast_flag = dhcp_packet.flags & 0x8000 != 0;
-                                        build_and_send_dhcp_response(
+                                        if let Err(e) = build_and_send_dhcp_response(
                                             tx,
                                             &response,
                                             our_mac,
@@ -1192,10 +1470,12 @@ async fn handle_ethernet_frame(
                                             config.dhcplisten,
                                             client_ip,
                                             broadcast_flag,
-                                        );
+                                        ) {
+                                            error!("Failed to send DHCP Offer: {}", e);
+                                        }
                                     }
                                     DhcpAction::Nak(response) => {
-                                        build_and_send_dhcp_response(
+                                        if let Err(e) = build_and_send_dhcp_response(
                                             tx,
                                             &response,
                                             our_mac,
@@ -1203,7 +1483,9 @@ async fn handle_ethernet_frame(
                                             config.dhcplisten,
                                             Ipv4Addr::new(255, 255, 255, 255),
                                             true,
-                                        );
+                                        ) {
+                                            error!("Failed to send DHCP NAK: {}", e);
+                                        }
                                     }
                                     DhcpAction::NoResponse => {}
                                 }
@@ -1214,6 +1496,34 @@ async fn handle_ethernet_frame(
                     // This is UPLOAD traffic
                     let src_mac = ethernet_packet.get_source().octets();
                     if let Some(session) = session_manager.get_session_by_mac(&src_mac).await {
+                        if !session.state.authenticated {
+                             if ipv4_packet.get_next_level_protocol() == pnet::packet::ip::IpNextHeaderProtocols::Tcp {
+                                if let Some(tcp_packet) = pnet::packet::tcp::TcpPacket::new(ipv4_packet.payload()) {
+                                    if tcp_packet.get_destination() == 80 {
+                                        info!("Intercepted HTTP request from unauthenticated user {}", session.hisip);
+
+                                                let payload = tcp_packet.payload();
+                                                if !payload.is_empty() && payload.starts_with(b"GET") {
+                                                    let original_uri = String::from_utf8_lossy(payload).lines().next().unwrap_or("").to_string();
+
+                                                        let mut mutable_session = session.clone();
+                                                        if let Some(redirect_url) = build_redirect_url(&mut mutable_session, config, &original_uri) {
+                                                            info!("Redirecting to {}", redirect_url);
+                                                            if let Some(packet) = build_http_redirect_packet(&redirect_url, ethernet_packet, &ipv4_packet, &tcp_packet, our_mac) {
+                                                                if tx.send_to(&packet, None).is_none() {
+                                                                    error!("Failed to send redirect packet");
+                                                                }
+                                                            }
+                                                            session_manager.update_session(&session.hisip, |s| *s = mutable_session).await;
+                                                        }
+                                                }
+
+                                        return Ok(()); // Drop the original packet
+                                    }
+                                }
+                            }
+                        }
+
                         let packet_len = ethernet_packet.packet().len() as u64;
                         if let Some(updated_session) = session_manager.update_session(&session.hisip, |s| {
                             if s.state.authenticated {
@@ -1221,7 +1531,7 @@ async fn handle_ethernet_frame(
                                 s.state.input_packets += 1;
                             }
                         }).await {
-                            if !updated_session.state.authenticated { return; }
+                            if !updated_session.state.authenticated { return Ok(()); }
 
                             let mut terminate = false;
                             if updated_session.params.maxinputoctets > 0
@@ -1285,9 +1595,10 @@ async fn handle_ethernet_frame(
                 .await
                 {
                     let mut ethernet_buffer = vec![0u8; 14 + response_payload.len()];
-                    let mut new_ethernet_packet =
-                        pnet::packet::ethernet::MutableEthernetPacket::new(&mut ethernet_buffer)
-                            .unwrap();
+                    let mut new_ethernet_packet = pnet::packet::ethernet::MutableEthernetPacket::new(
+                        &mut ethernet_buffer,
+                    )
+                    .ok_or_else(|| anyhow::anyhow!("Failed to create EAPOL response ethernet packet"))?;
                     new_ethernet_packet.set_destination(ethernet_packet.get_source());
                     new_ethernet_packet.set_source(our_mac);
                     new_ethernet_packet.set_ethertype(EtherType(0x888E));
@@ -1298,6 +1609,7 @@ async fn handle_ethernet_frame(
         }
         _ => {}
     }
+    Ok(())
 }
 
 pub async fn tun_packet_loop<T: PacketDevice + 'static>(
@@ -1571,7 +1883,7 @@ async fn packet_loop(
     config_rx: watch::Receiver<Arc<chilli_core::Config>>,
     _walled_garden_ips: Arc<Mutex<HashSet<Ipv4Addr>>>,
     eapol_attribute_cache: Arc<Mutex<HashMap<[u8; 6], RadiusAttributes>>>,
-    auth_tx: tokio::sync::mpsc::Sender<chilli_core::AuthRequest>,
+    core_tx: tokio::sync::mpsc::Sender<chilli_core::CoreRequest>,
     upload_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     mut download_rx: tokio::sync::mpsc::Receiver<(Vec<u8>, MacAddr)>,
 ) {
@@ -1580,17 +1892,20 @@ async fn packet_loop(
         match download_rx.try_recv() {
             Ok((packet, dest_mac)) => {
                 let mut eth_buf = vec![0u8; 14 + packet.len()];
-                let mut eth_packet = MutableEthernetPacket::new(&mut eth_buf).unwrap();
-                eth_packet.set_destination(dest_mac);
-                eth_packet.set_source(our_mac);
-                eth_packet.set_ethertype(EtherTypes::Ipv4);
-                eth_packet.set_payload(&packet);
+                if let Some(mut eth_packet) = MutableEthernetPacket::new(&mut eth_buf) {
+                    eth_packet.set_destination(dest_mac);
+                    eth_packet.set_source(our_mac);
+                    eth_packet.set_ethertype(EtherTypes::Ipv4);
+                    eth_packet.set_payload(&packet);
 
-                if tx.send_to(eth_packet.packet(), None).is_none() {
-                    error!("Failed to send download packet to wire");
+                    if tx.send_to(eth_packet.packet(), None).is_none() {
+                        error!("Failed to send download packet to wire");
+                    }
+                } else {
+                    error!("Failed to create ethernet buffer for download packet, dropping.");
                 }
-            },
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => { /* Nothing to do */ },
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => { /* Nothing to do */ }
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                 error!("Download channel disconnected, exiting packet loop.");
                 break;
@@ -1611,7 +1926,7 @@ async fn packet_loop(
                     &firewall,
                     &current_config,
                     &eapol_attribute_cache,
-                    &auth_tx,
+                    &core_tx,
                     &upload_tx,
                 ).await;
             }
@@ -1638,7 +1953,7 @@ pub async fn process_ethernet_frame(
     firewall: &Arc<Firewall>,
     config: &Arc<chilli_core::Config>,
     eapol_attribute_cache: &Arc<Mutex<HashMap<[u8; 6], RadiusAttributes>>>,
-    auth_tx: &tokio::sync::mpsc::Sender<chilli_core::AuthRequest>,
+    core_tx: &tokio::sync::mpsc::Sender<chilli_core::CoreRequest>,
     upload_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
     if let Some(ethernet_packet) = EthernetPacket::new(packet) {
@@ -1648,7 +1963,7 @@ pub async fn process_ethernet_frame(
                 if let Some(inner_ethernet_packet) =
                     EthernetPacket::new(vlan_packet.payload())
                 {
-                    handle_ethernet_frame(
+                    if let Err(e) = handle_ethernet_frame(
                         tx,
                         our_mac,
                         &inner_ethernet_packet,
@@ -1659,14 +1974,17 @@ pub async fn process_ethernet_frame(
                         firewall,
                         config,
                         eapol_attribute_cache,
-                        auth_tx,
+                        core_tx,
                         upload_tx,
                     )
-                    .await;
+                    .await
+                    {
+                        error!("Error handling inner ethernet frame: {}", e);
+                    }
                 }
             }
         } else {
-            handle_ethernet_frame(
+            if let Err(e) = handle_ethernet_frame(
                 tx,
                 our_mac,
                 &ethernet_packet,
@@ -1677,10 +1995,13 @@ pub async fn process_ethernet_frame(
                 firewall,
                 config,
                 eapol_attribute_cache,
-                auth_tx,
+                core_tx,
                 upload_tx,
             )
-            .await;
+            .await
+            {
+                error!("Error handling ethernet frame: {}", e);
+            }
         }
     }
 }
@@ -1693,7 +2014,7 @@ pub async fn l2_packet_dispatcher(
     config_rx: watch::Receiver<Arc<chilli_core::Config>>,
     _walled_garden_ips: Arc<Mutex<HashSet<Ipv4Addr>>>,
     eapol_attribute_cache: Arc<Mutex<HashMap<[u8; 6], RadiusAttributes>>>,
-    auth_tx: tokio::sync::mpsc::Sender<chilli_core::AuthRequest>,
+    core_tx: tokio::sync::mpsc::Sender<chilli_core::CoreRequest>,
     upload_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     download_rx: tokio::sync::mpsc::Receiver<(Vec<u8>, MacAddr)>,
 ) -> anyhow::Result<()> {
@@ -1703,20 +2024,19 @@ pub async fn l2_packet_dispatcher(
     let interface = interfaces
         .into_iter()
         .find(|iface: &NetworkInterface| iface.name == config.dhcpif)
-        .expect("Failed to find interface");
+        .ok_or_else(|| anyhow::anyhow!("Failed to find interface '{}'", config.dhcpif))?;
 
-    let our_mac = interface.mac.expect("Failed to get MAC address from interface");
+    let our_mac = interface.mac.ok_or_else(|| {
+        anyhow::anyhow!("Interface '{}' has no MAC address", interface.name)
+    })?;
 
     let mut channel_config = datalink::Config::default();
     channel_config.read_timeout = Some(Duration::from_millis(1));
 
     let (tx, rx) = match datalink::channel(&interface, channel_config) {
         Ok(datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
-        Ok(_) => panic!("Unhandled channel type"),
-        Err(e) => panic!(
-            "An error occurred when creating the datalink channel: {}",
-            e
-        ),
+        Ok(_) => anyhow::bail!("Unhandled datalink channel type"),
+        Err(e) => anyhow::bail!("Failed to create datalink channel: {}", e),
     };
 
     packet_loop(
@@ -1730,10 +2050,11 @@ pub async fn l2_packet_dispatcher(
         config_rx,
         _walled_garden_ips,
         eapol_attribute_cache,
-        auth_tx,
+        core_tx,
         upload_tx,
         download_rx,
-    ).await;
+    )
+    .await;
 
     Ok(())
 }
@@ -1752,9 +2073,12 @@ mod tests {
         let mut buf = [0u8; 1504];
 
         // 1. Receive Identity Response, send Challenge
-        let (len, src) = socket.recv_from(&mut buf).await.unwrap();
+        let (len, src) = socket
+            .recv_from(&mut buf)
+            .await
+            .expect("Mock RADIUS failed to receive");
         info!("Mock RADIUS: Received Identity Response: {:?}", &buf[..len]);
-        let req_packet = RadiusPacket::from_bytes(&buf[..len]).unwrap();
+        let req_packet = RadiusPacket::from_bytes(&buf[..len]).expect("Failed to parse RADIUS packet");
 
         let eap_payload_data = {
             let mut data = vec![EapType::MsChapV2 as u8];
@@ -1793,43 +2117,61 @@ mod tests {
         to_hash.extend_from_slice(&req_packet.authenticator);
         to_hash.extend_from_slice(&payload);
         to_hash.extend_from_slice(secret.as_bytes());
-        let response_auth = md5::compute(&to_hash);
+        let mut hasher = Md5::new();
+        hasher.update(&to_hash);
+        let response_auth = hasher.finalize();
 
         let mut response_buf = Vec::new();
         response_buf.extend_from_slice(&response_header);
-        response_buf.extend_from_slice(&response_auth.0);
+        response_buf.extend_from_slice(&response_auth[..]);
         response_buf.extend_from_slice(&payload);
 
-        socket.send_to(&response_buf, src).await.unwrap();
+        socket
+            .send_to(&response_buf, src)
+            .await
+            .expect("Mock RADIUS failed to send challenge");
         info!("Mock RADIUS: Sent Challenge");
 
         // 2. Receive Challenge Response, send Success
-        let (len, src) = socket.recv_from(&mut buf).await.unwrap();
+        let (len, src) = socket
+            .recv_from(&mut buf)
+            .await
+            .expect("Mock RADIUS failed to receive challenge response");
         info!("Mock RADIUS: Received Challenge Response: {:?}", &buf[..len]);
-        let req_packet = RadiusPacket::from_bytes(&buf[..len]).unwrap();
+        let req_packet =
+            RadiusPacket::from_bytes(&buf[..len]).expect("Failed to parse RADIUS packet");
 
         let mut response_header = vec![RadiusCode::AccessAccept as u8, req_packet.id, 0, 0];
         let mut to_hash = response_header.clone();
         to_hash.extend_from_slice(&req_packet.authenticator);
         to_hash.extend_from_slice(secret.as_bytes());
-        let response_auth = md5::compute(&to_hash);
+        let mut hasher = Md5::new();
+        hasher.update(&to_hash);
+        let response_auth = hasher.finalize();
 
         let mut final_response = Vec::new();
         let length = (chilli_net::radius::RADIUS_HDR_LEN) as u16;
         response_header[2..4].copy_from_slice(&length.to_be_bytes());
         final_response.extend_from_slice(&response_header[0..2]);
         final_response.extend_from_slice(&length.to_be_bytes());
-        final_response.extend_from_slice(&response_auth.0);
+        final_response.extend_from_slice(&response_auth[..]);
 
-        socket.send_to(&final_response, src).await.unwrap();
+        socket
+            .send_to(&final_response, src)
+            .await
+            .expect("Mock RADIUS failed to send access-accept");
         info!("Mock RADIUS: Sent Access-Accept");
     }
 
     #[tokio::test]
     async fn test_eap_flow() {
         tracing_subscriber::fmt::init();
-        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = server_socket.local_addr().unwrap();
+        let server_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind mock RADIUS socket");
+        let server_addr = server_socket
+            .local_addr()
+            .expect("Failed to get mock RADIUS socket address");
 
         let mut config = Config::default();
         if let std::net::IpAddr::V4(ip) = server_addr.ip() {
@@ -1843,7 +2185,11 @@ mod tests {
 
         let mock_server_handle = tokio::spawn(mock_radius_server(server_socket, secret));
 
-        let radius_client = Arc::new(RadiusClient::new(config_rx).await.unwrap());
+        let radius_client = Arc::new(
+            RadiusClient::new(config_rx)
+                .await
+                .expect("Failed to create RADIUS client"),
+        );
         let session_manager = Arc::new(SessionManager::new());
         let firewall = Arc::new(Firewall::new(arc_config.as_ref().clone()));
 
@@ -1852,7 +2198,7 @@ mod tests {
             auth_type: AuthType::Eap,
             ip: Ipv4Addr::new(10, 0, 0, 1),
             username: "testuser".to_string(),
-            password: Some("password".to_string()),
+            password: Some("password".to_string().into()),
             tx,
         };
 
@@ -1868,55 +2214,63 @@ mod tests {
             radius_client.run().await;
         });
 
-        let result = tokio::time::timeout(tokio::time::Duration::from_secs(10), rx).await;
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(10), rx)
+            .await
+            .expect("Test timed out");
 
-        assert!(result.is_ok(), "Test timed out");
-        let auth_result = result.unwrap();
-        assert!(auth_result.is_ok(), "Authentication channel closed");
-        assert!(auth_result.unwrap(), "Authentication failed");
+        assert!(result.is_ok(), "Authentication channel closed");
+        assert!(result.unwrap(), "Authentication failed");
 
-        handle.await.unwrap();
-        mock_server_handle.await.unwrap();
+        handle.await.expect("EAP auth handle panicked");
+        mock_server_handle
+            .await
+            .expect("Mock RADIUS server panicked");
         client_run.abort();
     }
 
     #[tokio::test]
     async fn test_build_arp_reply() {
         let mut config = Config::default();
-        config.dhcpstart = "10.0.0.10".parse().unwrap();
-        config.dhcpend = "10.0.0.20".parse().unwrap();
+        config.dhcpstart = "10.0.0.10".parse().expect("Failed to parse IP");
+        config.dhcpend = "10.0.0.20".parse().expect("Failed to parse IP");
         let arc_config = Arc::new(config);
 
         let our_mac = MacAddr::new(0x00, 0x01, 0x02, 0x03, 0x04, 0x05);
-        let client_ip = "10.0.0.15".parse().unwrap(); // IP within the DHCP range
+        let client_ip = "10.0.0.15".parse().expect("Failed to parse IP"); // IP within the DHCP range
 
         let mut ethernet_buffer = [0u8; 42];
-        let mut request_packet = MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
+        let mut request_packet =
+            MutableEthernetPacket::new(&mut ethernet_buffer).expect("Failed to create eth packet");
         request_packet.set_destination(MacAddr::broadcast());
         request_packet.set_source(MacAddr::new(0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff));
         request_packet.set_ethertype(EtherTypes::Arp);
 
         let mut arp_buffer = [0u8; 28];
-        let mut arp_packet = pnet::packet::arp::MutableArpPacket::new(&mut arp_buffer).unwrap();
+        let mut arp_packet =
+            pnet::packet::arp::MutableArpPacket::new(&mut arp_buffer).expect("Failed to create arp packet");
         arp_packet.set_hardware_type(ArpHardwareTypes::Ethernet);
         arp_packet.set_protocol_type(EtherTypes::Ipv4);
         arp_packet.set_hw_addr_len(6);
         arp_packet.set_proto_addr_len(4);
         arp_packet.set_operation(ArpOperations::Request);
         arp_packet.set_sender_hw_addr(MacAddr::new(0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff));
-        arp_packet.set_sender_proto_addr("10.0.0.1".parse().unwrap());
+        arp_packet.set_sender_proto_addr("10.0.0.1".parse().expect("Failed to parse IP"));
         arp_packet.set_target_hw_addr(MacAddr::zero());
         arp_packet.set_target_proto_addr(client_ip);
         request_packet.set_payload(arp_packet.packet());
 
-        let reply = build_arp_reply(&request_packet.to_immutable(), &arc_config, our_mac).await;
+        let reply = build_arp_reply(&request_packet.to_immutable(), &arc_config, our_mac)
+            .await
+            .expect("ARP reply should not be None");
 
-        assert!(reply.is_some());
-        let reply_vec = reply.unwrap();
-        let reply_packet = EthernetPacket::new(&reply_vec).unwrap();
-        assert_eq!(reply_packet.get_destination(), MacAddr::new(0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff));
+        let reply_packet = EthernetPacket::new(&reply).expect("Failed to parse eth reply");
+        assert_eq!(
+            reply_packet.get_destination(),
+            MacAddr::new(0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff)
+        );
         assert_eq!(reply_packet.get_source(), our_mac);
-        let reply_arp = ArpPacket::new(reply_packet.payload()).unwrap();
+        let reply_arp =
+            ArpPacket::new(reply_packet.payload()).expect("Failed to parse arp reply");
         assert_eq!(reply_arp.get_operation(), ArpOperations::Reply);
         assert_eq!(reply_arp.get_sender_hw_addr(), our_mac);
         assert_eq!(reply_arp.get_sender_proto_addr(), client_ip);

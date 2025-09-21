@@ -79,6 +79,12 @@ pub struct Config {
     /// Do not check the source IP of CoA/Disconnect requests.
     #[serde(default)]
     pub coanoipcheck: bool,
+    /// The timeout for RADIUS requests in seconds.
+    #[serde(default = "default_radiustimeout")]
+    pub radiustimeout: u32,
+    /// The number of retries for RADIUS requests.
+    #[serde(default = "default_radiusretry")]
+    pub radiusretry: u32,
 
     /// The network interface to use for DHCP.
     pub dhcpif: String,
@@ -156,6 +162,14 @@ pub struct Config {
     pub radiuslocationname: Option<String>,
 }
 
+fn default_radiustimeout() -> u32 {
+    10
+}
+
+fn default_radiusretry() -> u32 {
+    3
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -166,30 +180,32 @@ impl Default for Config {
             interval: 3600,
             pidfile: "/var/run/chilli.pid".to_string(),
             statedir: "/var/run".to_string(),
-            net: "192.168.182.0".parse().unwrap(),
-            mask: "255.255.255.0".parse().unwrap(),
+            net: "192.168.182.0".parse().expect("Default IP is invalid"),
+            mask: "255.255.255.0".parse().expect("Default IP is invalid"),
             tundev: Some("tun0".to_string()),
             dynip: None,
             statip: None,
-            dns1: "8.8.8.8".parse().unwrap(),
-            dns2: "8.8.4.4".parse().unwrap(),
+            dns1: "8.8.8.8".parse().expect("Default IP is invalid"),
+            dns2: "8.8.4.4".parse().expect("Default IP is invalid"),
             domain: Some("coova.org".to_string()),
-            radiuslisten: "0.0.0.0".parse().unwrap(),
-            radiusserver1: "127.0.0.1".parse().unwrap(),
-            radiusserver2: Some("127.0.0.1".parse().unwrap()),
+            radiuslisten: "0.0.0.0".parse().expect("Default IP is invalid"),
+            radiusserver1: "127.0.0.1".parse().expect("Default IP is invalid"),
+            radiusserver2: Some("127.0.0.1".parse().expect("Default IP is invalid")),
             radiussecret: "testing123".to_string(),
             radiusauthport: 1812,
             radiusacctport: 1813,
             coaport: 3799,
             coanoipcheck: false,
+            radiustimeout: default_radiustimeout(),
+            radiusretry: default_radiusretry(),
             dhcpif: "eth0".to_string(),
-            dhcplisten: "192.168.182.1".parse().unwrap(),
-            dhcpstart: "192.168.182.10".parse().unwrap(),
-            dhcpend: "192.168.182.254".parse().unwrap(),
+            dhcplisten: "192.168.182.1".parse().expect("Default IP is invalid"),
+            dhcpstart: "192.168.182.10".parse().expect("Default IP is invalid"),
+            dhcpend: "192.168.182.254".parse().expect("Default IP is invalid"),
             lease: 3600,
             uamsecret: Some("uamsecret".to_string()),
             uamurl: Some("http://127.0.0.1:3990/login".to_string()),
-            uamlisten: "192.168.182.1".parse().unwrap(),
+            uamlisten: "192.168.182.1".parse().expect("Default IP is invalid"),
             uamport: 3990,
             uamanyip: false,
             max_clients: 1024,

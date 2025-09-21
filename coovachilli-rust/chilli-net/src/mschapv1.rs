@@ -91,8 +91,12 @@ fn des_encrypt(key: &[u8; 7], data: &[u8; 8]) -> [u8; 8] {
 
 fn challenge_response(challenge: &[u8; 8], pw_hash: &[u8; 16]) -> [u8; 24] {
     let mut response = [0u8; 24];
-    let key1: &[u8; 7] = pw_hash[0..7].try_into().unwrap();
-    let key2: &[u8; 7] = pw_hash[7..14].try_into().unwrap();
+    let key1: &[u8; 7] = pw_hash[0..7]
+        .try_into()
+        .expect("pw_hash slice is guaranteed to be correct");
+    let key2: &[u8; 7] = pw_hash[7..14]
+        .try_into()
+        .expect("pw_hash slice is guaranteed to be correct");
     let mut key3 = [0u8; 7];
     key3[0..2].copy_from_slice(&pw_hash[14..16]);
 
@@ -116,8 +120,12 @@ pub fn mschap_lanman_response(challenge: &[u8; 8], secret: &str) -> [u8; 24] {
         i += 1;
     }
 
-    let key1: &[u8; 7] = padded_secret[0..7].try_into().unwrap();
-    let key2: &[u8; 7] = padded_secret[7..14].try_into().unwrap();
+    let key1: &[u8; 7] = padded_secret[0..7]
+        .try_into()
+        .expect("padded_secret slice is guaranteed to be correct");
+    let key2: &[u8; 7] = padded_secret[7..14]
+        .try_into()
+        .expect("padded_secret slice is guaranteed to be correct");
 
     let mut hash = [0u8; 16];
     hash[0..8].copy_from_slice(&des_encrypt(key1, salt));

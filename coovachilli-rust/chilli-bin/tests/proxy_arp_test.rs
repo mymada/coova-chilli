@@ -19,7 +19,10 @@ impl datalink::DataLinkSender for MockDataLinkSender {
         packet: &[u8],
         _dst_iface: Option<NetworkInterface>,
     ) -> Option<std::io::Result<()>> {
-        self.packets.lock().unwrap().push(packet.to_vec());
+        self.packets
+            .lock()
+            .expect("Failed to lock mock sender packets")
+            .push(packet.to_vec());
         Some(Ok(()))
     }
 
@@ -39,7 +42,8 @@ fn build_arp_request(
     target_ip: Ipv4Addr,
 ) -> Vec<u8> {
     let mut arp_buffer = [0u8; 28];
-    let mut arp_packet = MutableArpPacket::new(&mut arp_buffer).unwrap();
+    let mut arp_packet =
+        MutableArpPacket::new(&mut arp_buffer).expect("Failed to create arp packet buffer");
 
     arp_packet.set_hardware_type(ArpHardwareTypes::Ethernet);
     arp_packet.set_protocol_type(EtherTypes::Ipv4);
@@ -52,7 +56,8 @@ fn build_arp_request(
     arp_packet.set_target_proto_addr(target_ip);
 
     let mut eth_buf = vec![0u8; 14 + arp_packet.packet().len()];
-    let mut eth_packet = MutableEthernetPacket::new(&mut eth_buf).unwrap();
+    let mut eth_packet =
+        MutableEthernetPacket::new(&mut eth_buf).expect("Failed to create ethernet packet buffer");
     eth_packet.set_destination(MacAddr::broadcast());
     eth_packet.set_source(sender_mac);
     eth_packet.set_ethertype(EtherTypes::Arp);
@@ -65,12 +70,12 @@ fn build_arp_request(
 async fn test_proxy_arp_reply() {
     tracing_subscriber::fmt::try_init().ok();
 
-    let (config, session_manager, radius_client, dhcp_server, firewall, eapol_attribute_cache, auth_tx, _auth_rx, _config_tx) = initialize_services(None).await;
+    let (config, session_manager, radius_client, dhcp_server, firewall, eapol_attribute_cache, auth_tx, _auth_rx, _config_tx) = initialize_services(None, Some(0)).await.expect("initialize_services failed");
 
     let our_mac = MacAddr::new(0x00, 0x01, 0x02, 0x03, 0x04, 0x05);
     let client_a_mac = MacAddr::new(0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA);
-    let client_a_ip = "10.1.0.10".parse().unwrap();
-    let client_b_ip = "10.1.0.1".parse().unwrap(); // The IP in the default DHCP range
+    let client_a_ip = "10.1.0.10".parse().expect("Failed to parse IP");
+    let client_b_ip = "10.1.0.1".parse().expect("Failed to parse IP"); // The IP in the default DHCP range
 
     let sent_packets = Arc::new(Mutex::new(Vec::new()));
     let mut tx: Box<dyn datalink::DataLinkSender> = Box::new(MockDataLinkSender {
@@ -84,18 +89,35 @@ async fn test_proxy_arp_reply() {
     process_ethernet_frame(&mut tx, our_mac, &arp_request_packet, &session_manager, &radius_client, &dhcp_server, &firewall, &config, &eapol_attribute_cache, &auth_tx, &upload_tx).await;
 
     // Verify that we sent a reply
-    let packets = sent_packets.lock().unwrap();
+    let packets = sent_packets.lock().expect("Failed to lock sent_packets");
     assert_eq!(packets.len(), 1, "Expected one packet (ARP reply)");
 
     // Verify the ARP reply
-    let reply_eth = EthernetPacket::new(&packets[0]).unwrap();
-    assert_eq!(reply_eth.get_destination(), client_a_mac, "ARP reply should be sent to Client A");
-    assert_eq!(reply_eth.get_source(), our_mac, "ARP reply should come from our MAC");
+    let reply_eth = EthernetPacket::new(&packets[0]).expect("Failed to parse ethernet packet");
+    assert_eq!(
+        reply_eth.get_destination(),
+        client_a_mac,
+        "ARP reply should be sent to Client A"
+    );
+    assert_eq!(
+        reply_eth.get_source(),
+        our_mac,
+        "ARP reply should come from our MAC"
+    );
     assert_eq!(reply_eth.get_ethertype(), EtherTypes::Arp);
 
-    let reply_arp = pnet::packet::arp::ArpPacket::new(reply_eth.payload()).unwrap();
-    assert_eq!(reply_arp.get_operation(), ArpOperations::Reply, "Packet should be an ARP reply");
-    assert_eq!(reply_arp.get_sender_hw_addr(), our_mac, "Sender MAC in ARP payload should be our MAC");
+    let reply_arp =
+        pnet::packet::arp::ArpPacket::new(reply_eth.payload()).expect("Failed to parse ARP packet");
+    assert_eq!(
+        reply_arp.get_operation(),
+        ArpOperations::Reply,
+        "Packet should be an ARP reply"
+    );
+    assert_eq!(
+        reply_arp.get_sender_hw_addr(),
+        our_mac,
+        "Sender MAC in ARP payload should be our MAC"
+    );
     assert_eq!(reply_arp.get_sender_proto_addr(), client_b_ip, "Sender IP in ARP payload should be the requested IP (Client B)");
     assert_eq!(reply_arp.get_target_hw_addr(), client_a_mac);
     assert_eq!(reply_arp.get_target_proto_addr(), client_a_ip);

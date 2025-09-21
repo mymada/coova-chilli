@@ -4,8 +4,10 @@ use std::net::Ipv4Addr;
 
 #[test]
 fn test_load_config() {
-    let config_contents = fs::read_to_string("tests/chilli.toml").unwrap();
-    let config: Config = toml::from_str(&config_contents).unwrap();
+    let config_contents =
+        fs::read_to_string("tests/chilli.toml").expect("Failed to read config file");
+    let config: Config =
+        toml::from_str(&config_contents).expect("Failed to parse config file");
 
     assert_eq!(config.foreground, true);
     assert_eq!(config.debug, true);
