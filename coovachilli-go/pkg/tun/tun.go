@@ -2,15 +2,17 @@ package tun
 
 import (
 	"fmt"
-	"log"
 	"os/exec"
 
 	"coovachilli-go/pkg/config"
+	"github.com/rs/zerolog"
 	"github.com/songgao/water"
 )
 
 // New creates and configures a new TUN interface.
-func New(cfg *config.Config) (*water.Interface, error) {
+func New(cfg *config.Config, logger zerolog.Logger) (*water.Interface, error) {
+	log := logger.With().Str("component", "tun").Logger()
+
 	waterCfg := water.Config{
 		DeviceType: water.TUN,
 	}
@@ -21,7 +23,7 @@ func New(cfg *config.Config) (*water.Interface, error) {
 		return nil, fmt.Errorf("failed to create TUN interface: %w", err)
 	}
 
-	log.Printf("TUN interface %s created", ifce.Name())
+	log.Info().Str("device", ifce.Name()).Msg("TUN interface created")
 
 	// Configure the IP address and bring the interface up.
 	// This uses the `ip` command, which is Linux-specific.
@@ -36,18 +38,19 @@ func New(cfg *config.Config) (*water.Interface, error) {
 		return nil, fmt.Errorf("failed to bring up TUN interface: %w", err)
 	}
 
-	log.Printf("TUN interface %s configured and up", ifce.Name())
+	log.Info().Str("device", ifce.Name()).Msg("TUN interface configured and up")
 
 	return ifce, nil
 }
 
 // ReadPackets reads packets from the TUN interface and sends them to the dispatcher.
-func ReadPackets(ifce *water.Interface, dispatch chan<- []byte) {
+func ReadPackets(ifce *water.Interface, dispatch chan<- []byte, logger zerolog.Logger) {
+	log := logger.With().Str("component", "tun").Logger()
 	packet := make([]byte, 1500)
 	for {
 		n, err := ifce.Read(packet)
 		if err != nil {
-			log.Printf("Error reading from TUN interface: %v", err)
+			log.Error().Err(err).Msg("Error reading from TUN interface")
 			continue
 		}
 		dispatch <- packet[:n]

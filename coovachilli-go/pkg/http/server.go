@@ -2,12 +2,13 @@ package http
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"net/http"
+	"time"
 
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
+	"github.com/rs/zerolog"
 )
 
 const loginPage = `
@@ -34,14 +35,16 @@ type Server struct {
 	cfg            *config.Config
 	sessionManager *core.SessionManager
 	radiusReqChan  chan<- *core.Session
+	logger         zerolog.Logger
 }
 
 // NewServer creates a new HTTP server.
-func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<- *core.Session) *Server {
+func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<- *core.Session, logger zerolog.Logger) *Server {
 	return &Server{
 		cfg:            cfg,
 		sessionManager: sm,
 		radiusReqChan:  radiusReqChan,
+		logger:         logger.With().Str("component", "http").Logger(),
 	}
 }
 
@@ -51,9 +54,9 @@ func (s *Server) Start() {
 	http.HandleFunc("/login", s.handleLogin)
 
 	addr := fmt.Sprintf(":%d", s.cfg.UAMPort)
-	log.Printf("Starting HTTP server on %s", addr)
+	s.logger.Info().Str("addr", addr).Msg("Starting HTTP server")
 	if err := http.ListenAndServe(addr, nil); err != nil {
-		log.Fatalf("Failed to start HTTP server: %v", err)
+		s.logger.Fatal().Err(err).Msg("Failed to start HTTP server")
 	}
 }
 
@@ -75,7 +78,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	username := r.FormValue("username")
 	password := r.FormValue("password")
 
-	log.Printf("Login attempt from username: %s", username)
+	s.logger.Info().Str("user", username).Str("remote_addr", r.RemoteAddr).Msg("Login attempt")
 
 	// Get the client's IP address
 	ipStr, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -100,8 +103,17 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	s.radiusReqChan <- session
 
-	// In a real implementation, we would wait for the RADIUS response
-	// and then show a success or failure page. For now, we'll just
-	// show a simple success message.
-	fmt.Fprint(w, "Login request sent. Please wait.")
+	// Wait for the authentication result, with a timeout
+	select {
+	case authOK := <-session.AuthResult:
+		if authOK {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "<h1>Login Successful</h1><p>You can now access the internet.</p>")
+		} else {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, "<h1>Login Failed</h1><p>Invalid username or password.</p>")
+		}
+	case <-time.After(10 * time.Second):
+		http.Error(w, "Login request timed out.", http.StatusGatewayTimeout)
+	}
 }

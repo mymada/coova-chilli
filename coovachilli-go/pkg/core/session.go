@@ -35,6 +35,9 @@ type Session struct {
 
 	// UAM/Redir state
 	Redir RedirState
+
+	// AuthResult is used to signal the result of an authentication attempt.
+	AuthResult chan bool
 }
 
 // SessionParams holds RADIUS-provisioned session parameters.
@@ -85,10 +88,11 @@ func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr) *Sessio
 	defer sm.Unlock()
 
 	session := &Session{
-		HisIP:  ip,
-		HisMAC: mac,
-		StartTime: time.Now(),
-		LastSeen:  time.Now(),
+		HisIP:      ip,
+		HisMAC:     mac,
+		StartTime:  time.Now(),
+		LastSeen:   time.Now(),
+		AuthResult: make(chan bool, 1),
 	}
 
 	if ip.To4() != nil {

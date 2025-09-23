@@ -60,6 +60,7 @@ type Config struct {
 	UAMUrl        string   `yaml:"uamurl"`
 
 	// Firewall settings
+	ExtIf      string `yaml:"extif"`
 	IPTables   string `yaml:"iptables"`
 	IP6Tables  string `yaml:"ip6tables"`
 

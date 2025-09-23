@@ -15,6 +15,7 @@ dhcplisten: 10.1.0.1
 
 # DHCP settings
 dhcpif: eth0
+extif: eth0
 dhcpstart: 10.1.0.100
 dhcpend: 10.1.0.200
 lease: 1h

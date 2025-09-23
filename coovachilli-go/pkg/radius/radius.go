@@ -3,11 +3,11 @@ package radius
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
+	"github.com/rs/zerolog"
 	"layeh.com/radius"
 	"layeh.com/radius/rfc2865"
 	"layeh.com/radius/rfc2866"
@@ -16,13 +16,15 @@ import (
 
 // Client holds the state for the RADIUS client.
 type Client struct {
-	cfg *config.Config
+	cfg    *config.Config
+	logger zerolog.Logger
 }
 
 // NewClient creates a new RADIUS client.
-func NewClient(cfg *config.Config) *Client {
+func NewClient(cfg *config.Config, logger zerolog.Logger) *Client {
 	return &Client{
-		cfg: cfg,
+		cfg:    cfg,
+		logger: logger.With().Str("component", "radius").Logger(),
 	}
 }
 
@@ -54,7 +56,7 @@ func (c *Client) SendAccessRequest(session *core.Session, username, password str
 		return nil, fmt.Errorf("failed to send RADIUS Access-Request: %w", err)
 	}
 
-	log.Printf("Received RADIUS response: %s", response.Code.String())
+	c.logger.Debug().Str("code", response.Code.String()).Str("user", username).Msg("Received RADIUS response")
 	return response, nil
 }
 
@@ -94,6 +96,6 @@ func (c *Client) SendAccountingRequest(session *core.Session, statusType rfc2866
 		return nil, fmt.Errorf("failed to send RADIUS Accounting-Request: %w", err)
 	}
 
-	log.Printf("Received RADIUS accounting response: %s", response.Code.String())
+	c.logger.Debug().Str("code", response.Code.String()).Str("user", session.Redir.Username).Msg("Received RADIUS accounting response")
 	return response, nil
 }
