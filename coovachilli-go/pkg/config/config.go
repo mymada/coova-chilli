@@ -30,6 +30,8 @@ type Config struct {
 
 	// DHCP settings
 	DHCPIf         string `yaml:"dhcpif"`
+	DHCPRelay      bool   `yaml:"dhcprelay"`
+	DHCPUpstream   string `yaml:"dhcpupstream"`
 	DHCPStart      net.IP `yaml:"dhcpstart"`
 	DHCPEnd        net.IP `yaml:"dhcpend"`
 	DHCPStartV6    net.IP `yaml:"dhcpstart_v6"`
@@ -62,13 +64,17 @@ type Config struct {
 	UAMUrl        string   `yaml:"uamurl"`
 
 	// Firewall settings
-	ExtIf      string `yaml:"extif"`
-	IPTables   string `yaml:"iptables"`
-	IP6Tables  string `yaml:"ip6tables"`
+	ExtIf             string `yaml:"extif"`
+	ClientIsolation   bool   `yaml:"clientisolation"`
+	IPTables          string `yaml:"iptables"`
+	IP6Tables         string `yaml:"ip6tables"`
 
 	// Scripts
 	ConUp   string `yaml:"conup"`
 	ConDown string `yaml:"condown"`
+
+	// Management
+	CmdSockPath string `yaml:"cmdsockpath"`
 }
 
 // Load loads the configuration from a YAML file.

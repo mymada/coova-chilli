@@ -12,6 +12,7 @@ import (
 	"coovachilli-go/pkg/core"
 	"coovachilli-go/pkg/dhcp"
 	"coovachilli-go/pkg/firewall"
+	"coovachilli-go/pkg/cmdsock"
 	"coovachilli-go/pkg/http"
 	"coovachilli-go/pkg/radius"
 	"coovachilli-go/pkg/tun"
@@ -74,8 +75,32 @@ func main() {
 	packetChan := make(chan []byte)
 	go tun.ReadPackets(ifce, packetChan, log.Logger)
 
+	cmdChan := make(chan string)
+	cmdSockListener := cmdsock.NewListener(cfg.CmdSockPath, cmdChan, log.Logger)
+	go cmdSockListener.Start()
+
 	coaReqChan := make(chan radius.CoAIncomingRequest)
 	go radiusClient.StartCoAListener(coaReqChan)
+
+	// Command socket processing loop
+	go func() {
+		for cmd := range cmdChan {
+			if cmd == "list" {
+				log.Info().Msg("--- Active Sessions ---")
+				for _, s := range sessionManager.GetAllSessions() {
+					log.Info().
+						Str("user", s.Redir.Username).
+						Str("ip", s.HisIP.String()).
+						Str("mac", s.HisMAC.String()).
+						Time("started", s.StartTime).
+						Msg("Session")
+				}
+				log.Info().Msg("-----------------------")
+			} else {
+				log.Warn().Str("cmd", cmd).Msg("Unknown command")
+			}
+		}
+	}()
 
 	// CoA processing loop
 	go func() {

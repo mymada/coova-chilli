@@ -93,6 +93,11 @@ func (f *Firewall) Initialize() error {
 	}
 
 	// Filter rules
+	if f.cfg.ClientIsolation {
+		if err := f.ipt.Append("filter", "FORWARD", "-i", f.cfg.TUNDev, "-o", f.cfg.TUNDev, "-j", "DROP"); err != nil {
+			return fmt.Errorf("failed to add client isolation rule: %w", err)
+		}
+	}
 	if err := f.ipt.Append("filter", "FORWARD", "-i", f.cfg.TUNDev, "-j", chainChilli); err != nil {
 		return fmt.Errorf("failed to append to FORWARD chain: %w", err)
 	}
@@ -186,6 +191,11 @@ func (f *Firewall) Cleanup() error {
 	}
 	if err := f.ipt.Delete("filter", "FORWARD", "-i", f.cfg.TUNDev, "-j", chainChilli); err != nil {
 		f.logger.Error().Err(err).Msg("Failed to delete from FORWARD chain")
+	}
+	if f.cfg.ClientIsolation {
+		if err := f.ipt.Delete("filter", "FORWARD", "-i", f.cfg.TUNDev, "-o", f.cfg.TUNDev, "-j", "DROP"); err != nil {
+			f.logger.Error().Err(err).Msg("Failed to delete client isolation rule")
+		}
 	}
 
 	for _, chain := range []string{chainChilli, chainWalledGarden} {

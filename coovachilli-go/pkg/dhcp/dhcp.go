@@ -50,14 +50,17 @@ type Pool struct {
 
 // NewServer creates a new DHCP server and starts listening for packets.
 func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<- *core.Session, logger zerolog.Logger) (*Server, error) {
-	poolV4, err := NewPool(cfg.DHCPStart, cfg.DHCPEnd)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create IPv4 pool: %w", err)
-	}
-
-	poolV6, err := NewPool(cfg.DHCPStartV6, cfg.DHCPEndV6)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create IPv6 pool: %w", err)
+	var poolV4, poolV6 *Pool
+	var err error
+	if !cfg.DHCPRelay {
+		poolV4, err = NewPool(cfg.DHCPStart, cfg.DHCPEnd)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create IPv4 pool: %w", err)
+		}
+		poolV6, err = NewPool(cfg.DHCPStartV6, cfg.DHCPEndV6)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create IPv6 pool: %w", err)
+		}
 	}
 
 	iface, err := net.InterfaceByName(cfg.DHCPIf)
@@ -146,14 +149,20 @@ func (s *Server) listen() {
 
 		switch udp.DstPort {
 		case 67, 68: // DHCPv4
-			respBytes, req, err := s.HandleDHCPv4(appLayer.Payload())
-			if err != nil {
-				s.logger.Error().Err(err).Msg("Error handling DHCPv4 packet")
-				continue
-			}
-			if respBytes != nil {
-				if err := s.sendDHCPResponse(respBytes, req); err != nil {
-					s.logger.Error().Err(err).Msg("Error sending DHCPv4 response")
+			if s.cfg.DHCPRelay {
+				if err := s.relayDHCPv4(packet); err != nil {
+					s.logger.Error().Err(err).Msg("Error relaying DHCPv4 packet")
+				}
+			} else {
+				respBytes, req, err := s.HandleDHCPv4(appLayer.Payload())
+				if err != nil {
+					s.logger.Error().Err(err).Msg("Error handling DHCPv4 packet")
+					continue
+				}
+				if respBytes != nil {
+					if err := s.sendDHCPResponse(respBytes, req); err != nil {
+						s.logger.Error().Err(err).Msg("Error sending DHCPv4 response")
+					}
 				}
 			}
 		case 546, 547: // DHCPv6
@@ -224,6 +233,65 @@ func (s *Server) sendDHCPv6Response(respBytes []byte, reqPacket gopacket.Packet)
 
 	s.logger.Debug().Str("dst_mac", reqEth.SrcMAC.String()).Str("dst_ip", reqIPv6.SrcIP.String()).Msg("DHCPv6 response sent")
 	return nil
+}
+
+func (s *Server) relayDHCPv4(packet gopacket.Packet) error {
+	appLayer := packet.ApplicationLayer()
+	if appLayer == nil {
+		return fmt.Errorf("cannot relay packet without application layer")
+	}
+
+	dhcpPacket, err := dhcpv4.FromBytes(appLayer.Payload())
+	if err != nil {
+		return fmt.Errorf("failed to parse dhcpv4 packet for relay: %w", err)
+	}
+
+	// Set the gateway IP address in the packet
+	dhcpPacket.GatewayIPAddr = s.cfg.DHCPListen
+
+	// Add Relay Agent Information (Option 82)
+	// This is a basic implementation. A production relay would add more sub-options.
+	opt82 := dhcpv4.OptRelayAgentInfo(dhcpv4.OptGeneric(iana.OptionRelayAgentInformation, []byte("coovachilli-go")))
+	dhcpPacket.UpdateOption(opt82)
+
+	// Send the packet to the upstream DHCP server
+	upstreamAddr := &net.UDPAddr{
+		IP:   net.ParseIP(s.cfg.DHCPUpstream),
+		Port: 67,
+	}
+	conn, err := net.DialUDP("udp", nil, upstreamAddr)
+	if err != nil {
+		return fmt.Errorf("failed to dial upstream dhcp server: %w", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write(dhcpPacket.ToBytes()); err != nil {
+		return fmt.Errorf("failed to send relayed dhcp packet: %w", err)
+	}
+
+	s.logger.Info().
+		Str("client_mac", dhcpPacket.ClientHWAddr.String()).
+		Str("upstream", upstreamAddr.String()).
+		Msg("Relayed DHCPv4 packet to upstream server")
+
+	// Listen for the response
+	buf := make([]byte, 1500)
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, _, err := conn.ReadFromUDP(buf)
+	if err != nil {
+		return fmt.Errorf("failed to read from upstream dhcp server: %w", err)
+	}
+
+	s.logger.Info().Msg("Received response from upstream DHCP server")
+
+	// Parse the response
+	respPacket, err := dhcpv4.FromBytes(buf[:n])
+	if err != nil {
+		return fmt.Errorf("failed to parse relayed dhcp response: %w", err)
+	}
+
+	// Forward the response back to the client
+	return s.sendDHCPResponse(respPacket.ToBytes(), respPacket)
 }
 
 func (s *Server) sendDHCPResponse(respBytes []byte, req *dhcpv4.DHCPv4) error {
@@ -299,8 +367,7 @@ func (s *Server) HandleDHCPv6(packet []byte) ([]byte, dhcpv6.DHCPv6, error) {
 	case dhcpv6.MessageTypeSolicit:
 		resp, err = s.handleSolicit(req)
 	case dhcpv6.MessageTypeRequest:
-		// return s.handleRequestV6(req)
-		resp = nil // Placeholder
+		resp, err = s.handleRequestV6(req)
 	default:
 		s.logger.Warn().Str("type", req.Type().String()).Msg("Unhandled DHCPv6 message type")
 		return nil, nil, nil
@@ -372,6 +439,72 @@ func (s *Server) handleSolicit(req dhcpv6.DHCPv6) (dhcpv6.DHCPv6, error) {
 	}
 
 	s.logger.Info().Str("ip", ip.String()).Msg("Advertising IPv6 address")
+	return resp, nil
+}
+
+func (s *Server) handleRequestV6(req dhcpv6.DHCPv6) (dhcpv6.DHCPv6, error) {
+	// Get client DUID
+	opt := req.GetOneOption(dhcpv6.OptionClientID)
+	if opt == nil {
+		return nil, fmt.Errorf("no client DUID in REQUEST")
+	}
+	clientDUID := opt.(*dhcpv6.OptClientID).DUID
+
+	// Get the address the client is requesting
+	iana := req.GetOneOption(dhcpv6.OptionIANA).(*dhcpv6.OptIANA)
+	iaAddr := iana.Options.GetOne(dhcpv6.OptionIAAddress).(*dhcpv6.OptIAAddress)
+	if iaAddr == nil {
+		return nil, fmt.Errorf("no IAAddress in REQUEST")
+	}
+	reqIP := iaAddr.IPv6Address
+
+	// TODO: Validate that the requested IP is valid and was offered by us.
+	// For now, we'll just accept it.
+
+	// Create lease
+	s.Lock()
+	s.leasesV6[clientDUID.String()] = &Lease{
+		IP:      reqIP,
+		Expires: time.Now().Add(s.cfg.Lease),
+	}
+	s.Unlock()
+
+	// Create REPLY response
+	resp, err := dhcpv6.NewReply(req.TransactionID(),
+		dhcpv6.WithServerID(dhcpv6.DUID_LLT{
+			Type:        dhcpv6.DUIDTypeLLT,
+			Time:        dhcpv6.GetTime(),
+			LinkLayer:   iana.HWTypeEthernet,
+			LinkLayerAddr: s.ifaceMAC,
+		}),
+		dhcpv6.WithClientID(clientDUID),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create DHCPv6 REPLY: %w", err)
+	}
+
+	// Add the IP address back
+	replyIana := dhcpv6.OptIANA{
+		IaId: iana.IaId,
+		Options: dhcpv6.Options{
+			dhcpv6.OptIAAddress{
+				IPv6Address:       reqIP,
+				PreferredLifetime: 3600 * time.Second,
+				ValidLifetime:     7200 * time.Second,
+			},
+		},
+	}
+	resp.AddOption(&replyIana)
+
+	// Add DNS servers
+	if s.cfg.DNS1V6 != nil {
+		resp.AddOption(dhcpv6.OptDNSRecursiveNameServer(s.cfg.DNS1V6))
+	}
+	if s.cfg.DNS2V6 != nil {
+		resp.AddOption(dhcpv6.OptDNSRecursiveNameServer(s.cfg.DNS2V6))
+	}
+
+	s.logger.Info().Str("ip", reqIP.String()).Msg("Replying to DHCPv6 request")
 	return resp, nil
 }
 

@@ -16,6 +16,9 @@ dhcplisten: 10.1.0.1
 # DHCP settings
 dhcpif: eth0
 extif: eth0
+clientisolation: true
+dhcprelay: false
+dhcpupstream: "" # e.g., 192.168.1.1
 dhcpstart: 10.1.0.100
 dhcpend: 10.1.0.200
 lease: 1h
@@ -40,3 +43,6 @@ uamallowed:
   - "www.google.co.in"
   - "www.github.com"
   - "github.com"
+
+# Management
+cmdsockpath: /var/run/chilli.sock
