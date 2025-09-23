@@ -63,7 +63,7 @@ func main() {
 		log.Fatal().Err(err).Msg("Error creating DHCP server")
 	}
 
-	httpServer := http.NewServer(cfg, sessionManager, radiusReqChan, log.Logger)
+	httpServer := http.NewServer(cfg, sessionManager, radiusReqChan, radiusClient, fw, log.Logger)
 	go httpServer.Start()
 
 	ifce, err := tun.New(cfg, log.Logger)

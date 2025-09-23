@@ -14,6 +14,11 @@ import (
 	"layeh.com/radius/rfc3162"
 )
 
+// AccountingSender defines the interface for sending RADIUS accounting packets.
+type AccountingSender interface {
+	SendAccountingRequest(session *core.Session, statusType rfc2866.AcctStatusType) (*radius.Packet, error)
+}
+
 // Client holds the state for the RADIUS client.
 type Client struct {
 	cfg    *config.Config

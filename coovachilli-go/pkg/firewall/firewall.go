@@ -9,6 +9,11 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// UserRuleRemover defines the interface for removing firewall rules for a user.
+type UserRuleRemover interface {
+	RemoveAuthenticatedUser(ip net.IP) error
+}
+
 const (
 	chainChilli   = "chilli"
 	chainWalledGarden = "chilli_walled_garden"
