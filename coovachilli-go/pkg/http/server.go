@@ -3,6 +3,7 @@ package http
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -85,10 +86,23 @@ func (s *Server) Start() {
 	http.HandleFunc("/status", s.handleStatus)
 	http.HandleFunc("/logout", s.handleLogout)
 
+	// API endpoints
+	http.HandleFunc("/api/v1/status", s.handleApiStatus)
+	http.HandleFunc("/api/v1/login", s.handleApiLogin)
+	http.HandleFunc("/api/v1/logout", s.handleApiLogout)
+
 	addr := fmt.Sprintf(":%d", s.cfg.UAMPort)
-	s.logger.Info().Str("addr", addr).Msg("Starting HTTP server")
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		s.logger.Fatal().Err(err).Msg("Failed to start HTTP server")
+
+	if s.cfg.CertFile != "" && s.cfg.KeyFile != "" {
+		s.logger.Info().Str("addr", addr).Msg("Starting HTTPS server")
+		if err := http.ListenAndServeTLS(addr, s.cfg.CertFile, s.cfg.KeyFile, nil); err != nil {
+			s.logger.Fatal().Err(err).Msg("Failed to start HTTPS server")
+		}
+	} else {
+		s.logger.Info().Str("addr", addr).Msg("Starting HTTP server")
+		if err := http.ListenAndServe(addr, nil); err != nil {
+			s.logger.Fatal().Err(err).Msg("Failed to start HTTP server")
+		}
 	}
 }
 
@@ -246,4 +260,160 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	s.sessionManager.DeleteSession(session)
 
 	fmt.Fprint(w, "<h1>You have been logged out.</h1>")
+}
+
+// --- API Handlers ---
+
+type apiStatusResponse struct {
+	Username      string `json:"username"`
+	IP            string `json:"ip"`
+	MAC           string `json:"mac"`
+	SessionStart  time.Time `json:"session_start"`
+	SessionUptime int64  `json:"session_uptime_seconds"`
+	InputOctets   uint64 `json:"input_octets"`
+	OutputOctets  uint64 `json:"output_octets"`
+}
+
+func (s *Server) handleApiStatus(w http.ResponseWriter, r *http.Request) {
+	ipStr, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		http.Error(w, "{\"error\":\"Failed to get client IP address\"}", http.StatusInternalServerError)
+		return
+	}
+	ip := net.ParseIP(ipStr)
+
+	session, ok := s.sessionManager.GetSessionByIP(ip)
+	if !ok {
+		http.Error(w, "{\"error\":\"Session not found\"}", http.StatusNotFound)
+		return
+	}
+
+	session.RLock()
+	defer session.RUnlock()
+
+	resp := apiStatusResponse{
+		Username:      session.Redir.Username,
+		IP:            session.HisIP.String(),
+		MAC:           session.HisMAC.String(),
+		SessionStart:  session.StartTime,
+		SessionUptime: int64(time.Since(session.StartTime).Seconds()),
+		InputOctets:   session.InputOctets,
+		OutputOctets:  session.OutputOctets,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+type apiLoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+func (s *Server) handleApiLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "{\"error\":\"Method not allowed\"}", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req apiLoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "{\"error\":\"Invalid request body\"}", http.StatusBadRequest)
+		return
+	}
+
+	s.logger.Info().Str("user", req.Username).Str("remote_addr", r.RemoteAddr).Msg("API login attempt")
+
+	ipStr, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		http.Error(w, "{\"error\":\"Failed to get client IP address\"}", http.StatusInternalServerError)
+		return
+	}
+	ip := net.ParseIP(ipStr)
+
+	session, ok := s.sessionManager.GetSessionByIP(ip)
+	if !ok {
+		http.Error(w, "{\"error\":\"Session not found\"}", http.StatusNotFound)
+		return
+	}
+
+	session.Lock()
+	session.Redir.Username = req.Username
+	session.Redir.Password = req.Password
+	session.Unlock()
+
+	s.radiusReqChan <- session
+
+	w.Header().Set("Content-Type", "application/json")
+	select {
+	case authOK := <-session.AuthResult:
+		if authOK {
+			token, err := generateSecureToken(32)
+			if err != nil {
+				s.logger.Error().Err(err).Msg("Failed to generate session token")
+				http.Error(w, "{\"error\":\"Internal server error\"}", http.StatusInternalServerError)
+				return
+			}
+
+			session.Lock()
+			session.Token = token
+			session.Unlock()
+			s.sessionManager.AssociateToken(session)
+
+			http.SetCookie(w, &http.Cookie{
+				Name:     sessionCookieName,
+				Value:    token,
+				Expires:  time.Now().Add(24 * time.Hour),
+				HttpOnly: true,
+				Path:     "/",
+			})
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "{\"status\":\"success\"}")
+		} else {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, "{\"error\":\"Invalid username or password\"}")
+		}
+	case <-time.After(10 * time.Second):
+		w.WriteHeader(http.StatusGatewayTimeout)
+		fmt.Fprint(w, "{\"error\":\"Login request timed out\"}")
+	}
+}
+
+func (s *Server) handleApiLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "{\"error\":\"Method not allowed\"}", http.StatusMethodNotAllowed)
+		return
+	}
+
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil {
+		http.Error(w, "{\"error\":\"Not authenticated\"}", http.StatusUnauthorized)
+		return
+	}
+
+	session, ok := s.sessionManager.GetSessionByToken(cookie.Value)
+	if !ok {
+		http.Error(w, "{\"error\":\"Invalid session\"}", http.StatusUnauthorized)
+		return
+	}
+
+	s.logger.Info().Str("user", session.Redir.Username).Msg("API logout")
+
+	// Clear the cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Expires:  time.Unix(0, 0),
+		HttpOnly: true,
+		Path:     "/",
+	})
+
+	go s.radiusClient.SendAccountingRequest(session, rfc2866.AcctStatusType_Stop)
+	if err := s.firewall.RemoveAuthenticatedUser(session.HisIP); err != nil {
+		s.logger.Error().Err(err).Str("ip", session.HisIP.String()).Msg("Failed to remove firewall rules during API logout")
+	}
+	s.sessionManager.DeleteSession(session)
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, "{\"status\":\"logged_out\"}")
 }

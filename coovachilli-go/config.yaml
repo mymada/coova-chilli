@@ -29,9 +29,12 @@ radiusauthport: 1812
 radiusacctport: 1813
 radiussecret: "secret"
 radiusnasid: "coovachilli-go"
+coaport: 3799
 
 # UAM/Captive Portal settings
 uamport: 8080
+certfile: "" # /etc/coovachilli/cert.pem
+keyfile: ""  # /etc/coovachilli/key.pem
 uamallowed:
   - "www.google.com"
   - "www.google.co.in"

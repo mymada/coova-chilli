@@ -74,6 +74,54 @@ func main() {
 	packetChan := make(chan []byte)
 	go tun.ReadPackets(ifce, packetChan, log.Logger)
 
+	coaReqChan := make(chan radius.CoAIncomingRequest)
+	go radiusClient.StartCoAListener(coaReqChan)
+
+	// CoA processing loop
+	go func() {
+		for req := range coaReqChan {
+			// For now, we only handle Disconnect-Request
+			if req.Packet.Code != radius.CodeDisconnectRequest {
+				log.Warn().Str("code", req.Packet.Code.String()).Msg("Received unhandled CoA/DM code")
+				// Send NAK
+				response := req.Packet.Response(radius.CodeDisconnectNAK)
+				radiusClient.SendCoAResponse(response, req.Peer)
+				continue
+			}
+
+			// Find session to disconnect
+			userName, _ := rfc2865.UserName_GetString(req.Packet)
+			// TODO: Also support finding by NAS-Port-Id, Acct-Session-Id, etc.
+			var sessionToDisconnect *core.Session
+			for _, s := range sessionManager.GetAllSessions() {
+				if s.Redir.Username == userName {
+					sessionToDisconnect = s
+					break
+				}
+			}
+
+			if sessionToDisconnect == nil {
+				log.Warn().Str("user", userName).Msg("Received Disconnect-Request for unknown user")
+				// Per RFC, if user is unknown, send ACK
+				response := req.Packet.Response(radius.CodeDisconnectACK)
+				radiusClient.SendCoAResponse(response, req.Peer)
+				continue
+			}
+
+			log.Info().Str("user", userName).Msg("Disconnecting user per RADIUS request")
+			// Terminate the session
+			go radiusClient.SendAccountingRequest(sessionToDisconnect, rfc2866.AcctStatusType_Stop)
+			if err := fw.RemoveAuthenticatedUser(sessionToDisconnect.HisIP); err != nil {
+				log.Error().Err(err).Str("user", userName).Msg("Failed to remove firewall rules for disconnected user")
+			}
+			sessionManager.DeleteSession(sessionToDisconnect)
+
+			// Send ACK
+			response := req.Packet.Response(radius.CodeDisconnectACK)
+			radiusClient.SendCoAResponse(response, req.Peer)
+		}
+	}()
+
 	// RADIUS processing loop
 	go func() {
 		for session := range radiusReqChan {

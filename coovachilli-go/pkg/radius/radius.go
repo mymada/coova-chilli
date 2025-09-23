@@ -19,6 +19,12 @@ type AccountingSender interface {
 	SendAccountingRequest(session *core.Session, statusType rfc2866.AcctStatusType) (*radius.Packet, error)
 }
 
+// CoAIncomingRequest holds a parsed CoA/Disconnect packet and the sender's address.
+type CoAIncomingRequest struct {
+	Packet *radius.Packet
+	Peer   *net.UDPAddr
+}
+
 // Client holds the state for the RADIUS client.
 type Client struct {
 	cfg    *config.Config
@@ -103,4 +109,55 @@ func (c *Client) SendAccountingRequest(session *core.Session, statusType rfc2866
 
 	c.logger.Debug().Str("code", response.Code.String()).Str("user", session.Redir.Username).Msg("Received RADIUS accounting response")
 	return response, nil
+}
+
+// StartCoAListener listens for incoming CoA and Disconnect requests.
+func (c *Client) StartCoAListener(coaReqChan chan<- CoAIncomingRequest) {
+	addr := fmt.Sprintf(":%d", c.cfg.CoaPort)
+	conn, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		c.logger.Fatal().Err(err).Str("addr", addr).Msg("Failed to start CoA listener")
+		return
+	}
+	defer conn.Close()
+
+	c.logger.Info().Str("addr", addr).Msg("CoA listener started")
+
+	for {
+		buf := make([]byte, 4096)
+		n, peer, err := conn.ReadFrom(buf)
+		if err != nil {
+			c.logger.Error().Err(err).Msg("Error reading from CoA socket")
+			continue
+		}
+
+		packet, err := radius.Parse(buf[:n], []byte(c.cfg.RadiusSecret))
+		if err != nil {
+			c.logger.Error().Err(err).Msg("Failed to parse incoming CoA packet")
+			continue
+		}
+
+		c.logger.Info().Str("code", packet.Code.String()).Str("peer", peer.String()).Msg("Received CoA/Disconnect request")
+		coaReqChan <- CoAIncomingRequest{
+			Packet: packet,
+			Peer:   peer.(*net.UDPAddr),
+		}
+	}
+}
+
+// SendCoAResponse sends a CoA or Disconnect ACK/NAK.
+func (c *Client) SendCoAResponse(response *radius.Packet, peer *net.UDPAddr) error {
+	conn, err := net.DialUDP("udp", nil, peer)
+	if err != nil {
+		return fmt.Errorf("failed to dial peer for CoA response: %w", err)
+	}
+	defer conn.Close()
+
+	_, err = conn.Write(response.Raw)
+	if err != nil {
+		return fmt.Errorf("failed to write CoA response: %w", err)
+	}
+
+	c.logger.Info().Str("code", response.Code.String()).Str("peer", peer.String()).Msg("Sent CoA/Disconnect response")
+	return nil
 }
