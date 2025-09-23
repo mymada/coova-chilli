@@ -1,0 +1,38 @@
+# CoovaChilli-Go Configuration
+
+# General settings
+foreground: true
+pidfile: /var/run/chilli.pid
+interval: 3600s
+
+# TUN/TAP settings
+tundev: tun0
+
+# Network settings
+net: 10.1.0.0/24
+uamlisten: 10.1.0.1
+dhcplisten: 10.1.0.1
+
+# DHCP settings
+dhcpif: eth0
+dhcpstart: 10.1.0.100
+dhcpend: 10.1.0.200
+lease: 1h
+dns1: 8.8.8.8
+dns2: 8.8.4.4
+
+# RADIUS settings
+radiuslisten: 10.1.0.1
+radiusserver1: 127.0.0.1
+radiusauthport: 1812
+radiusacctport: 1813
+radiussecret: "secret"
+radiusnasid: "coovachilli-go"
+
+# UAM/Captive Portal settings
+uamport: 8080
+uamallowed:
+  - "www.google.com"
+  - "www.google.co.in"
+  - "www.github.com"
+  - "github.com"
