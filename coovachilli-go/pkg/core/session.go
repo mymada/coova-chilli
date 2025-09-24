@@ -35,6 +35,12 @@ type Session struct {
 
 	// UAM/Redir state
 	Redir RedirState
+
+	// AuthResult is used to signal the result of an authentication attempt.
+	AuthResult chan bool
+
+	// Token is a secure token for cookie-based auto-login.
+	Token string
 }
 
 // SessionParams holds RADIUS-provisioned session parameters.
@@ -65,17 +71,19 @@ type RedirState struct {
 // SessionManager manages all active sessions.
 type SessionManager struct {
 	sync.RWMutex
-	sessionsByIPv4 map[string]*Session
-	sessionsByIPv6 map[string]*Session
-	sessionsByMAC  map[string]*Session
+	sessionsByIPv4  map[string]*Session
+	sessionsByIPv6  map[string]*Session
+	sessionsByMAC   map[string]*Session
+	sessionsByToken map[string]*Session
 }
 
 // NewSessionManager creates a new SessionManager.
 func NewSessionManager() *SessionManager {
 	return &SessionManager{
-		sessionsByIPv4: make(map[string]*Session),
-		sessionsByIPv6: make(map[string]*Session),
-		sessionsByMAC:  make(map[string]*Session),
+		sessionsByIPv4:  make(map[string]*Session),
+		sessionsByIPv6:  make(map[string]*Session),
+		sessionsByMAC:   make(map[string]*Session),
+		sessionsByToken: make(map[string]*Session),
 	}
 }
 
@@ -85,10 +93,11 @@ func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr) *Sessio
 	defer sm.Unlock()
 
 	session := &Session{
-		HisIP:  ip,
-		HisMAC: mac,
-		StartTime: time.Now(),
-		LastSeen:  time.Now(),
+		HisIP:      ip,
+		HisMAC:     mac,
+		StartTime:  time.Now(),
+		LastSeen:   time.Now(),
+		AuthResult: make(chan bool, 1),
 	}
 
 	if ip.To4() != nil {
@@ -125,6 +134,24 @@ func (sm *SessionManager) GetSessionByMAC(mac net.HardwareAddr) (*Session, bool)
 	return session, ok
 }
 
+// GetSessionByToken returns a session by its auth token.
+func (sm *SessionManager) GetSessionByToken(token string) (*Session, bool) {
+	sm.RLock()
+	defer sm.RUnlock()
+
+	session, ok := sm.sessionsByToken[token]
+	return session, ok
+}
+
+// AssociateToken adds the session to the token lookup map.
+func (sm *SessionManager) AssociateToken(session *Session) {
+	sm.Lock()
+	defer sm.Unlock()
+	if session.Token != "" {
+		sm.sessionsByToken[session.Token] = session
+	}
+}
+
 // DeleteSession deletes a session.
 func (sm *SessionManager) DeleteSession(session *Session) {
 	sm.Lock()
@@ -139,6 +166,9 @@ func (sm *SessionManager) DeleteSession(session *Session) {
 	}
 	if session.HisMAC != nil {
 		delete(sm.sessionsByMAC, session.HisMAC.String())
+	}
+	if session.Token != "" {
+		delete(sm.sessionsByToken, session.Token)
 	}
 }
 

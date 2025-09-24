@@ -15,6 +15,10 @@ dhcplisten: 10.1.0.1
 
 # DHCP settings
 dhcpif: eth0
+extif: eth0
+clientisolation: true
+dhcprelay: false
+dhcpupstream: "" # e.g., 192.168.1.1
 dhcpstart: 10.1.0.100
 dhcpend: 10.1.0.200
 lease: 1h
@@ -28,11 +32,17 @@ radiusauthport: 1812
 radiusacctport: 1813
 radiussecret: "secret"
 radiusnasid: "coovachilli-go"
+coaport: 3799
 
 # UAM/Captive Portal settings
 uamport: 8080
+certfile: "" # /etc/coovachilli/cert.pem
+keyfile: ""  # /etc/coovachilli/key.pem
 uamallowed:
   - "www.google.com"
   - "www.google.co.in"
   - "www.github.com"
   - "github.com"
+
+# Management
+cmdsockpath: /var/run/chilli.sock

@@ -1,0 +1,40 @@
+name: Go Build and Test
+
+on:
+  push:
+    branches: [ "main" ] # Or your default branch
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+
+    - name: Tidy and Verify Modules
+      working-directory: ./coovachilli-go
+      run: |
+        go mod tidy
+        go mod verify
+
+    - name: Run tests
+      working-directory: ./coovachilli-go
+      run: go test -v ./...
+
+    - name: Build
+      working-directory: ./coovachilli-go
+      run: go build -v -o coovachilli-go ./cmd/coovachilli/
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: coovachilli-go-binary
+        path: coovachilli-go/coovachilli-go
