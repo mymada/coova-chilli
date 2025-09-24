@@ -1,11 +1,21 @@
 package core
 
 import (
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net"
+	"os"
 	"sync"
 	"time"
 )
+
+var startTime = time.Now()
+
+// MonotonicTime returns a uint32 representing the number of seconds since the process started.
+func MonotonicTime() uint32 {
+	return uint32(time.Since(startTime).Seconds())
+}
 
 // Session holds the state for a single client session.
 type Session struct {
@@ -17,12 +27,14 @@ type Session struct {
 	HisMAC  net.HardwareAddr
 
 	// Session state
-	Authenticated bool
-	StartTime     time.Time
-	LastSeen      time.Time
-	LastUpTime    time.Time
-	SessionID     string
-	ChilliSessionID string
+	Authenticated       bool
+	StartTime           time.Time
+	LastSeen            time.Time
+	LastUpTime          time.Time
+	SessionID           string
+	ChilliSessionID     string
+	StartTimeSec        uint32 `json:"-"` // Monotonic time, not for persistence
+	LastActivityTimeSec uint32 `json:"-"` // Monotonic time, not for persistence
 
 	// RADIUS parameters
 	SessionParams SessionParams
@@ -55,6 +67,9 @@ type SessionParams struct {
 	InterimInterval  uint32
 	URL              string
 	FilterID         string
+	State            []byte
+	Class            []byte
+	CUI              []byte
 }
 
 // RedirState holds state related to the UAM/redirection process.
@@ -87,17 +102,26 @@ func NewSessionManager() *SessionManager {
 	}
 }
 
+// StateData is the container for serializing persistent state.
+type StateData struct {
+	SaveTime uint32    `json:"save_time"`
+	Sessions []*Session `json:"sessions"`
+}
+
 // CreateSession creates a new session for a client.
 func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr) *Session {
 	sm.Lock()
 	defer sm.Unlock()
 
+	now := MonotonicTime()
 	session := &Session{
-		HisIP:      ip,
-		HisMAC:     mac,
-		StartTime:  time.Now(),
-		LastSeen:   time.Now(),
-		AuthResult: make(chan bool, 1),
+		HisIP:               ip,
+		HisMAC:              mac,
+		StartTime:           time.Now(),
+		LastSeen:            time.Now(),
+		AuthResult:          make(chan bool, 1),
+		StartTimeSec:        now,
+		LastActivityTimeSec: now,
 	}
 
 	if ip.To4() != nil {
@@ -184,4 +208,101 @@ func (sm *SessionManager) GetAllSessions() []*Session {
 		sessions = append(sessions, s)
 	}
 	return sessions
+}
+
+// SaveSessions serializes all active, authenticated sessions to a file.
+func (sm *SessionManager) SaveSessions(path string) error {
+	sm.RLock()
+	defer sm.RUnlock()
+
+	if path == "" {
+		return nil // Nothing to do if no path is configured
+	}
+
+	var sessionsToSave []*Session
+	for _, s := range sm.sessionsByMAC {
+		if s.Authenticated {
+			sessionsToSave = append(sessionsToSave, s)
+		}
+	}
+
+	if len(sessionsToSave) == 0 {
+		return nil // Nothing to save
+	}
+
+	state := StateData{
+		SaveTime: MonotonicTime(),
+		Sessions: sessionsToSave,
+	}
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal sessions: %w", err)
+	}
+
+	return ioutil.WriteFile(path, data, 0644)
+}
+
+// LoadSessions loads sessions from a file, adjusting for downtime.
+func (sm *SessionManager) LoadSessions(path string) error {
+	sm.Lock()
+	defer sm.Unlock()
+
+	if path == "" {
+		return nil
+	}
+
+	data, err := ioutil.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // State file doesn't exist, which is fine on first start
+		}
+		return fmt.Errorf("failed to read state file: %w", err)
+	}
+
+	var state StateData
+	if err := json.Unmarshal(data, &state); err != nil {
+		return fmt.Errorf("failed to unmarshal state file: %w", err)
+	}
+
+	downtime := MonotonicTime() - state.SaveTime
+
+	for _, s := range state.Sessions {
+		// Adjust timeouts
+		if s.SessionParams.SessionTimeout > 0 {
+			if s.SessionParams.SessionTimeout > downtime {
+				s.SessionParams.SessionTimeout -= downtime
+			} else {
+				continue // Session expired while daemon was down
+			}
+		}
+		if s.SessionParams.IdleTimeout > 0 {
+			if s.SessionParams.IdleTimeout > downtime {
+				s.SessionParams.IdleTimeout -= downtime
+			} else {
+				continue // Session expired while daemon was down
+			}
+		}
+
+		// Restore monotonic timestamps relative to the new process start
+		s.StartTimeSec = MonotonicTime() - uint32(time.Since(s.StartTime).Seconds())
+		s.LastActivityTimeSec = MonotonicTime() - uint32(time.Since(s.LastSeen).Seconds())
+
+		// Re-populate the session manager's maps
+		if s.HisIP != nil {
+			if s.HisIP.To4() != nil {
+				sm.sessionsByIPv4[s.HisIP.String()] = s
+			} else {
+				sm.sessionsByIPv6[s.HisIP.String()] = s
+			}
+		}
+		if s.HisMAC != nil {
+			sm.sessionsByMAC[s.HisMAC.String()] = s
+		}
+		if s.Token != "" {
+			sm.sessionsByToken[s.Token] = s
+		}
+	}
+
+	return nil
 }

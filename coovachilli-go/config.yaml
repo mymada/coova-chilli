@@ -46,6 +46,7 @@ uamallowed:
 
 # Management
 cmdsockpath: /var/run/chilli.sock
+statefile: /tmp/chilli.state
 
 # Scripts
 conup: "coovachilli-go/conup.sh"
