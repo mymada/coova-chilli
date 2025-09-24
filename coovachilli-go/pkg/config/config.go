@@ -75,6 +75,7 @@ type Config struct {
 
 	// Management
 	CmdSockPath string `yaml:"cmdsockpath"`
+	StateFile   string `yaml:"statefile"`
 }
 
 // Load loads the configuration from a YAML file.
