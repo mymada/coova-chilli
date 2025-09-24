@@ -43,6 +43,10 @@ uamallowed:
   - "www.google.co.in"
   - "www.github.com"
   - "github.com"
+defsessiontimeout: 86400 # 24 hours
+defidletimeout: 600     # 10 minutes
+defbandwidthmaxdown: 1000000 # 1 Mbps
+defbandwidthmaxup: 256000    # 256 Kbps
 
 # Management
 cmdsockpath: /var/run/chilli.sock

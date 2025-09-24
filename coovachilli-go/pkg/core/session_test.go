@@ -3,6 +3,8 @@ package core
 import (
 	"net"
 	"testing"
+
+	"coovachilli-go/pkg/config"
 )
 
 func TestSessionManager(t *testing.T) {
@@ -12,7 +14,7 @@ func TestSessionManager(t *testing.T) {
 	ip := net.ParseIP("10.1.0.100")
 
 	// Test CreateSession
-	session := sm.CreateSession(ip, mac)
+	session := sm.CreateSession(ip, mac, &config.Config{})
 	if session == nil {
 		t.Fatal("CreateSession should not return nil")
 	}
@@ -44,5 +46,36 @@ func TestSessionManager(t *testing.T) {
 	_, ok = sm.GetSessionByMAC(mac)
 	if ok {
 		t.Fatal("GetSessionByMAC should not find the session after deletion")
+	}
+}
+
+func TestCreateSession_Defaults(t *testing.T) {
+	sm := NewSessionManager()
+	mac, _ := net.ParseMAC("00:00:5e:00:53:02")
+	ip := net.ParseIP("10.1.0.101")
+
+	cfg := &config.Config{
+		DefSessionTimeout:   3600,
+		DefIdleTimeout:      300,
+		DefBandwidthMaxDown: 2000000,
+		DefBandwidthMaxUp:   500000,
+	}
+
+	session := sm.CreateSession(ip, mac, cfg)
+	if session == nil {
+		t.Fatal("CreateSession should not return nil")
+	}
+
+	if session.SessionParams.SessionTimeout != cfg.DefSessionTimeout {
+		t.Errorf("Default SessionTimeout not set correctly: got %d, want %d", session.SessionParams.SessionTimeout, cfg.DefSessionTimeout)
+	}
+	if session.SessionParams.IdleTimeout != cfg.DefIdleTimeout {
+		t.Errorf("Default IdleTimeout not set correctly: got %d, want %d", session.SessionParams.IdleTimeout, cfg.DefIdleTimeout)
+	}
+	if session.SessionParams.BandwidthMaxDown != cfg.DefBandwidthMaxDown {
+		t.Errorf("Default BandwidthMaxDown not set correctly: got %d, want %d", session.SessionParams.BandwidthMaxDown, cfg.DefBandwidthMaxDown)
+	}
+	if session.SessionParams.BandwidthMaxUp != cfg.DefBandwidthMaxUp {
+		t.Errorf("Default BandwidthMaxUp not set correctly: got %d, want %d", session.SessionParams.BandwidthMaxUp, cfg.DefBandwidthMaxUp)
 	}
 }

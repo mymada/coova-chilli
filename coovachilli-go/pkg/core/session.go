@@ -8,6 +8,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"coovachilli-go/pkg/config"
 )
 
 var startTime = time.Now()
@@ -109,7 +111,7 @@ type StateData struct {
 }
 
 // CreateSession creates a new session for a client.
-func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr) *Session {
+func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, cfg *config.Config) *Session {
 	sm.Lock()
 	defer sm.Unlock()
 
@@ -122,6 +124,12 @@ func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr) *Sessio
 		AuthResult:          make(chan bool, 1),
 		StartTimeSec:        now,
 		LastActivityTimeSec: now,
+		SessionParams: SessionParams{
+			SessionTimeout:   cfg.DefSessionTimeout,
+			IdleTimeout:      cfg.DefIdleTimeout,
+			BandwidthMaxDown: cfg.DefBandwidthMaxDown,
+			BandwidthMaxUp:   cfg.DefBandwidthMaxUp,
+		},
 	}
 
 	if ip.To4() != nil {
