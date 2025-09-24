@@ -15,6 +15,7 @@ import (
 	"coovachilli-go/pkg/cmdsock"
 	"coovachilli-go/pkg/http"
 	"coovachilli-go/pkg/radius"
+	"coovachilli-go/pkg/script"
 	"coovachilli-go/pkg/tun"
 
 	"github.com/google/gopacket"
@@ -55,7 +56,24 @@ func main() {
 	}
 	defer fw.Cleanup()
 
+	scriptRunner := script.NewRunner(log.Logger, cfg)
 	sessionManager := core.NewSessionManager()
+
+	// Load previous sessions
+	if err := sessionManager.LoadSessions(cfg.StateFile); err != nil {
+		log.Error().Err(err).Msg("Failed to load sessions from state file")
+	} else {
+		log.Info().Int("count", len(sessionManager.GetAllSessions())).Msg("Reloaded sessions from state file")
+		// Re-apply firewall rules for reloaded sessions
+		for _, s := range sessionManager.GetAllSessions() {
+			if s.Authenticated {
+				if err := fw.AddAuthenticatedUser(s.HisIP); err != nil {
+					log.Error().Err(err).Str("user", s.Redir.Username).Msg("Failed to re-apply firewall rule for loaded session")
+				}
+			}
+		}
+	}
+
 	radiusReqChan := make(chan *core.Session)
 	radiusClient := radius.NewClient(cfg, log.Logger)
 
@@ -134,6 +152,10 @@ func main() {
 			}
 
 			log.Info().Str("user", userName).Msg("Disconnecting user per RADIUS request")
+
+			// Run condown script before terminating
+			scriptRunner.RunScript(cfg.ConDown, sessionToDisconnect, 6) // 6 = Admin-Reset
+
 			// Terminate the session
 			go radiusClient.SendAccountingRequest(sessionToDisconnect, rfc2866.AcctStatusType_Stop)
 			if err := fw.RemoveAuthenticatedUser(sessionToDisconnect.HisIP); err != nil {
@@ -193,6 +215,10 @@ func main() {
 
 				// Send accounting start
 				go radiusClient.SendAccountingRequest(session, rfc2866.AcctStatusType_Start)
+
+				// Run conup script
+				scriptRunner.RunScript(cfg.ConUp, session, 0)
+
 				session.AuthResult <- true
 			} else {
 				log.Warn().Str("user", session.Redir.Username).Str("code", string(resp.Code)).Msg("RADIUS Access-Reject")
@@ -234,6 +260,13 @@ func main() {
 	<-sigChan
 
 	log.Info().Msg("Shutting down CoovaChilli-Go...")
+
+	// Save active sessions to state file
+	if err := sessionManager.SaveSessions(cfg.StateFile); err != nil {
+		log.Error().Err(err).Msg("Failed to save sessions to state file")
+	} else {
+		log.Info().Msg("Successfully saved sessions to state file.")
+	}
 
 	// Perform cleanup tasks here
 	// For example, send accounting stop for all active sessions
