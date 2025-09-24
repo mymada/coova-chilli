@@ -54,14 +54,18 @@ type Config struct {
 	CoaPort            int    `yaml:"coaport"`
 
 	// UAM/Captive Portal settings
-	UAMPort       int      `yaml:"uamport"`
-	UAMUIPort     int      `yaml:"uamuiport"`
-	UAMSecret     string   `yaml:"uamsecret"`
-	CertFile      string   `yaml:"certfile"`
-	KeyFile       string   `yaml:"keyfile"`
-	UAMAllowed    []string `yaml:"uamallowed"`
-	UAMDomains    []string `yaml:"uamdomains"`
-	UAMUrl        string   `yaml:"uamurl"`
+	UAMPort             int      `yaml:"uamport"`
+	UAMUIPort           int      `yaml:"uamuiport"`
+	UAMSecret           string   `yaml:"uamsecret"`
+	CertFile            string   `yaml:"certfile"`
+	KeyFile             string   `yaml:"keyfile"`
+	UAMAllowed          []string `yaml:"uamallowed"`
+	UAMDomains          []string `yaml:"uamdomains"`
+	UAMUrl              string   `yaml:"uamurl"`
+	DefSessionTimeout   uint32   `yaml:"defsessiontimeout"`
+	DefIdleTimeout      uint32   `yaml:"defidletimeout"`
+	DefBandwidthMaxDown uint64   `yaml:"defbandwidthmaxdown"`
+	DefBandwidthMaxUp   uint64   `yaml:"defbandwidthmaxup"`
 
 	// Firewall settings
 	ExtIf             string `yaml:"extif"`

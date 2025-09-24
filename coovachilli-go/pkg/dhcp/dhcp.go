@@ -601,7 +601,7 @@ func (s *Server) handleRequest(req *dhcpv4.DHCPv4) ([]byte, error) {
 			s.logger.Error().Str("mac", req.ClientHWAddr.String()).Msg("No session found for renewing MAC. Denying.")
 			return s.makeNak(req)
 		}
-		session = s.sessionManager.CreateSession(reqIP, req.ClientHWAddr)
+		session = s.sessionManager.CreateSession(reqIP, req.ClientHWAddr, s.cfg)
 	}
 
 	s.radiusReqChan <- session

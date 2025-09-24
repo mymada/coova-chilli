@@ -46,7 +46,7 @@ func TestHandleStatus(t *testing.T) {
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:02")
-	session := sm.CreateSession(clientIP, clientMAC)
+	session := sm.CreateSession(clientIP, clientMAC, &config.Config{})
 	session.Authenticated = true
 	session.Redir.Username = "testuser"
 
@@ -73,7 +73,7 @@ func TestHandleLogout(t *testing.T) {
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:02")
-	sm.CreateSession(clientIP, clientMAC)
+	sm.CreateSession(clientIP, clientMAC, &config.Config{})
 
 	req := httptest.NewRequest("POST", "/logout", nil)
 	rr := httptest.NewRecorder()
@@ -102,7 +102,7 @@ func TestHandleApiStatus(t *testing.T) {
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:02")
-	session := sm.CreateSession(clientIP, clientMAC)
+	session := sm.CreateSession(clientIP, clientMAC, &config.Config{})
 	session.Authenticated = true
 	session.Redir.Username = "testuser"
 
@@ -129,7 +129,7 @@ func TestHandleApiLogout(t *testing.T) {
 	// Create a mock session with a token
 	clientIP := net.ParseIP("10.0.0.15")
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:02")
-	session := sm.CreateSession(clientIP, clientMAC)
+	session := sm.CreateSession(clientIP, clientMAC, &config.Config{})
 	session.Token = "testtoken"
 	sm.AssociateToken(session)
 

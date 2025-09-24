@@ -14,6 +14,7 @@ import (
 	"coovachilli-go/pkg/firewall"
 	"coovachilli-go/pkg/cmdsock"
 	"coovachilli-go/pkg/http"
+	"coovachilli-go/pkg/disconnect"
 	"coovachilli-go/pkg/radius"
 	"coovachilli-go/pkg/script"
 	"coovachilli-go/pkg/tun"
@@ -76,13 +77,18 @@ func main() {
 
 	radiusReqChan := make(chan *core.Session)
 	radiusClient := radius.NewClient(cfg, log.Logger)
+	disconnectManager := disconnect.NewManager(sessionManager, fw, radiusClient, scriptRunner, log.Logger)
+
+	reaper := core.NewReaper(cfg, sessionManager, disconnectManager, log.Logger)
+	reaper.Start()
+	defer reaper.Stop()
 
 	_, err = dhcp.NewServer(cfg, sessionManager, radiusReqChan, log.Logger)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error creating DHCP server")
 	}
 
-	httpServer := http.NewServer(cfg, sessionManager, radiusReqChan, radiusClient, fw, log.Logger)
+	httpServer := http.NewServer(cfg, sessionManager, radiusReqChan, disconnectManager, log.Logger)
 	go httpServer.Start()
 
 	ifce, err := tun.New(cfg, log.Logger)
@@ -151,17 +157,7 @@ func main() {
 				continue
 			}
 
-			log.Info().Str("user", userName).Msg("Disconnecting user per RADIUS request")
-
-			// Run condown script before terminating
-			scriptRunner.RunScript(cfg.ConDown, sessionToDisconnect, 6) // 6 = Admin-Reset
-
-			// Terminate the session
-			go radiusClient.SendAccountingRequest(sessionToDisconnect, rfc2866.AcctStatusType_Stop)
-			if err := fw.RemoveAuthenticatedUser(sessionToDisconnect.HisIP); err != nil {
-				log.Error().Err(err).Str("user", userName).Msg("Failed to remove firewall rules for disconnected user")
-			}
-			sessionManager.DeleteSession(sessionToDisconnect)
+			disconnectManager.Disconnect(sessionToDisconnect, "Admin-Reset")
 
 			// Send ACK
 			response := req.Packet.Response(radius.CodeDisconnectACK)
@@ -272,7 +268,7 @@ func main() {
 	// For example, send accounting stop for all active sessions
 	for _, session := range sessionManager.GetAllSessions() {
 		if session.Authenticated {
-			radiusClient.SendAccountingRequest(session, rfc2866.AcctStatusType_Stop)
+			disconnectManager.Disconnect(session, "NAS-Reboot")
 		}
 	}
 

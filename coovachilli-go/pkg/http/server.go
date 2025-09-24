@@ -62,19 +62,17 @@ type Server struct {
 	cfg            *config.Config
 	sessionManager *core.SessionManager
 	radiusReqChan  chan<- *core.Session
-	radiusClient   radius.AccountingSender
-	firewall       firewall.UserRuleRemover
+	disconnecter   core.Disconnector
 	logger         zerolog.Logger
 }
 
 // NewServer creates a new HTTP server.
-func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<- *core.Session, rc radius.AccountingSender, fw firewall.UserRuleRemover, logger zerolog.Logger) *Server {
+func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<- *core.Session, disconnecter core.Disconnector, logger zerolog.Logger) *Server {
 	return &Server{
 		cfg:            cfg,
 		sessionManager: sm,
 		radiusReqChan:  radiusReqChan,
-		radiusClient:   rc,
-		firewall:       fw,
+		disconnecter:   disconnecter,
 		logger:         logger.With().Str("component", "http").Logger(),
 	}
 }
@@ -246,18 +244,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.logger.Info().Str("user", session.Redir.Username).Str("ip", ip.String()).Msg("Logging out user")
-
-	// Send accounting stop
-	go s.radiusClient.SendAccountingRequest(session, rfc2866.AcctStatusType_Stop)
-
-	// Remove firewall rules
-	if err := s.firewall.RemoveAuthenticatedUser(ip); err != nil {
-		s.logger.Error().Err(err).Str("ip", ip.String()).Msg("Failed to remove firewall rules during logout")
-	}
-
-	// Delete local session
-	s.sessionManager.DeleteSession(session)
+	s.disconnecter.Disconnect(session, "User-Request")
 
 	fmt.Fprint(w, "<h1>You have been logged out.</h1>")
 }
@@ -408,11 +395,7 @@ func (s *Server) handleApiLogout(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 	})
 
-	go s.radiusClient.SendAccountingRequest(session, rfc2866.AcctStatusType_Stop)
-	if err := s.firewall.RemoveAuthenticatedUser(session.HisIP); err != nil {
-		s.logger.Error().Err(err).Str("ip", session.HisIP.String()).Msg("Failed to remove firewall rules during API logout")
-	}
-	s.sessionManager.DeleteSession(session)
+	s.disconnecter.Disconnect(session, "User-Request")
 
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, "{\"status\":\"logged_out\"}")
