@@ -15,6 +15,7 @@ import (
 	"coovachilli-go/pkg/cmdsock"
 	"coovachilli-go/pkg/http"
 	"coovachilli-go/pkg/radius"
+	"coovachilli-go/pkg/script"
 	"coovachilli-go/pkg/tun"
 
 	"github.com/google/gopacket"
@@ -55,6 +56,7 @@ func main() {
 	}
 	defer fw.Cleanup()
 
+	scriptRunner := script.NewRunner(log.Logger, cfg)
 	sessionManager := core.NewSessionManager()
 	radiusReqChan := make(chan *core.Session)
 	radiusClient := radius.NewClient(cfg, log.Logger)
@@ -134,6 +136,10 @@ func main() {
 			}
 
 			log.Info().Str("user", userName).Msg("Disconnecting user per RADIUS request")
+
+			// Run condown script before terminating
+			scriptRunner.RunScript(cfg.ConDown, sessionToDisconnect, 6) // 6 = Admin-Reset
+
 			// Terminate the session
 			go radiusClient.SendAccountingRequest(sessionToDisconnect, rfc2866.AcctStatusType_Stop)
 			if err := fw.RemoveAuthenticatedUser(sessionToDisconnect.HisIP); err != nil {
@@ -193,6 +199,10 @@ func main() {
 
 				// Send accounting start
 				go radiusClient.SendAccountingRequest(session, rfc2866.AcctStatusType_Start)
+
+				// Run conup script
+				scriptRunner.RunScript(cfg.ConUp, session, 0)
+
 				session.AuthResult <- true
 			} else {
 				log.Warn().Str("user", session.Redir.Username).Str("code", string(resp.Code)).Msg("RADIUS Access-Reject")
