@@ -4,44 +4,29 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
-	"time"
 
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
-	"coovachilli-go/pkg/firewall"
-	"coovachilli-go/pkg/radius"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
-	"layeh.com/radius/rfc2866"
 )
 
 // Mock components for testing
-type mockRadius struct {
-	Called bool
+type mockDisconnector struct {
+	Called  bool
+	Session *core.Session
 }
 
-func (m *mockRadius) SendAccountingRequest(session *core.Session, statusType rfc2866.AcctStatusType) (*radius.Packet, error) {
+func (m *mockDisconnector) Disconnect(session *core.Session, reason string) {
 	m.Called = true
-	return nil, nil
-}
-
-type mockFirewall struct {
-	Called bool
-	IP     net.IP
-}
-
-func (m *mockFirewall) RemoveAuthenticatedUser(ip net.IP) error {
-	m.Called = true
-	m.IP = ip
-	return nil
+	m.Session = session
 }
 
 func TestHandleStatus(t *testing.T) {
 	// Setup
 	sm := core.NewSessionManager()
-	server := NewServer(&config.Config{}, sm, nil, nil, nil, zerolog.Nop())
+	server := NewServer(&config.Config{}, sm, nil, nil, zerolog.Nop())
 
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
@@ -66,14 +51,13 @@ func TestHandleStatus(t *testing.T) {
 func TestHandleLogout(t *testing.T) {
 	// Setup
 	sm := core.NewSessionManager()
-	mockFw := &mockFirewall{}
-	mockRadius := &mockRadius{}
-	server := NewServer(&config.Config{}, sm, nil, mockRadius, mockFw, zerolog.Nop())
+	mockDc := &mockDisconnector{}
+	server := NewServer(&config.Config{}, sm, nil, mockDc, zerolog.Nop())
 
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:02")
-	sm.CreateSession(clientIP, clientMAC, &config.Config{})
+	session := sm.CreateSession(clientIP, clientMAC, &config.Config{})
 
 	req := httptest.NewRequest("POST", "/logout", nil)
 	rr := httptest.NewRecorder()
@@ -84,20 +68,15 @@ func TestHandleLogout(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	require.Contains(t, rr.Body.String(), "You have been logged out")
 
-	// Assert that the mocks were called
-	require.True(t, mockFw.Called, "firewall.RemoveAuthenticatedUser should have been called")
-	require.True(t, mockFw.IP.Equal(clientIP), "firewall.RemoveAuthenticatedUser called with wrong IP")
-	require.True(t, mockRadius.Called, "radius.SendAccountingRequest should have been called")
-
-	// Assert that the session was deleted
-	_, ok := sm.GetSessionByIP(clientIP)
-	require.False(t, ok, "Session should have been deleted")
+	// Assert that the disconnector was called
+	require.True(t, mockDc.Called, "Disconnect should have been called")
+	require.Equal(t, session, mockDc.Session, "Disconnect called with wrong session")
 }
 
 func TestHandleApiStatus(t *testing.T) {
 	// Setup
 	sm := core.NewSessionManager()
-	server := NewServer(&config.Config{}, sm, nil, nil, nil, zerolog.Nop())
+	server := NewServer(&config.Config{}, sm, nil, nil, zerolog.Nop())
 
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
@@ -122,9 +101,8 @@ func TestHandleApiStatus(t *testing.T) {
 func TestHandleApiLogout(t *testing.T) {
 	// Setup
 	sm := core.NewSessionManager()
-	mockFw := &mockFirewall{}
-	mockRadius := &mockRadius{}
-	server := NewServer(&config.Config{}, sm, nil, mockRadius, mockFw, zerolog.Nop())
+	mockDc := &mockDisconnector{}
+	server := NewServer(&config.Config{}, sm, nil, mockDc, zerolog.Nop())
 
 	// Create a mock session with a token
 	clientIP := net.ParseIP("10.0.0.15")
@@ -142,11 +120,7 @@ func TestHandleApiLogout(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	require.Contains(t, rr.Body.String(), "logged_out")
 
-	// Assert that the mocks were called
-	require.True(t, mockFw.Called, "firewall.RemoveAuthenticatedUser should have been called")
-	require.True(t, mockRadius.Called, "radius.SendAccountingRequest should have been called")
-
-	// Assert that the session was deleted
-	_, ok := sm.GetSessionByToken("testtoken")
-	require.False(t, ok, "Session should have been deleted")
+	// Assert that the disconnector was called
+	require.True(t, mockDc.Called, "Disconnect should have been called")
+	require.Equal(t, session, mockDc.Session, "Disconnect called with wrong session")
 }

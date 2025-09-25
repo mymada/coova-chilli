@@ -2,7 +2,6 @@ package cmdsock
 
 import (
 	"bufio"
-	"fmt"
 	"net"
 	"os"
 	"strings"

@@ -32,7 +32,9 @@ func TestCoAListener(t *testing.T) {
 	// Send the packet to the listener
 	conn, err := net.Dial("udp", "127.0.0.1:3799")
 	require.NoError(t, err)
-	_, err = conn.Write(packet.Raw)
+	encoded, err := packet.Encode()
+	require.NoError(t, err)
+	_, err = conn.Write(encoded)
 	require.NoError(t, err)
 	conn.Close()
 
@@ -40,7 +42,7 @@ func TestCoAListener(t *testing.T) {
 	select {
 	case req := <-coaReqChan:
 		require.Equal(t, radius.CodeDisconnectRequest, req.Packet.Code)
-		user, _ := rfc2865.UserName_GetString(req.Packet)
+		user := rfc2865.UserName_GetString(req.Packet)
 		require.Equal(t, "testuser", user)
 	case <-time.After(1 * time.Second):
 		t.Fatal("Did not receive CoA request on channel")

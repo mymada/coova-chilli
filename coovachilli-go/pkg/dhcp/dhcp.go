@@ -166,7 +166,7 @@ func (s *Server) listen() {
 				}
 			}
 		case 546, 547: // DHCPv6
-			respBytes, req, err := s.HandleDHCPv6(appLayer.Payload())
+			respBytes, _, err := s.HandleDHCPv6(appLayer.Payload())
 			if err != nil {
 				s.logger.Error().Err(err).Msg("Error handling DHCPv6 packet")
 				continue
@@ -236,12 +236,16 @@ func (s *Server) sendDHCPv6Response(respBytes []byte, reqPacket gopacket.Packet)
 }
 
 func (s *Server) relayDHCPv4(packet gopacket.Packet) error {
-	appLayer := packet.ApplicationLayer()
-	if appLayer == nil {
-		return fmt.Errorf("cannot relay packet without application layer")
+	udpLayer := packet.Layer(layers.LayerTypeUDP)
+	if udpLayer == nil {
+		return fmt.Errorf("cannot relay packet without UDP layer")
+	}
+	udp, _ := udpLayer.(*layers.UDP)
+	if len(udp.Payload) == 0 {
+		return fmt.Errorf("cannot relay packet with empty UDP payload")
 	}
 
-	dhcpPacket, err := dhcpv4.FromBytes(appLayer.Payload())
+	dhcpPacket, err := dhcpv4.FromBytes(udp.Payload)
 	if err != nil {
 		return fmt.Errorf("failed to parse dhcpv4 packet for relay: %w", err)
 	}
@@ -251,7 +255,7 @@ func (s *Server) relayDHCPv4(packet gopacket.Packet) error {
 
 	// Add Relay Agent Information (Option 82)
 	// This is a basic implementation. A production relay would add more sub-options.
-	opt82 := dhcpv4.OptRelayAgentInfo(dhcpv4.OptGeneric(iana.OptionRelayAgentInformation, []byte("coovachilli-go")))
+	opt82 := dhcpv4.OptRelayAgentInfo(dhcpv4.OptGeneric(dhcpv4.OptionRelayAgentInformation, []byte("coovachilli-go")))
 	dhcpPacket.UpdateOption(opt82)
 
 	// Send the packet to the upstream DHCP server
@@ -358,6 +362,10 @@ func (s *Server) HandleDHCPv6(packet []byte) ([]byte, dhcpv6.DHCPv6, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse DHCPv6 request: %w", err)
 	}
+	msg, ok := req.(*dhcpv6.Message)
+	if !ok {
+		return nil, nil, fmt.Errorf("not a regular DHCPv6 message, got %s", req.Type())
+	}
 
 	s.logger.Debug().Str("type", req.Type().String()).Msg("Received DHCPv6 request")
 
@@ -365,9 +373,9 @@ func (s *Server) HandleDHCPv6(packet []byte) ([]byte, dhcpv6.DHCPv6, error) {
 	var resp dhcpv6.DHCPv6
 	switch req.Type() {
 	case dhcpv6.MessageTypeSolicit:
-		resp, err = s.handleSolicit(req)
+		resp, err = s.handleSolicit(msg)
 	case dhcpv6.MessageTypeRequest:
-		resp, err = s.handleRequestV6(req)
+		resp, err = s.handleRequestV6(msg)
 	default:
 		s.logger.Warn().Str("type", req.Type().String()).Msg("Unhandled DHCPv6 message type")
 		return nil, nil, nil
@@ -380,15 +388,10 @@ func (s *Server) HandleDHCPv6(packet []byte) ([]byte, dhcpv6.DHCPv6, error) {
 		return nil, nil, nil
 	}
 
-	respBytes, err := resp.ToBytes()
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to serialize DHCPv6 response: %w", err)
-	}
-
-	return respBytes, req, nil
+	return resp.ToBytes(), req, nil
 }
 
-func (s *Server) handleSolicit(req dhcpv6.DHCPv6) (dhcpv6.DHCPv6, error) {
+func (s *Server) handleSolicit(req *dhcpv6.Message) (dhcpv6.DHCPv6, error) {
 	s.poolV6.Lock()
 	defer s.poolV6.Unlock()
 
@@ -398,65 +401,79 @@ func (s *Server) handleSolicit(req dhcpv6.DHCPv6) (dhcpv6.DHCPv6, error) {
 	}
 
 	// Get client DUID
-	opt := req.GetOneOption(dhcpv6.OptionClientID)
-	if opt == nil {
+	clientDUID := req.Options.ClientID()
+	if clientDUID == nil {
 		return nil, fmt.Errorf("no client DUID in SOLICIT")
 	}
-	clientDUID := opt.(*dhcpv6.OptClientID).DUID
 
 	// Create ADVERTISE response
-	resp, err := dhcpv6.NewAdvertise(req.TransactionID(), clientDUID,
-		dhcpv6.WithServerID(dhcpv6.DUID_LLT{
-			Type:        dhcpv6.DUIDTypeLLT,
-			Time:        dhcpv6.GetTime(),
-			LinkLayer:   iana.HWTypeEthernet,
-			LinkLayerAddr: s.ifaceMAC,
-		}),
-	)
+	resp, err := dhcpv6.NewReplyFromMessage(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create DHCPv6 ADVERTISE: %w", err)
+		return nil, fmt.Errorf("failed to create DHCPv6 reply: %w", err)
 	}
+	resp.MessageType = dhcpv6.MessageTypeAdvertise
+
+	serverDUID := &dhcpv6.DUIDLLT{
+		HWType:        iana.HWTypeEthernet,
+		Time:          dhcpv6.GetTime(),
+		LinkLayerAddr: s.ifaceMAC,
+	}
+	resp.AddOption(dhcpv6.OptServerID(serverDUID))
+	resp.AddOption(dhcpv6.OptClientID(clientDUID))
 
 	// Add the IP address
-	iana := dhcpv6.OptIANA{
-		IaId: req.GetOneOption(dhcpv6.OptionIANA).(*dhcpv6.OptIANA).IaId,
-		Options: dhcpv6.Options{
-			dhcpv6.OptIAAddress{
-				IPv6Address:       ip,
-				PreferredLifetime: 3600 * time.Second,
-				ValidLifetime:     7200 * time.Second,
+	ianaOpt := req.GetOneOption(dhcpv6.OptionIANA)
+	if ianaOpt == nil {
+		return nil, fmt.Errorf("no IANA in SOLICIT")
+	}
+	iaid := ianaOpt.(*dhcpv6.OptIANA).IaId
+
+	ianaResp := dhcpv6.OptIANA{
+		IaId: iaid,
+		T1:   3600 * time.Second,
+		T2:   7200 * time.Second,
+		Options: dhcpv6.IdentityOptions{
+			Options: dhcpv6.Options{
+				&dhcpv6.OptIAAddress{
+					IPv6Addr:          ip,
+					PreferredLifetime: 3600 * time.Second,
+					ValidLifetime:     7200 * time.Second,
+				},
 			},
 		},
 	}
-	resp.AddOption(&iana)
+	resp.AddOption(&ianaResp)
 
 	// Add DNS servers
 	if s.cfg.DNS1V6 != nil {
-		resp.AddOption(dhcpv6.OptDNSRecursiveNameServer(s.cfg.DNS1V6))
+		resp.AddOption(dhcpv6.OptDNS(s.cfg.DNS1V6))
 	}
 	if s.cfg.DNS2V6 != nil {
-		resp.AddOption(dhcpv6.OptDNSRecursiveNameServer(s.cfg.DNS2V6))
+		resp.AddOption(dhcpv6.OptDNS(s.cfg.DNS2V6))
 	}
 
 	s.logger.Info().Str("ip", ip.String()).Msg("Advertising IPv6 address")
 	return resp, nil
 }
 
-func (s *Server) handleRequestV6(req dhcpv6.DHCPv6) (dhcpv6.DHCPv6, error) {
+func (s *Server) handleRequestV6(req *dhcpv6.Message) (dhcpv6.DHCPv6, error) {
 	// Get client DUID
-	opt := req.GetOneOption(dhcpv6.OptionClientID)
-	if opt == nil {
+	clientDUID := req.Options.ClientID()
+	if clientDUID == nil {
 		return nil, fmt.Errorf("no client DUID in REQUEST")
 	}
-	clientDUID := opt.(*dhcpv6.OptClientID).DUID
 
 	// Get the address the client is requesting
-	iana := req.GetOneOption(dhcpv6.OptionIANA).(*dhcpv6.OptIANA)
-	iaAddr := iana.Options.GetOne(dhcpv6.OptionIAAddress).(*dhcpv6.OptIAAddress)
-	if iaAddr == nil {
+	ianaOpt := req.GetOneOption(dhcpv6.OptionIANA)
+	if ianaOpt == nil {
+		return nil, fmt.Errorf("no IANA in REQUEST")
+	}
+	clientIANA := ianaOpt.(*dhcpv6.OptIANA)
+	iaAddrOpt := clientIANA.Options.GetOne(dhcpv6.OptionIAAddr)
+	if iaAddrOpt == nil {
 		return nil, fmt.Errorf("no IAAddress in REQUEST")
 	}
-	reqIP := iaAddr.IPv6Address
+	reqIP := iaAddrOpt.(*dhcpv6.OptIAAddress).IPv6Addr
 
 	// TODO: Validate that the requested IP is valid and was offered by us.
 	// For now, we'll just accept it.
@@ -470,27 +487,31 @@ func (s *Server) handleRequestV6(req dhcpv6.DHCPv6) (dhcpv6.DHCPv6, error) {
 	s.Unlock()
 
 	// Create REPLY response
-	resp, err := dhcpv6.NewReply(req.TransactionID(),
-		dhcpv6.WithServerID(dhcpv6.DUID_LLT{
-			Type:        dhcpv6.DUIDTypeLLT,
-			Time:        dhcpv6.GetTime(),
-			LinkLayer:   iana.HWTypeEthernet,
-			LinkLayerAddr: s.ifaceMAC,
-		}),
-		dhcpv6.WithClientID(clientDUID),
-	)
+	resp, err := dhcpv6.NewReplyFromMessage(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create DHCPv6 REPLY: %w", err)
 	}
 
+	serverDUID := &dhcpv6.DUIDLLT{
+		HWType:        iana.HWTypeEthernet,
+		Time:          dhcpv6.GetTime(),
+		LinkLayerAddr: s.ifaceMAC,
+	}
+	resp.AddOption(dhcpv6.OptServerID(serverDUID))
+	resp.AddOption(dhcpv6.OptClientID(clientDUID))
+
 	// Add the IP address back
 	replyIana := dhcpv6.OptIANA{
-		IaId: iana.IaId,
-		Options: dhcpv6.Options{
-			dhcpv6.OptIAAddress{
-				IPv6Address:       reqIP,
-				PreferredLifetime: 3600 * time.Second,
-				ValidLifetime:     7200 * time.Second,
+		IaId: clientIANA.IaId,
+		T1:   3600 * time.Second,
+		T2:   7200 * time.Second,
+		Options: dhcpv6.IdentityOptions{
+			Options: dhcpv6.Options{
+				&dhcpv6.OptIAAddress{
+					IPv6Addr:          reqIP,
+					PreferredLifetime: 3600 * time.Second,
+					ValidLifetime:     7200 * time.Second,
+				},
 			},
 		},
 	}
@@ -498,10 +519,10 @@ func (s *Server) handleRequestV6(req dhcpv6.DHCPv6) (dhcpv6.DHCPv6, error) {
 
 	// Add DNS servers
 	if s.cfg.DNS1V6 != nil {
-		resp.AddOption(dhcpv6.OptDNSRecursiveNameServer(s.cfg.DNS1V6))
+		resp.AddOption(dhcpv6.OptDNS(s.cfg.DNS1V6))
 	}
 	if s.cfg.DNS2V6 != nil {
-		resp.AddOption(dhcpv6.OptDNSRecursiveNameServer(s.cfg.DNS2V6))
+		resp.AddOption(dhcpv6.OptDNS(s.cfg.DNS2V6))
 	}
 
 	s.logger.Info().Str("ip", reqIP.String()).Msg("Replying to DHCPv6 request")

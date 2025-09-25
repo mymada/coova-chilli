@@ -5,7 +5,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 
 	"coovachilli-go/pkg/config"
@@ -77,10 +76,10 @@ func (r *Runner) buildEnv(session *core.Session, terminateCause int) []string {
 	env = setEnv(env, "COOVACHILLI_MAX_TOTAL_OCTETS", session.SessionParams.MaxTotalOctets)
 
 	// Accounting Details
-	env = setEnv(env, "INPUT_OCTETS", session.AcctInputOctets)
-	env = setEnv(env, "OUTPUT_OCTETS", session.AcctOutputOctets)
-	env = setEnv(env, "INPUT_PACKETS", session.AcctInputPackets)
-	env = setEnv(env, "OUTPUT_PACKETS", session.AcctOutputPackets)
+	env = setEnv(env, "INPUT_OCTETS", session.InputOctets)
+	env = setEnv(env, "OUTPUT_OCTETS", session.OutputOctets)
+	env = setEnv(env, "INPUT_PACKETS", session.InputPackets)
+	env = setEnv(env, "OUTPUT_PACKETS", session.OutputPackets)
 
 	// Timestamps
 	sessionTime := uint32(0)
@@ -89,7 +88,7 @@ func (r *Runner) buildEnv(session *core.Session, terminateCause int) []string {
 	if !session.StartTime.IsZero() {
 		sessionTime = now - session.StartTimeSec
 	}
-	if !session.LastActivityTime.IsZero() {
+	if !session.LastSeen.IsZero() {
 		idleTime = now - session.LastActivityTimeSec
 	}
 	env = setEnv(env, "SESSION_TIME", sessionTime)
