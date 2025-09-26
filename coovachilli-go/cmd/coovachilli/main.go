@@ -23,6 +23,7 @@ import (
 	"github.com/rs/zerolog/log"
 	layehradius "layeh.com/radius"
 	"layeh.com/radius/rfc2865"
+	"layeh.com/radius/rfc2866"
 	"layeh.com/radius/vendors/wispr"
 
 	"coovachilli-go/pkg/auth"
@@ -220,7 +221,7 @@ func main() {
 					}
 
 					// Send accounting start
-					// go radiusClient.SendAccountingRequest(s, rfc2866.AcctStatusType_Start)
+					go radiusClient.SendAccountingRequest(s, rfc2866.AcctStatusType(1)) // 1 = Start
 					// Run conup script
 					scriptRunner.RunScript(cfg.ConUp, s, 0)
 					s.AuthResult <- true

@@ -7,6 +7,7 @@ import (
 	"coovachilli-go/pkg/radius"
 	"coovachilli-go/pkg/script"
 	"github.com/rs/zerolog"
+	"layeh.com/radius/rfc2866"
 )
 
 // Manager handles the logic for disconnecting a user session.
@@ -50,12 +51,12 @@ func (m *Manager) Disconnect(session *core.Session, reason string) {
 		Msg("Disconnecting session")
 
 	// 1. Send RADIUS Accounting-Stop packet
-	// if m.radiusClient != nil {
-	// 	_, err := m.radiusClient.SendAccountingRequest(session, rfc2866.AcctStatusType_Stop)
-	// 	if err != nil {
-	// 		m.logger.Error().Err(err).Msg("Failed to send RADIUS accounting stop packet")
-	// 	}
-	// }
+	if m.radiusClient != nil {
+		_, err := m.radiusClient.SendAccountingRequest(session, rfc2866.AcctStatusType(2)) // 2 = Stop
+		if err != nil {
+			m.logger.Error().Err(err).Msg("Failed to send RADIUS accounting stop packet")
+		}
+	}
 
 	// 2. Run connection-down script
 	if m.scriptRunner != nil {

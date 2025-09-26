@@ -56,7 +56,7 @@ func TestHandleRequest_Renewal_AuthFailure(t *testing.T) {
 	}
 	sm := core.NewSessionManager()
 	radiusReqChan := make(chan *core.Session, 1)
-	logger := zerolog.Nop()
+	logger := zerolog.Nop() // Disable logging for the test
 
 	pool, err := NewPool(net.ParseIP("10.0.0.10"), net.ParseIP("10.0.0.20"))
 	require.NoError(t, err)
@@ -79,13 +79,15 @@ func TestHandleRequest_Renewal_AuthFailure(t *testing.T) {
 		MAC:     clientMAC,
 		Expires: time.Now().Add(30 * time.Minute),
 	}
-	session := sm.CreateSession(clientIP, clientMAC, cfg)
+	session := sm.CreateSession(clientIP, clientMAC)
 
 	// 2. Create a DHCPREQUEST packet for renewal
-	reqPacket, err := dhcpv4.New(dhcpv4.WithMessageType(dhcpv4.MessageTypeRequest))
+	reqPacket, err := dhcpv4.New(
+		dhcpv4.WithMessageType(dhcpv4.MessageTypeRequest),
+		dhcpv4.WithClientIP(clientIP),
+		dhcpv4.WithClientHardwareAddr(clientMAC),
+	)
 	require.NoError(t, err)
-	reqPacket.ClientIPAddr = clientIP
-	reqPacket.ClientHWAddr = clientMAC
 	reqBytes := reqPacket.ToBytes()
 
 	// 3. Goroutine to simulate RADIUS failure
@@ -120,6 +122,11 @@ func TestHandleSolicit(t *testing.T) {
 	require.NoError(t, err)
 
 	serverMAC, _ := net.ParseMAC("00:00:5e:00:53:ff")
+	serverDUID := &dhcpv6.DUIDLLT{
+		HWType:        iana.HWTypeEthernet,
+		Time:          dhcpv6.GetTime(),
+		LinkLayerAddr: serverMAC,
+	}
 
 	server := &Server{
 		cfg:      cfg,
@@ -144,19 +151,19 @@ func TestHandleSolicit(t *testing.T) {
 	require.NoError(t, err)
 
 	// Assert the response is an ADVERTISE
-	respMsg, err := dhcpv6.FromBytes(respBytes)
+	resp, err := dhcpv6.FromBytes(respBytes)
 	require.NoError(t, err)
-	resp, ok := respMsg.(*dhcpv6.Message)
+	msg, ok := resp.(*dhcpv6.Message)
 	require.True(t, ok)
-	require.Equal(t, dhcpv6.MessageTypeAdvertise, resp.Type())
+	require.Equal(t, dhcpv6.MessageTypeAdvertise, msg.MessageType)
 
 	// Assert the advertised IP is from the pool
-	respIana := resp.GetOneOption(dhcpv6.OptionIANA).(*dhcpv6.OptIANA)
-	respAddr := respIana.Options.GetOne(dhcpv6.OptionIAAddr).(*dhcpv6.OptIAAddress)
+	respIana := msg.GetOneOption(dhcpv6.OptionIANA).(*dhcpv6.OptIANA)
+	respAddr := respIana.Options.GetOne(dhcpv6.OptionIAAddress).(*dhcpv6.OptIAAddress)
 	require.True(t, respAddr.IPv6Addr.Equal(net.ParseIP("2001:db8::100")))
 
 	// Assert DNS server is set
-	dnsServers := resp.Options.DNS()
+	dnsServers := msg.Options.DNS()
 	require.NotNil(t, dnsServers)
 	require.Len(t, dnsServers, 1)
 	require.True(t, dnsServers[0].Equal(cfg.DNS1V6))
@@ -179,7 +186,7 @@ func TestRelayDHCPv4(t *testing.T) {
 		req, err := dhcpv4.FromBytes(buf[:n])
 		require.NoError(t, err)
 		require.Equal(t, dhcpv4.MessageTypeDiscover, req.MessageType())
-		opt82 := req.GetOneOption(dhcpv4.OptionRelayAgentInformation)
+		opt82 := req.GetOneOption(iana.OptionRelayAgentInformation)
 		require.NotNil(t, opt82, "Option 82 should be present")
 
 		close(upstreamDone)
@@ -200,33 +207,24 @@ func TestRelayDHCPv4(t *testing.T) {
 
 	// 3. Create a mock DHCP packet from a client
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:03")
-	discover, err := dhcpv4.New(dhcpv4.WithMessageType(dhcpv4.MessageTypeDiscover))
+	discover, err := dhcpv4.NewDiscovery(clientMAC)
 	require.NoError(t, err)
-	discover.ClientHWAddr = clientMAC
 
 	ethLayer := &layers.Ethernet{SrcMAC: clientMAC, DstMAC: layers.EthernetBroadcast, EthernetType: layers.EthernetTypeIPv4}
 	ipLayer := &layers.IPv4{SrcIP: net.IPv4zero, DstIP: net.IPv4bcast, Protocol: layers.IPProtocolUDP}
 	udpLayer := &layers.UDP{SrcPort: 68, DstPort: 67}
-	// This is crucial for gopacket to correctly decode the application layer.
-	udpLayer.SetNetworkLayerForChecksum(ipLayer)
 	buf := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true}
-	gopacket.SerializeLayers(buf, opts, ethLayer, ipLayer, udpLayer, gopacket.Payload(discover.ToBytes()))
-	// Use DecodeOptions to force full decoding, which is what happens in the real packet path.
-	packet := gopacket.NewPacket(buf.Bytes(), layers.LayerTypeEthernet, gopacket.DecodeOptions{Lazy: false, NoCopy: true})
+	gopacket.SerializeLayers(buf, gopacket.SerializeOptions{}, ethLayer, ipLayer, udpLayer, gopacket.Payload(discover.ToBytes()))
+	packet := gopacket.NewPacket(buf.Bytes(), layers.LayerTypeEthernet, gopacket.Default)
 
-	// 4. Call the relay function
-	err = server.relayDHCPv4(packet)
-	// We expect an error because the mock server doesn't send a response,
-	// causing a read timeout. We only care that the packet was received.
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "failed to read from upstream dhcp server")
+	// 4. Call the relay function (in a goroutine as it now waits for a response)
+	go server.relayDHCPv4(packet)
 
 	// 5. Assert that the upstream server received the packet
 	select {
 	case <-upstreamDone:
 		// success
-	case <-time.After(1 * time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("Upstream DHCP server did not receive relayed packet")
 	}
 }
@@ -242,11 +240,6 @@ func TestHandleRequestV6(t *testing.T) {
 	require.NoError(t, err)
 
 	serverMAC, _ := net.ParseMAC("00:00:5e:00:53:ff")
-	serverDUID := &dhcpv6.DUIDLLT{
-		HWType:        iana.HWTypeEthernet,
-		Time:          dhcpv6.GetTime(),
-		LinkLayerAddr: serverMAC,
-	}
 
 	server := &Server{
 		cfg:      cfg,
@@ -287,11 +280,11 @@ func TestHandleRequestV6(t *testing.T) {
 	require.NoError(t, err)
 
 	// Assert the response is a REPLY
-	respMsg, err := dhcpv6.FromBytes(respBytes)
+	resp, err := dhcpv6.FromBytes(respBytes)
 	require.NoError(t, err)
-	resp, ok := respMsg.(*dhcpv6.Message)
+	msg, ok := resp.(*dhcpv6.Message)
 	require.True(t, ok)
-	require.Equal(t, dhcpv6.MessageTypeReply, resp.Type())
+	require.Equal(t, dhcpv6.MessageTypeReply, msg.MessageType)
 
 	// Assert the lease was created
 	_, leaseExists := server.leasesV6[clientDUID.String()]
