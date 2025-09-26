@@ -11,10 +11,7 @@ import (
 
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
-	"coovachilli-go/pkg/firewall"
-	"coovachilli-go/pkg/radius"
 	"github.com/rs/zerolog"
-	"layeh.com/radius/rfc2866"
 )
 
 const loginPage = `

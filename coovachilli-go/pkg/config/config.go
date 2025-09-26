@@ -57,6 +57,8 @@ type Config struct {
 	UAMPort             int      `yaml:"uamport"`
 	UAMUIPort           int      `yaml:"uamuiport"`
 	UAMSecret           string   `yaml:"uamsecret"`
+	UseLocalUsers       bool     `yaml:"uselocalusers"`
+	LocalUsersFile      string   `yaml:"localusersfile"`
 	CertFile            string   `yaml:"certfile"`
 	KeyFile             string   `yaml:"keyfile"`
 	UAMAllowed          []string `yaml:"uamallowed"`
@@ -68,10 +70,12 @@ type Config struct {
 	DefBandwidthMaxUp   uint64   `yaml:"defbandwidthmaxup"`
 
 	// Firewall settings
-	ExtIf             string `yaml:"extif"`
-	ClientIsolation   bool   `yaml:"clientisolation"`
-	IPTables          string `yaml:"iptables"`
-	IP6Tables         string `yaml:"ip6tables"`
+	ExtIf             string   `yaml:"extif"`
+	ClientIsolation   bool     `yaml:"clientisolation"`
+	IPTables          string   `yaml:"iptables"`
+	IP6Tables         string   `yaml:"ip6tables"`
+	TCPPorts          []int    `yaml:"tcpports"`
+	UDPPorts          []int    `yaml:"udpports"`
 
 	// Scripts
 	ConUp   string `yaml:"conup"`

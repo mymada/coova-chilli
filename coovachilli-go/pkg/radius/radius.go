@@ -54,7 +54,11 @@ func (c *Client) SendAccessRequest(session *core.Session, username, password str
 		rfc2865.FramedIPAddress_Set(packet, session.HisIP)
 	}
 	if session.HisIPv6 != nil {
-		rfc3162.FramedIP6Prefix_Set(packet, 128, session.HisIPv6)
+		prefix := &net.IPNet{
+			IP:   session.HisIPv6,
+			Mask: net.CIDRMask(128, 128),
+		}
+		rfc3162.FramedIPv6Prefix_Add(packet, prefix)
 	}
 
 	// Add MAC address
@@ -83,18 +87,22 @@ func (c *Client) SendAccountingRequest(session *core.Session, statusType rfc2866
 	rfc2865.NASIPAddress_Set(packet, c.cfg.RadiusListen)
 
 	// Add accounting data
-	rfc2866.AcctInputOctets_Set(packet, uint32(session.InputOctets))
-	rfc2866.AcctOutputOctets_Set(packet, uint32(session.OutputOctets))
-	rfc2866.AcctInputPackets_Set(packet, uint32(session.InputPackets))
-	rfc2866.AcctOutputPackets_Set(packet, uint32(session.OutputPackets))
-	rfc2866.AcctSessionTime_Set(packet, uint32(session.LastSeen.Sub(session.StartTime).Seconds()))
+	rfc2866.AcctInputOctets_Set(packet, rfc2866.AcctInputOctets(session.InputOctets))
+	rfc2866.AcctOutputOctets_Set(packet, rfc2866.AcctOutputOctets(session.OutputOctets))
+	rfc2866.AcctInputPackets_Set(packet, rfc2866.AcctInputPackets(session.InputPackets))
+	rfc2866.AcctOutputPackets_Set(packet, rfc2866.AcctOutputPackets(session.OutputPackets))
+	rfc2866.AcctSessionTime_Set(packet, rfc2866.AcctSessionTime(session.LastSeen.Sub(session.StartTime).Seconds()))
 
 	// Add IPv4 and IPv6 attributes if available
 	if session.HisIP != nil && session.HisIP.To4() != nil {
 		rfc2865.FramedIPAddress_Set(packet, session.HisIP)
 	}
 	if session.HisIPv6 != nil {
-		rfc3162.FramedIP6Prefix_Set(packet, 128, session.HisIPv6)
+		prefix := &net.IPNet{
+			IP:   session.HisIPv6,
+			Mask: net.CIDRMask(128, 128),
+		}
+		rfc3162.FramedIPv6Prefix_Add(packet, prefix)
 	}
 
 	// Add MAC address
@@ -153,7 +161,12 @@ func (c *Client) SendCoAResponse(response *radius.Packet, peer *net.UDPAddr) err
 	}
 	defer conn.Close()
 
-	_, err = conn.Write(response.Raw)
+	encoded, err := response.Encode()
+	if err != nil {
+		return fmt.Errorf("failed to encode CoA response: %w", err)
+	}
+
+	_, err = conn.Write(encoded)
 	if err != nil {
 		return fmt.Errorf("failed to write CoA response: %w", err)
 	}

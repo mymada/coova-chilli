@@ -388,7 +388,7 @@ func (s *Server) HandleDHCPv6(packet []byte) ([]byte, dhcpv6.DHCPv6, error) {
 	return respBytes, req, nil
 }
 
-func (s *Server) handleSolicit(req dhcpv6.DHCPv6) (dhcpv6.DHCPv6, error) {
+func (s *Server) handleSolicit(req *dhcpv6.Message) (dhcpv6.DHCPv6, error) {
 	s.poolV6.Lock()
 	defer s.poolV6.Unlock()
 
@@ -397,40 +397,42 @@ func (s *Server) handleSolicit(req dhcpv6.DHCPv6) (dhcpv6.DHCPv6, error) {
 		return nil, err
 	}
 
-	// Get client DUID
-	opt := req.GetOneOption(dhcpv6.OptionClientID)
-	if opt == nil {
+	clientDUIDOpt := req.GetOneOption(dhcpv6.OptionClientID)
+	if clientDUIDOpt == nil {
 		return nil, fmt.Errorf("no client DUID in SOLICIT")
 	}
-	clientDUID := opt.(*dhcpv6.OptClientID).DUID
 
-	// Create ADVERTISE response
-	resp, err := dhcpv6.NewAdvertise(req.TransactionID(), clientDUID,
-		dhcpv6.WithServerID(dhcpv6.DUID_LLT{
-			Type:        dhcpv6.DUIDTypeLLT,
-			Time:        dhcpv6.GetTime(),
-			LinkLayer:   iana.HWTypeEthernet,
-			LinkLayerAddr: s.ifaceMAC,
-		}),
-	)
+	resp, err := dhcpv6.NewReplyFromMessage(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create DHCPv6 ADVERTISE: %w", err)
+		return nil, fmt.Errorf("failed to create DHCPv6 reply: %w", err)
 	}
+	resp.MessageType = dhcpv6.MessageTypeAdvertise
 
-	// Add the IP address
-	iana := dhcpv6.OptIANA{
-		IaId: req.GetOneOption(dhcpv6.OptionIANA).(*dhcpv6.OptIANA).IaId,
-		Options: dhcpv6.Options{
-			dhcpv6.OptIAAddress{
-				IPv6Address:       ip,
-				PreferredLifetime: 3600 * time.Second,
-				ValidLifetime:     7200 * time.Second,
-			},
-		},
+	serverDUID := &dhcpv6.DUIDLLT{
+		HWType:        iana.HWTypeEthernet,
+		Time:          dhcpv6.GetTime(),
+		LinkLayerAddr: s.ifaceMAC,
 	}
-	resp.AddOption(&iana)
+	resp.AddOption(dhcpv6.OptServerID(serverDUID))
+	resp.AddOption(clientDUIDOpt)
 
-	// Add DNS servers
+	ianaOpt := req.GetOneOption(dhcpv6.OptionIANA)
+	if ianaOpt == nil {
+		return nil, fmt.Errorf("no IANA in SOLICIT")
+	}
+	iana := &dhcpv6.OptIANA{
+		IaId: ianaOpt.(*dhcpv6.OptIANA).IaId,
+		T1:   3600 * time.Second,
+		T2:   7200 * time.Second,
+	}
+	iaAddr := &dhcpv6.OptIAAddress{
+		IPv6Addr:          ip,
+		PreferredLifetime: 3600 * time.Second,
+		ValidLifetime:     7200 * time.Second,
+	}
+	iana.Options.Add(iaAddr)
+	resp.AddOption(iana)
+
 	if s.cfg.DNS1V6 != nil {
 		resp.AddOption(dhcpv6.OptDNSRecursiveNameServer(s.cfg.DNS1V6))
 	}
@@ -442,61 +444,51 @@ func (s *Server) handleSolicit(req dhcpv6.DHCPv6) (dhcpv6.DHCPv6, error) {
 	return resp, nil
 }
 
-func (s *Server) handleRequestV6(req dhcpv6.DHCPv6) (dhcpv6.DHCPv6, error) {
-	// Get client DUID
-	opt := req.GetOneOption(dhcpv6.OptionClientID)
-	if opt == nil {
+func (s *Server) handleRequestV6(req *dhcpv6.Message) (dhcpv6.DHCPv6, error) {
+	clientDUIDOpt := req.GetOneOption(dhcpv6.OptionClientID)
+	if clientDUIDOpt == nil {
 		return nil, fmt.Errorf("no client DUID in REQUEST")
 	}
-	clientDUID := opt.(*dhcpv6.OptClientID).DUID
 
-	// Get the address the client is requesting
-	iana := req.GetOneOption(dhcpv6.OptionIANA).(*dhcpv6.OptIANA)
-	iaAddr := iana.Options.GetOne(dhcpv6.OptionIAAddress).(*dhcpv6.OptIAAddress)
-	if iaAddr == nil {
+	ianaOpt := req.GetOneOption(dhcpv6.OptionIANA)
+	if ianaOpt == nil {
+		return nil, fmt.Errorf("no IANA in REQUEST")
+	}
+	iana := ianaOpt.(*dhcpv6.OptIANA)
+	iaAddrOpt := iana.Options.GetOne(dhcpv6.OptionIAAddress)
+	if iaAddrOpt == nil {
 		return nil, fmt.Errorf("no IAAddress in REQUEST")
 	}
-	reqIP := iaAddr.IPv6Address
+	reqIP := iaAddrOpt.(*dhcpv6.OptIAAddress).IPv6Addr
 
-	// TODO: Validate that the requested IP is valid and was offered by us.
-	// For now, we'll just accept it.
-
-	// Create lease
 	s.Lock()
-	s.leasesV6[clientDUID.String()] = &Lease{
+	s.leasesV6[clientDUIDOpt.(*dhcpv6.OptClientID).DUID.String()] = &Lease{
 		IP:      reqIP,
 		Expires: time.Now().Add(s.cfg.Lease),
 	}
 	s.Unlock()
 
-	// Create REPLY response
-	resp, err := dhcpv6.NewReply(req.TransactionID(),
-		dhcpv6.WithServerID(dhcpv6.DUID_LLT{
-			Type:        dhcpv6.DUIDTypeLLT,
-			Time:        dhcpv6.GetTime(),
-			LinkLayer:   iana.HWTypeEthernet,
-			LinkLayerAddr: s.ifaceMAC,
-		}),
-		dhcpv6.WithClientID(clientDUID),
-	)
+	resp, err := dhcpv6.NewReplyFromMessage(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create DHCPv6 REPLY: %w", err)
+		return nil, fmt.Errorf("failed to create DHCPv6 reply: %w", err)
 	}
 
-	// Add the IP address back
-	replyIana := dhcpv6.OptIANA{
+	serverDUID := &dhcpv6.DUIDLLT{
+		HWType:        iana.HWTypeEthernet,
+		Time:          dhcpv6.GetTime(),
+		LinkLayerAddr: s.ifaceMAC,
+	}
+	resp.AddOption(dhcpv6.OptServerID(serverDUID))
+	resp.AddOption(clientDUIDOpt)
+
+	replyIana := &dhcpv6.OptIANA{
 		IaId: iana.IaId,
-		Options: dhcpv6.Options{
-			dhcpv6.OptIAAddress{
-				IPv6Address:       reqIP,
-				PreferredLifetime: 3600 * time.Second,
-				ValidLifetime:     7200 * time.Second,
-			},
-		},
+		T1:   3600 * time.Second,
+		T2:   7200 * time.Second,
 	}
-	resp.AddOption(&replyIana)
+	replyIana.Options.Add(iaAddrOpt)
+	resp.AddOption(replyIana)
 
-	// Add DNS servers
 	if s.cfg.DNS1V6 != nil {
 		resp.AddOption(dhcpv6.OptDNSRecursiveNameServer(s.cfg.DNS1V6))
 	}

@@ -19,11 +19,22 @@ const (
 	chainWalledGarden = "chilli_walled_garden"
 )
 
+// IPTables is an interface that wraps the go-iptables methods used by the firewall.
+// This allows for mocking in tests.
+type IPTables interface {
+	Append(table, chain string, rulespec ...string) error
+	Insert(table, chain string, pos int, rulespec ...string) error
+	Delete(table, chain string, rulespec ...string) error
+	NewChain(table, chain string) error
+	ClearChain(table, chain string) error
+	DeleteChain(table, chain string) error
+}
+
 // Firewall manages the system's firewall rules.
 type Firewall struct {
 	cfg    *config.Config
-	ipt    *iptables.IPTables
-	ip6t   *iptables.IPTables
+	ipt    IPTables
+	ip6t   IPTables
 	logger zerolog.Logger
 }
 
@@ -34,10 +45,13 @@ func NewFirewall(cfg *config.Config, logger zerolog.Logger) (*Firewall, error) {
 		return nil, fmt.Errorf("failed to create iptables handler: %w", err)
 	}
 
-	ip6t, err := iptables.NewWithProtocol(iptables.ProtocolIPv6)
+	var ip6t IPTables
+	ip6tReal, err := iptables.NewWithProtocol(iptables.ProtocolIPv6)
 	if err != nil {
-		// We can log this as a warning and continue, in case IPv6 is not supported
 		logger.Warn().Err(err).Msg("Failed to create ip6tables handler, IPv6 firewall will be disabled")
+		ip6t = nil // Explicitly set to nil if there's an error
+	} else {
+		ip6t = ip6tReal
 	}
 
 	return &Firewall{
@@ -89,6 +103,18 @@ func (f *Firewall) Initialize() error {
 	for _, domain := range f.cfg.UAMAllowed {
 		if err := f.ipt.Append("nat", chainWalledGarden, "-d", domain, "-j", "RETURN"); err != nil {
 			return fmt.Errorf("failed to add walled garden rule for %s: %w", domain, err)
+		}
+	}
+
+	// Open specified TCP/UDP ports for all users
+	for _, port := range f.cfg.TCPPorts {
+		if err := f.ipt.Append("filter", chainChilli, "-p", "tcp", "--dport", fmt.Sprintf("%d", port), "-j", "ACCEPT"); err != nil {
+			return fmt.Errorf("failed to add open TCP port rule for port %d: %w", port, err)
+		}
+	}
+	for _, port := range f.cfg.UDPPorts {
+		if err := f.ipt.Append("filter", chainChilli, "-p", "udp", "--dport", fmt.Sprintf("%d", port), "-j", "ACCEPT"); err != nil {
+			return fmt.Errorf("failed to add open UDP port rule for port %d: %w", port, err)
 		}
 	}
 

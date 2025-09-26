@@ -122,6 +122,11 @@ func TestHandleSolicit(t *testing.T) {
 	require.NoError(t, err)
 
 	serverMAC, _ := net.ParseMAC("00:00:5e:00:53:ff")
+	serverDUID := &dhcpv6.DUIDLLT{
+		HWType:        iana.HWTypeEthernet,
+		Time:          dhcpv6.GetTime(),
+		LinkLayerAddr: serverMAC,
+	}
 
 	server := &Server{
 		cfg:      cfg,
@@ -133,8 +138,12 @@ func TestHandleSolicit(t *testing.T) {
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:01")
 
 	// Create a SOLICIT packet
-	req, err := dhcpv6.NewSolicit(clientMAC)
+	req, err := dhcpv6.NewMessage()
 	require.NoError(t, err)
+	req.MessageType = dhcpv6.MessageTypeSolicit
+	req.AddOption(dhcpv6.OptClientID(&dhcpv6.DUIDLL{LinkLayerAddr: clientMAC}))
+	req.AddOption(&dhcpv6.OptIANA{})
+	req.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionRapidCommit, OptionData: []byte{}})
 	reqBytes := req.ToBytes()
 
 	// Call the handler
@@ -144,17 +153,18 @@ func TestHandleSolicit(t *testing.T) {
 	// Assert the response is an ADVERTISE
 	resp, err := dhcpv6.FromBytes(respBytes)
 	require.NoError(t, err)
-	require.Equal(t, dhcpv6.MessageTypeAdvertise, resp.Type())
+	msg, ok := resp.(*dhcpv6.Message)
+	require.True(t, ok)
+	require.Equal(t, dhcpv6.MessageTypeAdvertise, msg.MessageType)
 
 	// Assert the advertised IP is from the pool
-	respIana := resp.GetOneOption(dhcpv6.OptionIANA).(*dhcpv6.OptIANA)
+	respIana := msg.GetOneOption(dhcpv6.OptionIANA).(*dhcpv6.OptIANA)
 	respAddr := respIana.Options.GetOne(dhcpv6.OptionIAAddress).(*dhcpv6.OptIAAddress)
-	require.True(t, respAddr.IPv6Address.Equal(net.ParseIP("2001:db8::100")))
+	require.True(t, respAddr.IPv6Addr.Equal(net.ParseIP("2001:db8::100")))
 
 	// Assert DNS server is set
-	dnsOpt := resp.GetOneOption(dhcpv6.OptionDNSRecursiveNameServer)
-	require.NotNil(t, dnsOpt)
-	dnsServers := dnsOpt.(*dhcpv6.OptDNSRecursiveNameServer).NameServers
+	dnsServers := msg.Options.DNS()
+	require.NotNil(t, dnsServers)
 	require.Len(t, dnsServers, 1)
 	require.True(t, dnsServers[0].Equal(cfg.DNS1V6))
 }
@@ -240,20 +250,30 @@ func TestHandleRequestV6(t *testing.T) {
 	}
 
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:01")
-	clientDUID := dhcpv6.DUID_LL{
-		Type:          dhcpv6.DUIDTypeLL,
-		LinkLayer:     iana.HWTypeEthernet,
+	clientDUID := &dhcpv6.DUIDLL{
+		HWType:        iana.HWTypeEthernet,
 		LinkLayerAddr: clientMAC,
 	}
 	requestedIP := net.ParseIP("2001:db8::150")
 
 	// Create a REQUEST packet
-	req, err := dhcpv6.NewRequest(nil, // unicast to server, not used in this test
-		dhcpv6.WithClientID(clientDUID),
-		dhcpv6.WithServerID(server.ifaceMAC), // Not a DUID but works for test
-		dhcpv6.WithIANA(dhcpv6.OptIAAddress(requestedIP, 3600*time.Second, 7200*time.Second)),
-	)
+	req, err := dhcpv6.NewMessage()
 	require.NoError(t, err)
+	req.MessageType = dhcpv6.MessageTypeRequest
+	req.AddOption(dhcpv6.OptClientID(clientDUID))
+	req.AddOption(dhcpv6.OptServerID(serverDUID))
+	ianaOpt := &dhcpv6.OptIANA{
+		Options: dhcpv6.IdentityOptions{
+			Options: dhcpv6.Options{
+				&dhcpv6.OptIAAddress{
+					IPv6Addr:          requestedIP,
+					PreferredLifetime: 3600 * time.Second,
+					ValidLifetime:     7200 * time.Second,
+				},
+			},
+		},
+	}
+	req.AddOption(ianaOpt)
 
 	// Call the handler
 	respBytes, _, err := server.HandleDHCPv6(req.ToBytes())
@@ -262,7 +282,9 @@ func TestHandleRequestV6(t *testing.T) {
 	// Assert the response is a REPLY
 	resp, err := dhcpv6.FromBytes(respBytes)
 	require.NoError(t, err)
-	require.Equal(t, dhcpv6.MessageTypeReply, resp.Type())
+	msg, ok := resp.(*dhcpv6.Message)
+	require.True(t, ok)
+	require.Equal(t, dhcpv6.MessageTypeReply, msg.MessageType)
 
 	// Assert the lease was created
 	_, leaseExists := server.leasesV6[clientDUID.String()]

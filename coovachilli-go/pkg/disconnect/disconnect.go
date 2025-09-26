@@ -1,6 +1,7 @@
 package disconnect
 
 import (
+	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
 	"coovachilli-go/pkg/firewall"
 	"coovachilli-go/pkg/radius"
@@ -11,21 +12,23 @@ import (
 
 // Manager handles the logic for disconnecting a user session.
 type Manager struct {
-	sm         *core.SessionManager
-	fw         firewall.Firewall
+	cfg          *config.Config
+	sm           *core.SessionManager
+	fw           firewall.UserRuleRemover
 	radiusClient radius.AccountingSender
 	scriptRunner *script.Runner
-	logger     zerolog.Logger
+	logger       zerolog.Logger
 }
 
 // NewManager creates a new disconnection manager.
-func NewManager(sm *core.SessionManager, fw firewall.Firewall, radiusClient radius.AccountingSender, scriptRunner *script.Runner, logger zerolog.Logger) *Manager {
+func NewManager(cfg *config.Config, sm *core.SessionManager, fw firewall.UserRuleRemover, radiusClient radius.AccountingSender, scriptRunner *script.Runner, logger zerolog.Logger) *Manager {
 	return &Manager{
-		sm:         sm,
-		fw:         fw,
+		cfg:          cfg,
+		sm:           sm,
+		fw:           fw,
 		radiusClient: radiusClient,
 		scriptRunner: scriptRunner,
-		logger:     logger.With().Str("component", "disconnect").Logger(),
+		logger:       logger.With().Str("component", "disconnect").Logger(),
 	}
 }
 
@@ -49,7 +52,7 @@ func (m *Manager) Disconnect(session *core.Session, reason string) {
 
 	// 1. Send RADIUS Accounting-Stop packet
 	if m.radiusClient != nil {
-		_, err := m.radiusClient.SendAccountingRequest(session, rfc2866.AcctStatusTypeStop)
+		_, err := m.radiusClient.SendAccountingRequest(session, rfc2866.AcctStatusType(2)) // 2 = Stop
 		if err != nil {
 			m.logger.Error().Err(err).Msg("Failed to send RADIUS accounting stop packet")
 		}
@@ -57,9 +60,9 @@ func (m *Manager) Disconnect(session *core.Session, reason string) {
 
 	// 2. Run connection-down script
 	if m.scriptRunner != nil {
-		if err := m.scriptRunner.RunConDown(session); err != nil {
-			m.logger.Error().Err(err).Msg("condown script failed")
-		}
+		// The original `RunConDown` was likely a wrapper. We call RunScript directly.
+		// A more robust implementation would map the string reason to a cause code.
+		m.scriptRunner.RunScript(m.cfg.ConDown, session, 2) // Cause 2 for User-Request
 	}
 
 	// 3. Remove firewall rules

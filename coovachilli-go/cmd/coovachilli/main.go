@@ -1,12 +1,9 @@
 package main
 
 import (
-	"context"
-	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
@@ -22,18 +19,14 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/rs/zerolog"
-	"encoding/binary"
 
 	"github.com/rs/zerolog/log"
-	"layeh.com/radius"
+	layehradius "layeh.com/radius"
 	"layeh.com/radius/rfc2865"
 	"layeh.com/radius/rfc2866"
-)
+	"layeh.com/radius/vendors/wispr"
 
-const (
-	WISPrVendorID = 14122
-	WISPrBandwidthMaxDown = 7
-	WISPrBandwidthMaxUp = 8
+	"coovachilli-go/pkg/auth"
 )
 
 func main() {
@@ -77,7 +70,7 @@ func main() {
 
 	radiusReqChan := make(chan *core.Session)
 	radiusClient := radius.NewClient(cfg, log.Logger)
-	disconnectManager := disconnect.NewManager(sessionManager, fw, radiusClient, scriptRunner, log.Logger)
+	disconnectManager := disconnect.NewManager(cfg, sessionManager, fw, radiusClient, scriptRunner, log.Logger)
 
 	reaper := core.NewReaper(cfg, sessionManager, disconnectManager, log.Logger)
 	reaper.Start()
@@ -130,16 +123,16 @@ func main() {
 	go func() {
 		for req := range coaReqChan {
 			// For now, we only handle Disconnect-Request
-			if req.Packet.Code != radius.CodeDisconnectRequest {
+			if req.Packet.Code != layehradius.CodeDisconnectRequest {
 				log.Warn().Str("code", req.Packet.Code.String()).Msg("Received unhandled CoA/DM code")
 				// Send NAK
-				response := req.Packet.Response(radius.CodeDisconnectNAK)
+				response := req.Packet.Response(layehradius.CodeDisconnectNAK)
 				radiusClient.SendCoAResponse(response, req.Peer)
 				continue
 			}
 
 			// Find session to disconnect
-			userName, _ := rfc2865.UserName_GetString(req.Packet)
+			userName := rfc2865.UserName_GetString(req.Packet)
 			// TODO: Also support finding by NAS-Port-Id, Acct-Session-Id, etc.
 			var sessionToDisconnect *core.Session
 			for _, s := range sessionManager.GetAllSessions() {
@@ -152,7 +145,7 @@ func main() {
 			if sessionToDisconnect == nil {
 				log.Warn().Str("user", userName).Msg("Received Disconnect-Request for unknown user")
 				// Per RFC, if user is unknown, send ACK
-				response := req.Packet.Response(radius.CodeDisconnectACK)
+				response := req.Packet.Response(layehradius.CodeDisconnectACK)
 				radiusClient.SendCoAResponse(response, req.Peer)
 				continue
 			}
@@ -160,7 +153,7 @@ func main() {
 			disconnectManager.Disconnect(sessionToDisconnect, "Admin-Reset")
 
 			// Send ACK
-			response := req.Packet.Response(radius.CodeDisconnectACK)
+			response := req.Packet.Response(layehradius.CodeDisconnectACK)
 			radiusClient.SendCoAResponse(response, req.Peer)
 		}
 	}()
@@ -168,58 +161,76 @@ func main() {
 	// RADIUS processing loop
 	go func() {
 		for session := range radiusReqChan {
-			log.Info().Str("session", session.SessionID).Msg("Processing RADIUS request")
-			resp, err := radiusClient.SendAccessRequest(session, session.Redir.Username, session.Redir.Password)
-			if err != nil {
-				log.Error().Err(err).Str("session", session.SessionID).Msg("Error sending RADIUS Access-Request")
-				session.AuthResult <- false
-				continue
-			}
-
-			if resp.Code == "Access-Accept" {
-				log.Info().Str("user", session.Redir.Username).Msg("RADIUS Access-Accept")
-
-				// Parse attributes from the response
-				session.Lock()
-				session.Authenticated = true
-				if sessionTimeout, err := rfc2865.SessionTimeout_Get(resp.Packet); err == nil {
-					session.SessionParams.SessionTimeout = uint32(sessionTimeout)
-					log.Info().Uint32("timeout", session.SessionParams.SessionTimeout).Msg("Parsed Session-Timeout")
-				}
-				if idleTimeout, err := rfc2865.IdleTimeout_Get(resp.Packet); err == nil {
-					session.SessionParams.IdleTimeout = uint32(idleTimeout)
-					log.Info().Uint32("timeout", session.SessionParams.IdleTimeout).Msg("Parsed Idle-Timeout")
-				}
-
-				// Parse WISPr bandwidth attributes
-				if vsa, err := radius.GetVendor(resp.Packet, WISPrVendorID, WISPrBandwidthMaxDown); err == nil && len(vsa) == 4 {
-					session.SessionParams.BandwidthMaxDown = uint64(binary.BigEndian.Uint32(vsa))
-					log.Info().Uint64("kbits", session.SessionParams.BandwidthMaxDown).Msg("Parsed WISPr-Bandwidth-Max-Down")
-				}
-				if vsa, err := radius.GetVendor(resp.Packet, WISPrVendorID, WISPrBandwidthMaxUp); err == nil && len(vsa) == 4 {
-					session.SessionParams.BandwidthMaxUp = uint64(binary.BigEndian.Uint32(vsa))
-					log.Info().Uint64("kbits", session.SessionParams.BandwidthMaxUp).Msg("Parsed WISPr-Bandwidth-Max-Up")
+			go func(s *core.Session) {
+				// Try local authentication first if enabled
+				if cfg.UseLocalUsers {
+					authenticated, err := auth.AuthenticateLocalUser(cfg.LocalUsersFile, s.Redir.Username, s.Redir.Password)
+					if err != nil {
+						log.Error().Err(err).Str("user", s.Redir.Username).Msg("Error during local authentication")
+						// Fall through to RADIUS
+					} else if authenticated {
+						log.Info().Str("user", s.Redir.Username).Msg("Local authentication successful")
+						s.Lock()
+						s.Authenticated = true
+						// Apply default session parameters for local users
+						s.SessionParams.SessionTimeout = cfg.DefSessionTimeout
+						s.SessionParams.IdleTimeout = cfg.DefIdleTimeout
+						s.SessionParams.BandwidthMaxDown = cfg.DefBandwidthMaxDown
+						s.SessionParams.BandwidthMaxUp = cfg.DefBandwidthMaxUp
+						fw.AddAuthenticatedUser(s.HisIP)
+						s.Unlock()
+						s.AuthResult <- true
+						return
+					}
 				}
 
-				session.Unlock()
-
-				if err := fw.AddAuthenticatedUser(session.HisIP); err != nil {
-					log.Error().Err(err).Str("user", session.Redir.Username).Msg("Error adding firewall rule")
-					session.AuthResult <- false // Signal failure if firewall rule fails
-					continue
+				// Proceed with RADIUS authentication
+				log.Info().Str("session", s.SessionID).Msg("Processing RADIUS request")
+				resp, err := radiusClient.SendAccessRequest(s, s.Redir.Username, s.Redir.Password)
+				if err != nil {
+					log.Error().Err(err).Str("session", s.SessionID).Msg("Error sending RADIUS Access-Request")
+					s.AuthResult <- false
+					return
 				}
 
-				// Send accounting start
-				go radiusClient.SendAccountingRequest(session, rfc2866.AcctStatusType_Start)
+				s.Lock()
+				defer s.Unlock()
 
-				// Run conup script
-				scriptRunner.RunScript(cfg.ConUp, session, 0)
+				if resp.Code == layehradius.CodeAccessAccept {
+					log.Info().Str("user", s.Redir.Username).Msg("RADIUS Access-Accept")
+					s.Authenticated = true
 
-				session.AuthResult <- true
-			} else {
-				log.Warn().Str("user", session.Redir.Username).Str("code", string(resp.Code)).Msg("RADIUS Access-Reject")
-				session.AuthResult <- false
-			}
+					// Apply RADIUS attributes, overriding defaults only if present
+					if sessionTimeout, err := rfc2865.SessionTimeout_Lookup(resp); err == nil {
+						s.SessionParams.SessionTimeout = uint32(sessionTimeout)
+					}
+					if idleTimeout, err := rfc2865.IdleTimeout_Lookup(resp); err == nil {
+						s.SessionParams.IdleTimeout = uint32(idleTimeout)
+					}
+					if bwMaxDown, err := wispr.WISPrBandwidthMaxDown_Lookup(resp); err == nil {
+						s.SessionParams.BandwidthMaxDown = uint64(bwMaxDown)
+					}
+					if bwMaxUp, err := wispr.WISPrBandwidthMaxUp_Lookup(resp); err == nil {
+						s.SessionParams.BandwidthMaxUp = uint64(bwMaxUp)
+					}
+
+					if err := fw.AddAuthenticatedUser(s.HisIP); err != nil {
+						log.Error().Err(err).Str("user", s.Redir.Username).Msg("Error adding firewall rule")
+						s.AuthResult <- false // Signal failure if firewall rule fails
+						return
+					}
+
+					// Send accounting start
+					go radiusClient.SendAccountingRequest(s, rfc2866.AcctStatusType(1)) // 1 = Start
+					// Run conup script
+					scriptRunner.RunScript(cfg.ConUp, s, 0)
+					s.AuthResult <- true
+
+				} else {
+					log.Warn().Str("user", s.Redir.Username).Str("code", resp.Code.String()).Msg("RADIUS Access-Reject")
+					s.AuthResult <- false
+				}
+			}(session)
 		}
 	}()
 
