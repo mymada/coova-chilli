@@ -14,13 +14,15 @@ uamlisten: 10.1.0.1
 dhcplisten: 10.1.0.1
 
 # DHCP settings
-dhcpif: eth0
+dhcpif: chilli_lan
 extif: eth0
 clientisolation: true
 dhcprelay: false
 dhcpupstream: "" # e.g., 192.168.1.1
 dhcpstart: 10.1.0.100
 dhcpend: 10.1.0.200
+dhcpstart_v6: "fd00::100"
+dhcpend_v6: "fd00::200"
 lease: 1h
 dns1: 8.8.8.8
 dns2: 8.8.4.4

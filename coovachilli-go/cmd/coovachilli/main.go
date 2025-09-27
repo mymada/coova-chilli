@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"os"
 	"os/signal"
 	"syscall"
@@ -31,12 +32,22 @@ import (
 
 func main() {
 	// Setup structured logging
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 
+	// Command-line flags
+	configPath := flag.String("config", "config.yaml", "Path to the configuration file")
+	debug := flag.Bool("debug", false, "Enable debug logging")
+	flag.Parse()
+
+	if *debug {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	}
+
 	log.Info().Msg("Starting CoovaChilli-Go...")
 
-	cfg, err := config.Load("coovachilli-go/config.yaml")
+	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error loading configuration")
 	}

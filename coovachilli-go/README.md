@@ -32,24 +32,35 @@ The project is divided into several packages, each with a specific responsibilit
 
 ### Prerequisites
 
-*   Go 1.18 or later
-*   A C compiler (for `pcap` and `water` dependencies)
-*   `libpcap-dev` (or equivalent)
+*   **Go**: Version 1.25.1 or later.
+*   **C Compiler**: Required for some Go dependencies.
+*   **libpcap**: The packet capture library.
+
+On Debian-based systems (like Ubuntu), you can install all prerequisites with:
+
+```bash
+sudo apt-get update && sudo apt-get install -y golang-go build-essential libpcap-dev
+```
 
 ### Building
 
-To build the project, run the following command from the `coovachilli-go` directory:
+1.  Navigate to the Go application directory:
+    ```bash
+    cd coovachilli-go
+    ```
 
-```bash
-go build ./cmd/coovachilli
-```
+2.  Build the binary:
+    ```bash
+    go build ./cmd/coovachilli
+    ```
+    This will create an executable file named `coovachilli` in the current directory (`coovachilli-go/`).
 
 ### Running
 
-To run the application, you will need a `config.yaml` file. A default configuration file is provided in the `coovachilli-go` directory.
+1.  **Configuration**: Before running, you may need to edit `config.yaml`. At a minimum, ensure the `dhcpif` setting matches the name of your LAN interface (e.g., `eth1`, `enp0s8`).
 
-```bash
-sudo ./coovachilli
-```
-
-The application needs to be run with `sudo` because it requires elevated privileges to create TUN interfaces and manage firewall rules.
+2.  **Execution**: Run the application with `sudo` from within the `coovachilli-go` directory:
+    ```bash
+    sudo ./coovachilli
+    ```
+    The application needs `sudo` because it requires elevated privileges to create TUN interfaces and manage firewall rules.
