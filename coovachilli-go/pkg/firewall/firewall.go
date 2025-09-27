@@ -3,6 +3,7 @@ package firewall
 import (
 	"fmt"
 	"net"
+	"strings"
 
 	"coovachilli-go/pkg/config"
 	"github.com/coreos/go-iptables/iptables"
@@ -15,8 +16,8 @@ type UserRuleRemover interface {
 }
 
 const (
-	chainChilli   = "chilli"
-	chainWalledGarden = "chilli_walled_garden"
+	chainChilli        = "chilli"
+	chainWalledGarden  = "chilli_walled_garden"
 )
 
 // IPTables is an interface that wraps the go-iptables methods used by the firewall.
@@ -28,6 +29,7 @@ type IPTables interface {
 	NewChain(table, chain string) error
 	ClearChain(table, chain string) error
 	DeleteChain(table, chain string) error
+	Exists(table, chain string, rulespec ...string) (bool, error)
 }
 
 // Firewall manages the system's firewall rules.
@@ -64,24 +66,24 @@ func NewFirewall(cfg *config.Config, logger zerolog.Logger) (*Firewall, error) {
 
 // Initialize sets up the necessary firewall chains and rules.
 func (f *Firewall) Initialize() error {
+	f.logger.Debug().Msg("Initializing firewall rules")
 	// Create custom chains
 	for _, chain := range []string{chainChilli, chainWalledGarden} {
-		if err := f.ipt.NewChain("nat", chain); err != nil {
-			f.logger.Warn().Str("chain", chain).Str("table", "nat").Msg("Chain already exists, clearing it")
-			if err := f.ipt.ClearChain("nat", chain); err != nil {
-				return fmt.Errorf("failed to clear chain %s in nat table: %w", chain, err)
-			}
-		}
-		if err := f.ipt.NewChain("filter", chain); err != nil {
-			f.logger.Warn().Str("chain", chain).Str("table", "filter").Msg("Chain already exists, clearing it")
-			if err := f.ipt.ClearChain("filter", chain); err != nil {
-				return fmt.Errorf("failed to clear chain %s in filter table: %w", chain, err)
+		for _, table := range []string{"nat", "filter"} {
+			exists, _ := f.ipt.Exists(table, chain)
+			if exists {
+				if err := f.ipt.ClearChain(table, chain); err != nil {
+					f.logger.Warn().Err(err).Str("chain", chain).Str("table", table).Msg("Failed to clear chain, might be in use. Continuing...")
+				}
+			} else {
+				if err := f.ipt.NewChain(table, chain); err != nil {
+					return fmt.Errorf("failed to create chain %s in %s table: %w", chain, table, err)
+				}
 			}
 		}
 	}
 
 	// NAT rules
-	// Set up NAT for the client subnet
 	if f.cfg.ExtIf != "" {
 		if err := f.ipt.Append("nat", "POSTROUTING", "-s", f.cfg.Net.String(), "-o", f.cfg.ExtIf, "-j", "MASQUERADE"); err != nil {
 			return fmt.Errorf("failed to add NAT rule: %w", err)
@@ -130,9 +132,14 @@ func (f *Firewall) Initialize() error {
 
 	// === IPv6 Rules ===
 	if f.ip6t != nil {
-		// Create custom chains for IPv6
+		// Create custom chains for IPv6, but fail gracefully if nat table is not supported
 		for _, chain := range []string{chainChilli, chainWalledGarden} {
 			if err := f.ip6t.NewChain("nat", chain); err != nil {
+				if strings.Contains(err.Error(), "No such file or directory") || strings.Contains(err.Error(), "table nat does not exist") {
+					f.logger.Warn().Err(err).Msg("Could not create IPv6 NAT chain, ip6table_nat module may be missing. Disabling IPv6 firewall.")
+					f.ip6t = nil // Disable for the rest of the session
+					break        // Exit the loop
+				}
 				f.logger.Warn().Str("chain", chain).Str("table", "nat_v6").Msg("Chain already exists, clearing it")
 				if err := f.ip6t.ClearChain("nat", chain); err != nil {
 					return fmt.Errorf("failed to clear chain %s in nat table for ipv6: %w", chain, err)
@@ -146,16 +153,17 @@ func (f *Firewall) Initialize() error {
 			}
 		}
 
-		// IPv6 NAT rules
-		if f.cfg.ExtIf != "" {
-			if err := f.ip6t.Append("nat", "POSTROUTING", "-s", f.cfg.NetV6.String(), "-o", f.cfg.ExtIf, "-j", "MASQUERADE"); err != nil {
-				return fmt.Errorf("failed to add IPv6 NAT rule: %w", err)
+		// Continue with other IPv6 rules only if ip6t is still enabled
+		if f.ip6t != nil {
+			// IPv6 NAT rules
+			if f.cfg.ExtIf != "" && f.cfg.NetV6.IP != nil {
+				if err := f.ip6t.Append("nat", "POSTROUTING", "-s", f.cfg.NetV6.String(), "-o", f.cfg.ExtIf, "-j", "MASQUERADE"); err != nil {
+					// This can fail if NetV6 is not configured, which is fine.
+					f.logger.Warn().Err(err).Msg("Failed to add IPv6 NAT rule. Is 'net_v6' configured?")
+				}
 			}
+			// IPv6 redirection and forwarding rules would go here
 		}
-
-		// IPv6 redirection and forwarding rules would go here
-		// Note: IPv6 NAT is more complex than IPv4 and often not recommended.
-		// For now, we'll just set up the basic chains and MASQUERADE.
 	}
 
 	f.logger.Info().Msg("Firewall initialized successfully")
@@ -187,17 +195,17 @@ func (f *Firewall) AddAuthenticatedUser(ip net.IP) error {
 func (f *Firewall) RemoveAuthenticatedUser(ip net.IP) error {
 	if ip.To4() != nil {
 		if err := f.ipt.Delete("nat", chainChilli, "-s", ip.String(), "-j", "RETURN"); err != nil {
-			return fmt.Errorf("failed to delete nat rule for user %s: %w", ip.String(), err)
+			f.logger.Warn().Err(err).Msgf("failed to delete nat rule for user %s", ip.String())
 		}
 		if err := f.ipt.Delete("filter", chainChilli, "-s", ip.String(), "-j", "RETURN"); err != nil {
-			return fmt.Errorf("failed to delete filter rule for user %s: %w", ip.String(), err)
+			f.logger.Warn().Err(err).Msgf("failed to delete filter rule for user %s", ip.String())
 		}
 	} else if f.ip6t != nil {
 		if err := f.ip6t.Delete("nat", chainChilli, "-s", ip.String(), "-j", "RETURN"); err != nil {
-			return fmt.Errorf("failed to delete ip6tables nat rule for user %s: %w", ip.String(), err)
+			f.logger.Warn().Err(err).Msgf("failed to delete ip6tables nat rule for user %s", ip.String())
 		}
 		if err := f.ip6t.Delete("filter", chainChilli, "-s", ip.String(), "-j", "RETURN"); err != nil {
-			return fmt.Errorf("failed to delete ip6tables filter rule for user %s: %w", ip.String(), err)
+			f.logger.Warn().Err(err).Msgf("failed to delete ip6tables filter rule for user %s", ip.String())
 		}
 	}
 	f.logger.Info().Str("ip", ip.String()).Msg("Removed firewall rules for user")
@@ -241,7 +249,7 @@ func (f *Firewall) Cleanup() error {
 	}
 
 	if f.ip6t != nil {
-		if f.cfg.ExtIf != "" {
+		if f.cfg.ExtIf != "" && f.cfg.NetV6.IP != nil {
 			if err := f.ip6t.Delete("nat", "POSTROUTING", "-s", f.cfg.NetV6.String(), "-o", f.cfg.ExtIf, "-j", "MASQUERADE"); err != nil {
 				f.logger.Error().Err(err).Msg("Failed to delete IPv6 NAT rule")
 			}

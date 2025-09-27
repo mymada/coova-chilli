@@ -569,8 +569,8 @@ func (s *Server) handleRequest(req *dhcpv4.DHCPv4) ([]byte, error) {
 	defer s.Unlock()
 
 	var reqIP net.IP
-	if opt := req.GetOneOption(dhcpv4.OptionRequestedIPAddress); opt != nil {
-		reqIP = net.IP(opt)
+	if optBytes := req.GetOneOption(dhcpv4.OptionRequestedIPAddress); optBytes != nil {
+		reqIP = net.IP(optBytes)
 	} else {
 		reqIP = req.ClientIPAddr
 	}

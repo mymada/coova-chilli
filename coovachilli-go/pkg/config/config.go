@@ -21,8 +21,10 @@ type Config struct {
 	TUNDevices int `yaml:"tundevices"`
 
 	// Network settings
-	Net    net.IPNet `yaml:"net"`
-	NetV6  net.IPNet `yaml:"net_v6"`
+	NetStr string    `yaml:"net"`
+	Net    net.IPNet `yaml:"-"` // Parsed from NetStr
+	NetV6Str string  `yaml:"net_v6"`
+	NetV6  net.IPNet `yaml:"-"` // Parsed from NetV6Str
 	UAMListen net.IP `yaml:"uamlisten"`
 	UAMListenV6 net.IP `yaml:"uamlisten_v6"`
 	DHCPListen net.IP `yaml:"dhcplisten"`
@@ -96,6 +98,23 @@ func Load(path string) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config data: %w", err)
+	}
+
+	// Manual parsing for CIDR notation fields
+	if cfg.NetStr != "" {
+		_, ipnet, err := net.ParseCIDR(cfg.NetStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid 'net' CIDR value: %w", err)
+		}
+		cfg.Net = *ipnet
+	}
+
+	if cfg.NetV6Str != "" {
+		_, ipnet, err := net.ParseCIDR(cfg.NetV6Str)
+		if err != nil {
+			return nil, fmt.Errorf("invalid 'net_v6' CIDR value: %w", err)
+		}
+		cfg.NetV6 = *ipnet
 	}
 
 	return &cfg, nil
