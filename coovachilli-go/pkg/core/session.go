@@ -24,9 +24,8 @@ type Session struct {
 	sync.RWMutex
 
 	// Client identifiers
-	HisIP   net.IP
-	HisIPv6 net.IP
-	HisMAC  net.HardwareAddr
+	HisIP  net.IP
+	HisMAC net.HardwareAddr
 
 	// Session state
 	Authenticated       bool

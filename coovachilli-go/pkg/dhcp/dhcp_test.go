@@ -7,9 +7,9 @@ import (
 
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
-	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
+	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv6"
 	"github.com/insomniacslk/dhcp/iana"
 	"github.com/rs/zerolog"
@@ -79,15 +79,14 @@ func TestHandleRequest_Renewal_AuthFailure(t *testing.T) {
 		MAC:     clientMAC,
 		Expires: time.Now().Add(30 * time.Minute),
 	}
-	session := sm.CreateSession(clientIP, clientMAC)
+	session := sm.CreateSession(clientIP, clientMAC, cfg)
 
 	// 2. Create a DHCPREQUEST packet for renewal
-	reqPacket, err := dhcpv4.New(
-		dhcpv4.WithMessageType(dhcpv4.MessageTypeRequest),
-		dhcpv4.WithClientIP(clientIP),
-		dhcpv4.WithClientHardwareAddr(clientMAC),
-	)
+	reqPacket, err := dhcpv4.New()
 	require.NoError(t, err)
+	reqPacket.SetMessageType(dhcpv4.MessageTypeRequest)
+	reqPacket.ClientIPAddr = clientIP
+	reqPacket.ClientHWAddr = clientMAC
 	reqBytes := reqPacket.ToBytes()
 
 	// 3. Goroutine to simulate RADIUS failure
@@ -122,12 +121,6 @@ func TestHandleSolicit(t *testing.T) {
 	require.NoError(t, err)
 
 	serverMAC, _ := net.ParseMAC("00:00:5e:00:53:ff")
-	serverDUID := &dhcpv6.DUIDLLT{
-		HWType:        iana.HWTypeEthernet,
-		Time:          dhcpv6.GetTime(),
-		LinkLayerAddr: serverMAC,
-	}
-
 	server := &Server{
 		cfg:      cfg,
 		poolV6:   pool,
@@ -138,12 +131,9 @@ func TestHandleSolicit(t *testing.T) {
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:01")
 
 	// Create a SOLICIT packet
-	req, err := dhcpv6.NewMessage()
+	req, err := dhcpv6.NewSolicit(clientMAC)
 	require.NoError(t, err)
-	req.MessageType = dhcpv6.MessageTypeSolicit
-	req.AddOption(dhcpv6.OptClientID(&dhcpv6.DUIDLL{LinkLayerAddr: clientMAC}))
-	req.AddOption(&dhcpv6.OptIANA{})
-	req.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionRapidCommit, OptionData: []byte{}})
+	req.AddOption(&dhcpv6.OptRapidCommit{})
 	reqBytes := req.ToBytes()
 
 	// Call the handler
@@ -159,7 +149,7 @@ func TestHandleSolicit(t *testing.T) {
 
 	// Assert the advertised IP is from the pool
 	respIana := msg.GetOneOption(dhcpv6.OptionIANA).(*dhcpv6.OptIANA)
-	respAddr := respIana.Options.GetOne(dhcpv6.OptionIAAddress).(*dhcpv6.OptIAAddress)
+	respAddr := respIana.Options.GetOne(dhcpv6.OptIAAddress).(*dhcpv6.OptIAAddress)
 	require.True(t, respAddr.IPv6Addr.Equal(net.ParseIP("2001:db8::100")))
 
 	// Assert DNS server is set
@@ -186,7 +176,7 @@ func TestRelayDHCPv4(t *testing.T) {
 		req, err := dhcpv4.FromBytes(buf[:n])
 		require.NoError(t, err)
 		require.Equal(t, dhcpv4.MessageTypeDiscover, req.MessageType())
-		opt82 := req.GetOneOption(iana.OptionRelayAgentInformation)
+		opt82 := req.GetOneOption(dhcpv4.OptionRelayAgentInformation)
 		require.NotNil(t, opt82, "Option 82 should be present")
 
 		close(upstreamDone)
@@ -240,6 +230,10 @@ func TestHandleRequestV6(t *testing.T) {
 	require.NoError(t, err)
 
 	serverMAC, _ := net.ParseMAC("00:00:5e:00:53:ff")
+	serverDUID := &dhcpv6.DUIDLL{
+		HWType:        iana.HWTypeEthernet,
+		LinkLayerAddr: serverMAC,
+	}
 
 	server := &Server{
 		cfg:      cfg,
@@ -257,22 +251,18 @@ func TestHandleRequestV6(t *testing.T) {
 	requestedIP := net.ParseIP("2001:db8::150")
 
 	// Create a REQUEST packet
-	req, err := dhcpv6.NewMessage()
+	req, err := dhcpv6.New()
 	require.NoError(t, err)
 	req.MessageType = dhcpv6.MessageTypeRequest
 	req.AddOption(dhcpv6.OptClientID(clientDUID))
 	req.AddOption(dhcpv6.OptServerID(serverDUID))
-	ianaOpt := &dhcpv6.OptIANA{
-		Options: dhcpv6.IdentityOptions{
-			Options: dhcpv6.Options{
-				&dhcpv6.OptIAAddress{
-					IPv6Addr:          requestedIP,
-					PreferredLifetime: 3600 * time.Second,
-					ValidLifetime:     7200 * time.Second,
-				},
-			},
-		},
+	ianaOpt := &dhcpv6.OptIANA{}
+	optAddr := &dhcpv6.OptIAAddress{
+		IPv6Addr:          requestedIP,
+		PreferredLifetime: 3600 * time.Second,
+		ValidLifetime:     7200 * time.Second,
 	}
+	ianaOpt.Options = append(ianaOpt.Options, optAddr)
 	req.AddOption(ianaOpt)
 
 	// Call the handler
