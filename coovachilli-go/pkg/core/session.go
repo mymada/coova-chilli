@@ -26,6 +26,7 @@ type Session struct {
 	// Client identifiers
 	HisIP  net.IP
 	HisMAC net.HardwareAddr
+	VLANID uint16
 
 	// Session state
 	Authenticated       bool
@@ -113,7 +114,7 @@ type StateData struct {
 }
 
 // CreateSession creates a new session for a client.
-func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, cfg *config.Config) *Session {
+func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID uint16, cfg *config.Config) *Session {
 	sm.Lock()
 	defer sm.Unlock()
 
@@ -121,6 +122,7 @@ func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, cfg *co
 	session := &Session{
 		HisIP:               ip,
 		HisMAC:              mac,
+		VLANID:              vlanID,
 		StartTime:           time.Now(),
 		LastSeen:            time.Now(),
 		AuthResult:          make(chan bool, 1),

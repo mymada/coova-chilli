@@ -48,7 +48,7 @@ func TestReaper_Timeouts(t *testing.T) {
 
 	// --- Test Case 1: Session expired by Session-Timeout ---
 	mac1, _ := net.ParseMAC("00:00:5e:00:53:01")
-	session1 := sm.CreateSession(net.ParseIP("10.0.0.1"), mac1, cfg)
+	session1 := sm.CreateSession(net.ParseIP("10.0.0.1"), mac1, 0, cfg)
 	session1.Authenticated = true
 	session1.SessionParams.SessionTimeout = 100 // seconds
 	session1.StartTimeSec = MonotonicTime() - 101 // Started 101 seconds ago
@@ -56,7 +56,7 @@ func TestReaper_Timeouts(t *testing.T) {
 
 	// --- Test Case 2: Session expired by Idle-Timeout ---
 	mac2, _ := net.ParseMAC("00:00:5e:00:53:02")
-	session2 := sm.CreateSession(net.ParseIP("10.0.0.2"), mac2, cfg)
+	session2 := sm.CreateSession(net.ParseIP("10.0.0.2"), mac2, 0, cfg)
 	session2.Authenticated = true
 	session2.SessionParams.IdleTimeout = 50 // seconds
 	session2.StartTimeSec = MonotonicTime() - 1000 // Started long ago
@@ -64,7 +64,7 @@ func TestReaper_Timeouts(t *testing.T) {
 
 	// --- Test Case 3: Active session, should not be reaped ---
 	mac3, _ := net.ParseMAC("00:00:5e:00:53:03")
-	session3 := sm.CreateSession(net.ParseIP("10.0.0.3"), mac3, cfg)
+	session3 := sm.CreateSession(net.ParseIP("10.0.0.3"), mac3, 0, cfg)
 	session3.Authenticated = true
 	session3.SessionParams.SessionTimeout = 1000
 	session3.SessionParams.IdleTimeout = 500
@@ -73,7 +73,7 @@ func TestReaper_Timeouts(t *testing.T) {
 
 	// --- Test Case 4: Unauthenticated session, should not be reaped ---
 	mac4, _ := net.ParseMAC("00:00:5e:00:53:04")
-	_ = sm.CreateSession(net.ParseIP("10.0.0.4"), mac4, cfg) // Not authenticated
+	_ = sm.CreateSession(net.ParseIP("10.0.0.4"), mac4, 0, cfg) // Not authenticated
 
 	// Execute the reap function directly
 	reaper.reapSessions()
@@ -105,7 +105,7 @@ func TestReaper_QuotasAndAccounting(t *testing.T) {
 
 	// --- Test Case 1: Total data quota exceeded ---
 	mac1, _ := net.ParseMAC("00:00:5e:00:53:11")
-	session1 := sm.CreateSession(net.ParseIP("10.0.0.11"), mac1, cfg)
+	session1 := sm.CreateSession(net.ParseIP("10.0.0.11"), mac1, 0, cfg)
 	session1.Authenticated = true
 	session1.SessionParams.MaxTotalOctets = 1000
 	session1.InputOctets = 500
@@ -113,7 +113,7 @@ func TestReaper_QuotasAndAccounting(t *testing.T) {
 
 	// --- Test Case 2: Interim accounting update needed ---
 	mac2, _ := net.ParseMAC("00:00:5e:00:53:12")
-	session2 := sm.CreateSession(net.ParseIP("10.0.0.12"), mac2, cfg)
+	session2 := sm.CreateSession(net.ParseIP("10.0.0.12"), mac2, 0, cfg)
 	session2.Authenticated = true
 	session2.SessionParams.InterimInterval = 300
 	session2.LastInterimUpdateTime = MonotonicTime() - 301 // Last update was 301 seconds ago
@@ -129,5 +129,5 @@ func TestReaper_QuotasAndAccounting(t *testing.T) {
 
 	require.Len(t, mockAcct.SentRequests, 1, "Expected exactly 1 accounting request to be sent")
 	require.Equal(t, session2, mockAcct.SentRequests[0])
-	require.Equal(t, rfc2866.AcctStatusType(3), mockAcct.LastStatus) // 3 = Interim-Update
+	require.Equal(t, rfc2866.AcctStatusType(3), mockAcct.LastStatus)
 }

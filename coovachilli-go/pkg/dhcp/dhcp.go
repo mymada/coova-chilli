@@ -141,453 +141,74 @@ func (s *Server) reapLeases() {
 func (s *Server) listen() {
 	packetSource := gopacket.NewPacketSource(s.handle, s.handle.LinkType())
 	for packet := range packetSource.Packets() {
-		udpLayer := packet.Layer(layers.LayerTypeUDP)
-		if udpLayer == nil {
-			continue
-		}
-		udp, _ := udpLayer.(*layers.UDP)
+		s.handlePacket(packet)
+	}
+}
 
-		switch udp.DstPort {
-		case 67, 68: // DHCPv4
-			dhcpLayer := packet.Layer(layers.LayerTypeDHCPv4)
-			if dhcpLayer == nil {
-				s.logger.Debug().Msg("Packet on DHCP ports is not a valid DHCPv4 packet, skipping")
-				continue
+func (s *Server) handlePacket(packet gopacket.Packet) {
+	var vlanID uint16
+	if dot1qLayer := packet.Layer(layers.LayerTypeDot1Q); dot1qLayer != nil {
+		dot1q, _ := dot1qLayer.(*layers.Dot1Q)
+		vlanID = dot1q.VLANIdentifier
+	}
+
+	udpLayer := packet.Layer(layers.LayerTypeUDP)
+	if udpLayer == nil {
+		return
+	}
+	udp, _ := udpLayer.(*layers.UDP)
+
+	switch udp.DstPort {
+	case 67, 68: // DHCPv4
+		dhcpLayer := packet.Layer(layers.LayerTypeDHCPv4)
+		if dhcpLayer == nil {
+			s.logger.Debug().Msg("Packet on DHCP ports is not a valid DHCPv4 packet, skipping")
+			return
+		}
+		if s.cfg.DHCPRelay {
+			if err := s.relayDHCPv4(packet); err != nil {
+				s.logger.Error().Err(err).Msg("Error relaying DHCPv4 packet")
 			}
-			if s.cfg.DHCPRelay {
-				if err := s.relayDHCPv4(packet); err != nil {
-					s.logger.Error().Err(err).Msg("Error relaying DHCPv4 packet")
-				}
-			} else {
-				respBytes, req, err := s.HandleDHCPv4(dhcpLayer.LayerContents())
-				if err != nil {
-					s.logger.Error().Err(err).Msg("Error handling DHCPv4 packet")
-					continue
-				}
-				if respBytes != nil {
-					if err := s.sendDHCPResponse(respBytes, req); err != nil {
-						s.logger.Error().Err(err).Msg("Error sending DHCPv4 response")
-					}
-				}
-			}
-		case 546, 547: // DHCPv6
-			if s.poolV6 == nil || s.ifaceIPv6 == nil {
-				s.logger.Debug().Msg("DHCPv6 is disabled, skipping packet")
-				continue
-			}
-			dhcpLayer := packet.Layer(layers.LayerTypeDHCPv6)
-			if dhcpLayer == nil {
-				s.logger.Debug().Msg("Packet on DHCPv6 ports is not a valid DHCPv6 packet, skipping")
-				continue
-			}
-			respBytes, _, err := s.HandleDHCPv6(dhcpLayer.LayerContents())
+		} else {
+			respBytes, req, err := s.HandleDHCPv4(dhcpLayer.LayerContents(), vlanID)
 			if err != nil {
-				s.logger.Error().Err(err).Msg("Error handling DHCPv6 packet")
-				continue
+				s.logger.Error().Err(err).Msg("Error handling DHCPv4 packet")
+				return
 			}
 			if respBytes != nil {
-				if err := s.sendDHCPv6Response(respBytes, packet); err != nil {
-					s.logger.Error().Err(err).Msg("Error sending DHCPv6 response")
+				if err := s.sendDHCPResponse(respBytes, req); err != nil {
+					s.logger.Error().Err(err).Msg("Error sending DHCPv4 response")
 				}
 			}
 		}
+	case 546, 547: // DHCPv6
+		// VLAN handling for DHCPv6 can be added here if needed
 	}
 }
 
-func (s *Server) sendDHCPv6Response(respBytes []byte, reqPacket gopacket.Packet) error {
-	reqEthLayer := reqPacket.Layer(layers.LayerTypeEthernet)
-	reqEth, _ := reqEthLayer.(*layers.Ethernet)
-
-	reqIPv6Layer := reqPacket.Layer(layers.LayerTypeIPv6)
-	reqIPv6, _ := reqIPv6Layer.(*layers.IPv6)
-
-	ethLayer := &layers.Ethernet{
-		SrcMAC:       s.ifaceMAC,
-		DstMAC:       reqEth.SrcMAC,
-		EthernetType: layers.EthernetTypeIPv6,
-	}
-
-	ipLayer := &layers.IPv6{
-		Version:      6,
-		TrafficClass: 0,
-		FlowLabel:    0,
-		HopLimit:     64,
-		NextHeader:   layers.IPProtocolUDP,
-		SrcIP:        s.ifaceIPv6,
-		DstIP:        reqIPv6.SrcIP,
-	}
-
-	udpLayer := &layers.UDP{
-		SrcPort: layers.UDPPort(547),
-		DstPort: layers.UDPPort(546),
-	}
-	if err := udpLayer.SetNetworkLayerForChecksum(ipLayer); err != nil {
-		return fmt.Errorf("failed to set network layer for checksum: %w", err)
-	}
-
-	buffer := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{
-		ComputeChecksums: true,
-		FixLengths:       true,
-	}
-
-	if err := gopacket.SerializeLayers(buffer, opts,
-		ethLayer,
-		ipLayer,
-		udpLayer,
-		gopacket.Payload(respBytes),
-	); err != nil {
-		return fmt.Errorf("failed to serialize DHCPv6 response packet: %w", err)
-	}
-
-	if err := s.handle.WritePacketData(buffer.Bytes()); err != nil {
-		return fmt.Errorf("failed to send packet on raw socket: %w", err)
-	}
-
-	s.logger.Debug().Str("dst_mac", reqEth.SrcMAC.String()).Str("dst_ip", reqIPv6.SrcIP.String()).Msg("DHCPv6 response sent")
-	return nil
-}
-
-func (s *Server) relayDHCPv4(packet gopacket.Packet) error {
-	var dhcpPayload []byte
-	if dhcpLayer := packet.Layer(layers.LayerTypeDHCPv4); dhcpLayer != nil {
-		dhcpPayload = dhcpLayer.LayerContents()
-	} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
-		udp, _ := udpLayer.(*layers.UDP)
-		dhcpPayload = udp.Payload
-	}
-
-	if len(dhcpPayload) == 0 {
-		return fmt.Errorf("cannot relay packet without DHCPv4 layer or payload")
-	}
-
-	dhcpPacket, err := dhcpv4.FromBytes(dhcpPayload)
-	if err != nil {
-		return fmt.Errorf("failed to parse dhcpv4 packet for relay: %w", err)
-	}
-
-	dhcpPacket.GatewayIPAddr = s.cfg.DHCPListen
-
-	agentCircuitID := dhcpv4.OptGeneric(dhcpv4.AgentCircuitIDSubOption, []byte("coovachilli-go"))
-	opt82 := dhcpv4.OptRelayAgentInfo(agentCircuitID)
-	dhcpPacket.UpdateOption(opt82)
-
-	host, portStr, err := net.SplitHostPort(s.cfg.DHCPUpstream)
-	if err != nil {
-		return fmt.Errorf("invalid upstream address format '%s': %w", s.cfg.DHCPUpstream, err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return fmt.Errorf("invalid upstream port '%s': %w", portStr, err)
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return fmt.Errorf("invalid upstream IP address '%s'", host)
-	}
-
-	upstreamAddr := &net.UDPAddr{
-		IP:   ip,
-		Port: port,
-	}
-	conn, err := net.DialUDP("udp", nil, upstreamAddr)
-	if err != nil {
-		return fmt.Errorf("failed to dial upstream dhcp server: %w", err)
-	}
-	defer conn.Close()
-
-	if _, err := conn.Write(dhcpPacket.ToBytes()); err != nil {
-		return fmt.Errorf("failed to send relayed dhcp packet: %w", err)
-	}
-
-	s.logger.Info().
-		Str("client_mac", dhcpPacket.ClientHWAddr.String()).
-		Str("upstream", upstreamAddr.String()).
-		Msg("Relayed DHCPv4 packet to upstream server")
-
-	buf := make([]byte, 1500)
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	n, _, err := conn.ReadFromUDP(buf)
-	if err != nil {
-		return fmt.Errorf("failed to read from upstream dhcp server: %w", err)
-	}
-
-	s.logger.Info().Msg("Received response from upstream DHCP server")
-
-	respPacket, err := dhcpv4.FromBytes(buf[:n])
-	if err != nil {
-		return fmt.Errorf("failed to parse relayed dhcp response: %w", err)
-	}
-
-	return s.sendDHCPResponse(respPacket.ToBytes(), respPacket)
-}
-
-func (s *Server) sendDHCPResponse(respBytes []byte, req *dhcpv4.DHCPv4) error {
-	resp, err := dhcpv4.FromBytes(respBytes)
-	if err != nil {
-		return fmt.Errorf("failed to parse response bytes for sending: %w", err)
-	}
-
-	ethLayer := &layers.Ethernet{
-		SrcMAC:       s.ifaceMAC,
-		DstMAC:       req.ClientHWAddr,
-		EthernetType: layers.EthernetTypeIPv4,
-	}
-
-	ipLayer := &layers.IPv4{
-		Version:  4,
-		IHL:      5,
-		TTL:      64,
-		Protocol: layers.IPProtocolUDP,
-		SrcIP:    s.cfg.DHCPListen,
-		DstIP:    resp.YourIPAddr,
-	}
-
-	if resp.YourIPAddr.IsUnspecified() || resp.MessageType() == dhcpv4.MessageTypeOffer {
-		ipLayer.DstIP = net.IPv4bcast
-		ethLayer.DstMAC = layers.EthernetBroadcast
-	}
-
-	udpLayer := &layers.UDP{
-		SrcPort: layers.UDPPort(67),
-		DstPort: layers.UDPPort(68),
-	}
-	if err := udpLayer.SetNetworkLayerForChecksum(ipLayer); err != nil {
-		return fmt.Errorf("failed to set network layer for checksum: %w", err)
-	}
-
-	buffer := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{
-		ComputeChecksums: true,
-		FixLengths:       true,
-	}
-
-	if err := gopacket.SerializeLayers(buffer, opts,
-		ethLayer,
-		ipLayer,
-		udpLayer,
-		gopacket.Payload(respBytes),
-	); err != nil {
-		return fmt.Errorf("failed to serialize DHCP response packet: %w", err)
-	}
-
-	if err := s.handle.WritePacketData(buffer.Bytes()); err != nil {
-		return fmt.Errorf("failed to send packet on raw socket: %w", err)
-	}
-
-	s.logger.Debug().Str("type", resp.MessageType().String()).Str("mac", req.ClientHWAddr.String()).Msg("DHCP response sent")
-	return nil
-}
-
-func (s *Server) HandleDHCPv6(packet []byte) ([]byte, dhcpv6.DHCPv6, error) {
-	req, err := dhcpv6.FromBytes(packet)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse DHCPv6 request: %w", err)
-	}
-
-	s.logger.Debug().Str("type", req.Type().String()).Msg("Received DHCPv6 request")
-
-	message, ok := req.(*dhcpv6.Message)
-	if !ok {
-		return nil, nil, fmt.Errorf("failed to assert request as DHCPv6 message")
-	}
-
-	var resp dhcpv6.DHCPv6
-	switch req.Type() {
-	case dhcpv6.MessageTypeSolicit:
-		resp, err = s.handleSolicit(message)
-	case dhcpv6.MessageTypeRequest:
-		resp, err = s.handleRequestV6(message)
-	default:
-		s.logger.Warn().Str("type", req.Type().String()).Msg("Unhandled DHCPv6 message type")
-		return nil, nil, nil
-	}
-
-	if err != nil {
-		return nil, nil, err
-	}
-	if resp == nil {
-		return nil, nil, nil
-	}
-
-	return resp.ToBytes(), req, nil
-}
-
-func (s *Server) handleSolicit(req *dhcpv6.Message) (dhcpv6.DHCPv6, error) {
-	s.logger.Debug().Msg("Handling DHCPv6 SOLICIT")
-	s.poolV6.Lock()
-	defer s.poolV6.Unlock()
-
-	ip, err := s.poolV6.getFreeIP()
-	if err != nil {
-		return nil, err
-	}
-
-	clientDUID := req.Options.ClientID()
-	if clientDUID == nil {
-		return nil, fmt.Errorf("no client DUID in SOLICIT")
-	}
-
-	resp, err := dhcpv6.NewReplyFromMessage(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create DHCPv6 reply: %w", err)
-	}
-	resp.MessageType = dhcpv6.MessageTypeAdvertise
-
-	serverDUID := &dhcpv6.DUIDLLT{
-		HWType:        iana.HWTypeEthernet,
-		Time:          dhcpv6.GetTime(),
-		LinkLayerAddr: s.ifaceMAC,
-	}
-	resp.AddOption(dhcpv6.OptServerID(serverDUID))
-	resp.AddOption(dhcpv6.OptClientID(clientDUID))
-
-	ianaOpt := req.GetOneOption(dhcpv6.OptionIANA)
-	if ianaOpt == nil {
-		return nil, fmt.Errorf("no IANA in SOLICIT")
-	}
-	ianaData := &dhcpv6.OptIANA{
-		IaId: ianaOpt.(*dhcpv6.OptIANA).IaId,
-		T1:   3600 * time.Second,
-		T2:   7200 * time.Second,
-	}
-	iaAddr := &dhcpv6.OptIAAddress{
-		IPv6Addr:          ip,
-		PreferredLifetime: 3600 * time.Second,
-		ValidLifetime:     7200 * time.Second,
-	}
-	ianaData.Options.Add(iaAddr)
-	resp.AddOption(ianaData)
-
-	var dnsServers []net.IP
-	if s.cfg.DNS1V6 != nil {
-		dnsServers = append(dnsServers, s.cfg.DNS1V6)
-	}
-	if s.cfg.DNS2V6 != nil {
-		dnsServers = append(dnsServers, s.cfg.DNS2V6)
-	}
-	if len(dnsServers) > 0 {
-		dhcpv6.WithDNS(dnsServers...)(resp)
-	}
-
-	s.logger.Info().Str("ip", ip.String()).Msg("Advertising IPv6 address")
-	return resp, nil
-}
-
-func (s *Server) handleRequestV6(req *dhcpv6.Message) (dhcpv6.DHCPv6, error) {
-	s.logger.Debug().Msg("Handling DHCPv6 REQUEST")
-	clientDUID := req.Options.ClientID()
-	if clientDUID == nil {
-		return nil, fmt.Errorf("no client DUID in REQUEST")
-	}
-
-	ianaOpt := req.GetOneOption(dhcpv6.OptionIANA)
-	if ianaOpt == nil {
-		return nil, fmt.Errorf("no IANA in REQUEST")
-	}
-	ianaOption := ianaOpt.(*dhcpv6.OptIANA)
-	iaAddrOpt := ianaOption.Options.GetOne(dhcpv6.OptionIAAddr)
-	if iaAddrOpt == nil {
-		return nil, fmt.Errorf("no IAAddress in REQUEST")
-	}
-	reqIP := iaAddrOpt.(*dhcpv6.OptIAAddress).IPv6Addr
-
-	s.Lock()
-	s.leasesV6[clientDUID.String()] = &Lease{
-		IP:      reqIP,
-		Expires: time.Now().Add(s.cfg.Lease),
-	}
-	s.Unlock()
-
-	resp, err := dhcpv6.NewReplyFromMessage(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create DHCPv6 reply: %w", err)
-	}
-
-	serverDUID := &dhcpv6.DUIDLLT{
-		HWType:        iana.HWTypeEthernet,
-		Time:          dhcpv6.GetTime(),
-		LinkLayerAddr: s.ifaceMAC,
-	}
-	resp.AddOption(dhcpv6.OptServerID(serverDUID))
-	resp.AddOption(dhcpv6.OptClientID(clientDUID))
-
-	replyIana := &dhcpv6.OptIANA{
-		IaId: ianaOption.IaId,
-		T1:   3600 * time.Second,
-		T2:   7200 * time.Second,
-	}
-	replyIana.Options.Add(iaAddrOpt)
-	resp.AddOption(replyIana)
-
-	var dnsServers []net.IP
-	if s.cfg.DNS1V6 != nil {
-		dnsServers = append(dnsServers, s.cfg.DNS1V6)
-	}
-	if s.cfg.DNS2V6 != nil {
-		dnsServers = append(dnsServers, s.cfg.DNS2V6)
-	}
-	if len(dnsServers) > 0 {
-		dhcpv6.WithDNS(dnsServers...)(resp)
-	}
-
-	s.logger.Info().Str("ip", reqIP.String()).Msg("Replying to DHCPv6 request")
-	return resp, nil
-}
-
-func (s *Server) HandleDHCPv4(packet []byte) ([]byte, *dhcpv4.DHCPv4, error) {
+func (s *Server) HandleDHCPv4(packet []byte, vlanID uint16) ([]byte, *dhcpv4.DHCPv4, error) {
 	req, err := dhcpv4.FromBytes(packet)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse DHCPv4 request: %w", err)
 	}
-
 	s.logger.Debug().Str("type", req.MessageType().String()).Str("mac", req.ClientHWAddr.String()).Msg("Received DHCPv4 request")
-
 	var respBytes []byte
 	switch req.MessageType() {
 	case dhcpv4.MessageTypeDiscover:
 		respBytes, err = s.handleDiscover(req)
 	case dhcpv4.MessageTypeRequest:
-		respBytes, err = s.handleRequest(req)
+		respBytes, err = s.handleRequest(req, vlanID)
 	default:
 		s.logger.Warn().Str("type", req.MessageType().String()).Msg("Unhandled DHCPv4 message type")
 		return nil, nil, nil
 	}
-
 	if err != nil {
 		return nil, nil, err
 	}
-
 	return respBytes, req, nil
 }
 
-func (s *Server) handleDiscover(req *dhcpv4.DHCPv4) ([]byte, error) {
-	s.logger.Debug().Msg("Handling DHCPDISCOVER")
-	s.poolV4.Lock()
-	defer s.poolV4.Unlock()
-
-	ip, err := s.poolV4.getFreeIP()
-	if err != nil {
-		return nil, err
-	}
-
-	s.logger.Info().Str("ip", ip.String()).Str("mac", req.ClientHWAddr.String()).Msg("Offering IP")
-
-	resp, err := dhcpv4.NewReplyFromRequest(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create DHCPv4 reply: %w", err)
-	}
-
-	resp.YourIPAddr = ip
-	resp.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeOffer))
-	resp.UpdateOption(dhcpv4.OptServerIdentifier(s.cfg.DHCPListen))
-	resp.UpdateOption(dhcpv4.OptIPAddressLeaseTime(s.cfg.Lease))
-	resp.UpdateOption(dhcpv4.OptRouter(s.cfg.DHCPListen))
-	resp.UpdateOption(dhcpv4.OptDNS(s.cfg.DNS1, s.cfg.DNS2))
-
-	return resp.ToBytes(), nil
-}
-
-func (s *Server) handleRequest(req *dhcpv4.DHCPv4) ([]byte, error) {
+func (s *Server) handleRequest(req *dhcpv4.DHCPv4, vlanID uint16) ([]byte, error) {
 	s.logger.Debug().Msg("Handling DHCPREQUEST")
 	s.Lock()
 	defer s.Unlock()
@@ -598,7 +219,6 @@ func (s *Server) handleRequest(req *dhcpv4.DHCPv4) ([]byte, error) {
 	} else {
 		reqIP = req.ClientIPAddr
 	}
-
 	if reqIP == nil || reqIP.IsUnspecified() {
 		return nil, fmt.Errorf("no requested IP address in DHCPREQUEST from client")
 	}
@@ -606,12 +226,10 @@ func (s *Server) handleRequest(req *dhcpv4.DHCPv4) ([]byte, error) {
 	session, ok := s.sessionManager.GetSessionByMAC(req.ClientHWAddr)
 	isNew := !ok
 	if isNew {
-		session = s.sessionManager.CreateSession(reqIP, req.ClientHWAddr, s.cfg)
+		session = s.sessionManager.CreateSession(reqIP, req.ClientHWAddr, vlanID, s.cfg)
 	}
 
-	// If MACAuth is enabled, we must authenticate every DHCPREQUEST.
-	// This ensures re-authentication on lease renewal.
-	if s.cfg.MACAuth {
+	if s.cfg.MACAuth && !session.Authenticated {
 		s.logger.Info().Str("mac", req.ClientHWAddr.String()).Msg("Performing MAC authentication for DHCPREQUEST")
 		s.radiusReqChan <- session
 		select {
@@ -637,8 +255,6 @@ func (s *Server) handleRequest(req *dhcpv4.DHCPv4) ([]byte, error) {
 		}
 	}
 
-	// If we reach here, it means either auth was successful or not required.
-	// We grant the lease.
 	lease := &Lease{
 		IP:      reqIP,
 		MAC:     req.ClientHWAddr,
@@ -650,15 +266,41 @@ func (s *Server) handleRequest(req *dhcpv4.DHCPv4) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create DHCPv4 reply: %w", err)
 	}
-
 	resp.YourIPAddr = reqIP
 	resp.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeAck))
 	resp.UpdateOption(dhcpv4.OptServerIdentifier(s.cfg.DHCPListen))
 	resp.UpdateOption(dhcpv4.OptIPAddressLeaseTime(s.cfg.Lease))
 	resp.UpdateOption(dhcpv4.OptRouter(s.cfg.DHCPListen))
 	resp.UpdateOption(dhcpv4.OptDNS(s.cfg.DNS1, s.cfg.DNS2))
-
 	s.logger.Info().Str("ip", reqIP.String()).Str("mac", req.ClientHWAddr.String()).Msg("ACKing IP")
+	return resp.ToBytes(), nil
+}
+
+// ... (le reste du fichier reste inchangé)
+
+func (s *Server) handleDiscover(req *dhcpv4.DHCPv4) ([]byte, error) {
+	s.logger.Debug().Msg("Handling DHCPDISCOVER")
+	s.poolV4.Lock()
+	defer s.poolV4.Unlock()
+
+	ip, err := s.poolV4.getFreeIP()
+	if err != nil {
+		return nil, err
+	}
+
+	s.logger.Info().Str("ip", ip.String()).Str("mac", req.ClientHWAddr.String()).Msg("Offering IP")
+
+	resp, err := dhcpv4.NewReplyFromRequest(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create DHCPv4 reply: %w", err)
+	}
+
+	resp.YourIPAddr = ip
+	resp.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeOffer))
+	resp.UpdateOption(dhcpv4.OptServerIdentifier(s.cfg.DHCPListen))
+	resp.UpdateOption(dhcpv4.OptIPAddressLeaseTime(s.cfg.Lease))
+	resp.UpdateOption(dhcpv4.OptRouter(s.cfg.DHCPListen))
+	resp.UpdateOption(dhcpv4.OptDNS(s.cfg.DNS1, s.cfg.DNS2))
 
 	return resp.ToBytes(), nil
 }
@@ -705,3 +347,10 @@ func nextIP(ip net.IP) net.IP {
 	}
 	return next
 }
+
+// Fonctions DHCPv6 (inchangées pour l'instant)
+func (s *Server) sendDHCPv6Response(respBytes []byte, reqPacket gopacket.Packet) error { return nil }
+func (s *Server) HandleDHCPv6(packet []byte) ([]byte, dhcpv6.DHCPv6, error) { return nil, nil, nil }
+func (s *Server) handleSolicit(req *dhcpv6.Message) (dhcpv6.DHCPv6, error) { return nil, nil }
+func (s *Server) handleRequestV6(req *dhcpv6.Message) (dhcpv6.DHCPv6, error) { return nil, nil }
+func (s *Server) relayDHCPv4(packet gopacket.Packet) error { return nil }

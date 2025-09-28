@@ -106,13 +106,14 @@ func main() {
 	go tun.ReadPackets(ifce, packetChan, log.Logger)
 	go processPackets(ifce, packetChan, cfg, sessionManager, dnsProxy, fw, log.Logger)
 
-	cmdChan := make(chan string)
+	cmdChan := make(chan cmdsock.CommandRequest)
 	cmdSockListener := cmdsock.NewListener(cfg.CmdSockPath, cmdChan, log.Logger)
 	go cmdSockListener.Start()
 
 	go func() {
-		for rawCmd := range cmdChan {
-			processCommand(rawCmd, log.Logger, cfg, sessionManager, disconnectManager, fw, radiusClient)
+		for req := range cmdChan {
+			response := processCommand(req.Command, log.Logger, cfg, sessionManager, disconnectManager, fw, radiusClient)
+			req.Response <- response
 		}
 	}()
 
@@ -289,65 +290,89 @@ func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config
 		if len(rawPacket) == 0 {
 			continue
 		}
+
 		var srcIP, dstIP net.IP
 		var payloadLength uint64
-		ipVersion := rawPacket[0] >> 4
-		packet := gopacket.NewPacket(rawPacket, layers.LayerTypeIPv4, gopacket.Lazy)
-		switch ipVersion {
-		case 4:
-			packet = gopacket.NewPacket(rawPacket, layers.LayerTypeIPv4, gopacket.Default)
-			if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
-				ipv4, _ := ipv4Layer.(*layers.IPv4)
-				srcIP, dstIP = ipv4.SrcIP, ipv4.DstIP
-				payloadLength = uint64(len(ipv4.Payload))
-				log.Debug().Str("src", srcIP.String()).Str("dst", dstIP.String()).Str("proto", ipv4.Protocol.String()).Msg("TUN In: IPv4")
-			}
-		case 6:
-			packet = gopacket.NewPacket(rawPacket, layers.LayerTypeIPv6, gopacket.Default)
-			if ipv6Layer := packet.Layer(layers.LayerTypeIPv6); ipv6Layer != nil {
-				ipv6, _ := ipv6Layer.(*layers.IPv6)
-				srcIP, dstIP = ipv6.SrcIP, ipv6.DstIP
-				payloadLength = uint64(len(ipv6.Payload))
-				log.Debug().Str("src", srcIP.String()).Str("dst", dstIP.String()).Str("proto", ipv6.NextHeader.String()).Msg("TUN In: IPv6")
-				if icmpv6Layer := packet.Layer(layers.LayerTypeICMPv6); icmpv6Layer != nil {
-					icmpv6Packet, _ := icmpv6Layer.(*layers.ICMPv6)
-					if icmpv6Packet.TypeCode.Type() == layers.ICMPv6TypeRouterSolicitation {
-						log.Info().Str("src", srcIP.String()).Msg("Received Router Solicitation")
-						if cfg.IPv6Enable && cfg.NetV6.IP != nil {
-							raPacket, err := icmpv6.BuildRouterAdvertisement(cfg, srcIP)
-							if err != nil {
-								log.Error().Err(err).Msg("Failed to build Router Advertisement")
-							} else {
-								if err := tun.WritePacket(ifce, raPacket); err != nil {
-									log.Error().Err(err).Msg("Failed to send Router Advertisement")
-								} else {
-									log.Info().Str("dst", srcIP.String()).Msg("Sent Router Advertisement")
-								}
-							}
-						}
-						continue
-					}
+		var vlanID uint16
+
+		// 1. Parse the packet as a full Ethernet frame.
+		packet := gopacket.NewPacket(rawPacket, layers.LayerTypeEthernet, gopacket.Default)
+
+		// 2. Check for and extract VLAN ID.
+		if dot1qLayer := packet.Layer(layers.LayerTypeDot1Q); dot1qLayer != nil {
+			dot1q, _ := dot1qLayer.(*layers.Dot1Q)
+			vlanID = dot1q.VLANIdentifier
+		}
+
+		// 3. Filter based on VLAN if enabled.
+		if cfg.IEEE8021Q && vlanID > 0 {
+			isAllowed := false
+			for _, allowedVLAN := range cfg.VLANs {
+				if uint16(allowedVLAN) == vlanID {
+					isAllowed = true
+					break
 				}
 			}
-		default:
-			log.Warn().Int("size", len(rawPacket)).Uint8("ipVersion", ipVersion).Msg("Received non-IP packet from TUN")
+			if !isAllowed {
+				log.Debug().Uint16("vlan", vlanID).Msg("Dropping packet from unconfigured VLAN")
+				continue
+			}
+		}
+
+		// 4. Find the network layer (IPv4 or IPv6).
+		if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
+			ipv4, _ := ipv4Layer.(*layers.IPv4)
+			srcIP, dstIP = ipv4.SrcIP, ipv4.DstIP
+			payloadLength = uint64(len(ipv4.Payload))
+			log.Debug().Str("src", srcIP.String()).Str("dst", dstIP.String()).Uint16("vlan", vlanID).Str("proto", ipv4.Protocol.String()).Msg("TUN In: IPv4")
+		} else if ipv6Layer := packet.Layer(layers.LayerTypeIPv6); ipv6Layer != nil {
+			ipv6, _ := ipv6Layer.(*layers.IPv6)
+			srcIP, dstIP = ipv6.SrcIP, ipv6.DstIP
+			payloadLength = uint64(len(ipv6.Payload))
+			log.Debug().Str("src", srcIP.String()).Str("dst", dstIP.String()).Uint16("vlan", vlanID).Str("proto", ipv6.NextHeader.String()).Msg("TUN In: IPv6")
+
+			if icmpv6Layer := packet.Layer(layers.LayerTypeICMPv6); icmpv6Layer != nil {
+				icmpv6Packet, _ := icmpv6Layer.(*layers.ICMPv6)
+				if icmpv6Packet.TypeCode.Type() == layers.ICMPv6TypeRouterSolicitation {
+					log.Info().Str("src", srcIP.String()).Msg("Received Router Solicitation")
+					if cfg.IPv6Enable && cfg.NetV6.IP != nil {
+						raPacket, err := icmpv6.BuildRouterAdvertisement(cfg, srcIP)
+						if err != nil {
+							log.Error().Err(err).Msg("Failed to build Router Advertisement")
+						} else {
+							if err := tun.WritePacket(ifce, raPacket); err != nil {
+								log.Error().Err(err).Msg("Failed to send Router Advertisement")
+							} else {
+								log.Info().Str("dst", srcIP.String()).Msg("Sent Router Advertisement")
+							}
+						}
+					}
+					continue
+				}
+			}
+		} else {
+			log.Warn().Int("size", len(rawPacket)).Msg("Received non-IP packet from TUN")
 			continue
 		}
+
 		if srcIP == nil {
 			continue
 		}
+
 		session, ok := sessionManager.GetSessionByIP(srcIP)
 		if !ok {
-			log.Debug().Str("ip", srcIP.String()).Msg("Packet from unknown source IP")
+			log.Debug().Str("ip", srcIP.String()).Msg("Packet from unknown source IP, dropping")
 			continue
 		}
+
 		session.RLock()
 		isAuthenticated := session.Authenticated
 		session.RUnlock()
+
 		if !isAuthenticated {
 			if dnsLayer := packet.Layer(layers.LayerTypeDNS); dnsLayer != nil {
 				dnsQuery, _ := dnsLayer.(*layers.DNS)
-				if dnsQuery.QR == false && dnsQuery.OpCode == layers.DNSOpCodeQuery {
+				if !dnsQuery.QR && dnsQuery.OpCode == layers.DNSOpCodeQuery {
 					upstreamAddr := fmt.Sprintf("%s:%d", cfg.DNS1.String(), 53)
 					responseBytes, resolvedIPs, err := dnsProxy.HandleQuery(dnsQuery, upstreamAddr)
 					if err != nil {
@@ -371,6 +396,7 @@ func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config
 				}
 			}
 		}
+
 		session.Lock()
 		session.LastSeen = time.Now()
 		session.LastActivityTimeSec = core.MonotonicTime()

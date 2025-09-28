@@ -182,3 +182,73 @@ func TestHandleRequestV6(t *testing.T) {
 	_, leaseExists := server.leasesV6[clientDUID.String()]
 	require.True(t, leaseExists, "Lease should have been created")
 }
+
+type mockSessionManagerForVLANTest struct {
+	core.SessionManager
+	createdVLANID uint16
+}
+
+func (m *mockSessionManagerForVLANTest) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID uint16, cfg *config.Config) *core.Session {
+	m.createdVLANID = vlanID
+	// Return a dummy session to avoid nil pointers
+	return &core.Session{AuthResult: make(chan bool, 1)}
+}
+
+func TestDHCP_VLAN(t *testing.T) {
+	cfg := &config.Config{}
+	logger := zerolog.Nop()
+	sm := &mockSessionManagerForVLANTest{}
+	radiusReqChan := make(chan *core.Session, 1)
+
+	server := &Server{
+		cfg:            cfg,
+		sessionManager: sm,
+		radiusReqChan:  radiusReqChan,
+		logger:         logger,
+	}
+
+	// 1. Create a DHCP request packet
+	clientMAC, _ := net.ParseMAC("00:00:5e:88:99:aa")
+	req, err := dhcpv4.New(
+		dhcpv4.WithMessageType(dhcpv4.MessageTypeRequest),
+		dhcpv4.WithClientIP(net.ParseIP("10.1.1.1")),
+		dhcpv4.WithHwAddr(clientMAC),
+	)
+	require.NoError(t, err)
+
+	// 2. Create the full Ethernet frame with a VLAN tag
+	ethLayer := &layers.Ethernet{
+		SrcMAC:       clientMAC,
+		DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+		EthernetType: layers.EthernetTypeDot1Q,
+	}
+	dot1qLayer := &layers.Dot1Q{
+		VLANIdentifier: 123,
+		Type:           layers.EthernetTypeIPv4,
+	}
+	ipLayer := &layers.IPv4{
+		Version:  4,
+		SrcIP:    net.IPv4zero,
+		DstIP:    net.IPv4bcast,
+		Protocol: layers.IPProtocolUDP,
+	}
+	udpLayer := &layers.UDP{
+		SrcPort: 68,
+		DstPort: 67,
+	}
+	_ = udpLayer.SetNetworkLayerForChecksum(ipLayer)
+
+	buffer := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	err = gopacket.SerializeLayers(buffer, opts, ethLayer, dot1qLayer, ipLayer, udpLayer, gopacket.Payload(req.ToBytes()))
+	require.NoError(t, err)
+
+	// 3. Create a gopacket.Packet from the raw bytes
+	packet := gopacket.NewPacket(buffer.Bytes(), layers.LayerTypeEthernet, gopacket.Default)
+
+	// 4. Call the handler
+	server.handlePacket(packet)
+
+	// 5. Assert that the session was created with the correct VLAN ID
+	require.Equal(t, uint16(123), sm.createdVLANID, "Session should be created with the correct VLAN ID")
+}

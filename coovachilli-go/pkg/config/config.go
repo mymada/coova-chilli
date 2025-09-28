@@ -35,6 +35,8 @@ type Config struct {
 
 	// DHCP settings
 	DHCPIf         string `yaml:"dhcpif"`
+	IEEE8021Q      bool   `yaml:"ieee8021q"`
+	VLANs          []int  `yaml:"vlans"`
 	DHCPRelay      bool   `yaml:"dhcprelay"`
 	DHCPUpstream   string `yaml:"dhcpupstream"`
 	DHCPStart      net.IP `yaml:"dhcpstart"`

@@ -19,6 +19,7 @@ type UserRuleManager interface {
 	RemoveAuthenticatedUser(ip net.IP) error
 	UpdateUserBandwidth(ip net.IP, bandwidthMaxUp uint64, bandwidthMaxDown uint64) error
 	AddToWalledGarden(ip net.IP, ttl uint32) error
+	RemoveFromWalledGarden(ip net.IP) error
 }
 
 const (
@@ -341,6 +342,35 @@ func (f *Firewall) AddToWalledGarden(ip net.IP, ttl uint32) error {
 		IP:        ip,
 		ExpiresAt: time.Now().Add(time.Duration(ttl) * time.Second),
 	}
+	return nil
+}
+
+// RemoveFromWalledGarden removes a single IP address from the walled garden chain.
+func (f *Firewall) RemoveFromWalledGarden(ip net.IP) error {
+	var handler IPTables
+	if ip.To4() != nil {
+		handler = f.ipt
+	} else if f.ip6t != nil {
+		handler = f.ip6t
+	} else {
+		return nil // Neither IPv4 nor IPv6, do nothing
+	}
+
+	ruleSpec := []string{"-d", ip.String(), "-j", "ACCEPT"}
+
+	if err := handler.Delete("filter", chainWalledGarden, ruleSpec...); err != nil {
+		// Don't return an error if the rule just doesn't exist, but log it.
+		if !strings.Contains(err.Error(), "does not exist") {
+			return fmt.Errorf("failed to remove IP %s from walled garden: %w", ip.String(), err)
+		}
+	}
+
+	// Also remove from our dynamic tracking map if it's there
+	f.dynamicWalledGardenMu.Lock()
+	delete(f.dynamicWalledGarden, ip.String())
+	f.dynamicWalledGardenMu.Unlock()
+
+	f.logger.Info().Str("ip", ip.String()).Msg("Removed IP from walled garden")
 	return nil
 }
 

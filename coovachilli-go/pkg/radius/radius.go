@@ -88,6 +88,12 @@ func (c *Client) SendAccessRequest(session *core.Session, username, password str
 	// Add MAC address
 	rfc2865.CallingStationID_SetString(packet, session.HisMAC.String())
 
+	// Add Port Type and VLAN ID if available
+	rfc2865.NASPortType_Set(packet, rfc2865.NASPortType(19)) // 19 for Wireless-Other, matches C version
+	if session.VLANID > 0 {
+		rfc2865.NASPortID_SetString(packet, fmt.Sprintf("vlan-%d", session.VLANID))
+	}
+
 	// Send the packet
 	server := fmt.Sprintf("%s:%d", c.cfg.RadiusServer1, c.cfg.RadiusAuthPort)
 	response, err := radius.Exchange(context.Background(), packet, server)
@@ -130,6 +136,12 @@ func (c *Client) SendAccountingRequest(session *core.Session, statusType rfc2866
 
 		// Add MAC address
 		rfc2865.CallingStationID_SetString(packet, session.HisMAC.String())
+
+	// Add Port Type and VLAN ID if available
+	rfc2865.NASPortType_Set(packet, rfc2865.NASPortType(19)) // 19 for Wireless-Other
+	if session.VLANID > 0 {
+		rfc2865.NASPortID_SetString(packet, fmt.Sprintf("vlan-%d", session.VLANID))
+	}
 
 		// Add terminate cause if this is a stop packet
 		if statusType == rfc2866.AcctStatusType(2) { // 2 = Stop
