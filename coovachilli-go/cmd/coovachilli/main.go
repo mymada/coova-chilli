@@ -14,6 +14,7 @@ import (
 	"coovachilli-go/pkg/dhcp"
 	"coovachilli-go/pkg/dns"
 	"coovachilli-go/pkg/firewall"
+	"fmt"
 	"coovachilli-go/pkg/cmdsock"
 	"coovachilli-go/pkg/http"
 	"coovachilli-go/pkg/disconnect"
@@ -512,7 +513,12 @@ func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config
 						log.Error().Err(err).Msg("DNS proxy failed to handle query")
 					} else if responseBytes != nil {
 						// Add resolved IPs to the walled garden
-						for ip, ttl := range resolvedIPs {
+						for ipStr, ttl := range resolvedIPs {
+							ip := net.ParseIP(ipStr)
+							if ip == nil {
+								log.Warn().Str("ip", ipStr).Msg("DNS proxy returned an invalid IP address")
+								continue
+							}
 							if err := fw.AddToWalledGarden(ip, ttl); err != nil {
 								log.Error().Err(err).Str("ip", ip.String()).Msg("Failed to add IP to walled garden")
 							}
