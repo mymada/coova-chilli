@@ -141,39 +141,79 @@ func main() {
 	// CoA processing loop
 	go func() {
 		for req := range coaReqChan {
-			// For now, we only handle Disconnect-Request
-			if req.Packet.Code != layehradius.CodeDisconnectRequest {
-				log.Warn().Str("code", req.Packet.Code.String()).Msg("Received unhandled CoA/DM code")
-				// Send NAK
-				response := req.Packet.Response(layehradius.CodeDisconnectNAK)
-				radiusClient.SendCoAResponse(response, req.Peer)
-				continue
-			}
-
-			// Find session to disconnect
 			userName := rfc2865.UserName_GetString(req.Packet)
 			// TODO: Also support finding by NAS-Port-Id, Acct-Session-Id, etc.
-			var sessionToDisconnect *core.Session
+			var sessionToUpdate *core.Session
 			for _, s := range sessionManager.GetAllSessions() {
 				if s.Redir.Username == userName {
-					sessionToDisconnect = s
+					sessionToUpdate = s
 					break
 				}
 			}
 
-			if sessionToDisconnect == nil {
-				log.Warn().Str("user", userName).Msg("Received Disconnect-Request for unknown user")
-				// Per RFC, if user is unknown, send ACK
-				response := req.Packet.Response(layehradius.CodeDisconnectACK)
+			if sessionToUpdate == nil {
+				log.Warn().Str("user", userName).Msg("Received CoA/Disconnect request for unknown user")
+				// Per RFC, if user is unknown, send ACK for Disconnect and NAK for CoA
+				var response *layehradius.Packet
+				if req.Packet.Code == layehradius.CodeDisconnectRequest {
+					response = req.Packet.Response(layehradius.CodeDisconnectACK)
+				} else {
+					response = req.Packet.Response(layehradius.CodeCoANAK)
+				}
 				radiusClient.SendCoAResponse(response, req.Peer)
 				continue
 			}
 
-			disconnectManager.Disconnect(sessionToDisconnect, "Admin-Reset")
+			switch req.Packet.Code {
+			case layehradius.CodeDisconnectRequest:
+				log.Info().Str("user", userName).Msg("Received Disconnect-Request")
+				disconnectManager.Disconnect(sessionToUpdate, "Admin-Reset")
+				response := req.Packet.Response(layehradius.CodeDisconnectACK)
+				radiusClient.SendCoAResponse(response, req.Peer)
 
-			// Send ACK
-			response := req.Packet.Response(layehradius.CodeDisconnectACK)
-			radiusClient.SendCoAResponse(response, req.Peer)
+			case layehradius.CodeCoARequest:
+				log.Info().Str("user", userName).Msg("Received CoA-Request, updating session parameters")
+
+				sessionToUpdate.Lock()
+				// Apply RADIUS attributes from CoA packet
+				if sessionTimeout, err := rfc2865.SessionTimeout_Lookup(req.Packet); err == nil {
+					log.Debug().Str("user", userName).Uint32("timeout", uint32(sessionTimeout)).Msg("Updating Session-Timeout")
+					sessionToUpdate.SessionParams.SessionTimeout = uint32(sessionTimeout)
+				}
+				if idleTimeout, err := rfc2865.IdleTimeout_Lookup(req.Packet); err == nil {
+					log.Debug().Str("user", userName).Uint32("timeout", uint32(idleTimeout)).Msg("Updating Idle-Timeout")
+					sessionToUpdate.SessionParams.IdleTimeout = uint32(idleTimeout)
+				}
+				if bwMaxDown, err := wispr.WISPrBandwidthMaxDown_Lookup(req.Packet); err == nil {
+					log.Debug().Str("user", userName).Uint64("bw", uint64(bwMaxDown)).Msg("Updating Bandwidth-Max-Down")
+					sessionToUpdate.SessionParams.BandwidthMaxDown = uint64(bwMaxDown)
+				}
+				if bwMaxUp, err := wispr.WISPrBandwidthMaxUp_Lookup(req.Packet); err == nil {
+					log.Debug().Str("user", userName).Uint64("bw", uint64(bwMaxUp)).Msg("Updating Bandwidth-Max-Up")
+					sessionToUpdate.SessionParams.BandwidthMaxUp = uint64(bwMaxUp)
+				}
+				// Get the newly set bandwidth values
+				bwUp := sessionToUpdate.SessionParams.BandwidthMaxUp
+				bwDown := sessionToUpdate.SessionParams.BandwidthMaxDown
+				sessionToUpdate.Unlock()
+
+				// Apply the bandwidth changes to the firewall/TC
+				if err := fw.UpdateUserBandwidth(sessionToUpdate.HisIP, bwUp, bwDown); err != nil {
+					log.Error().Err(err).Str("user", userName).Msg("Failed to apply CoA bandwidth changes")
+					// Send NAK because we couldn't apply the changes
+					response := req.Packet.Response(layehradius.CodeCoANAK)
+					radiusClient.SendCoAResponse(response, req.Peer)
+					continue // Go to next request
+				}
+
+				response := req.Packet.Response(layehradius.CodeCoAACK)
+				radiusClient.SendCoAResponse(response, req.Peer)
+
+			default:
+				log.Warn().Str("code", req.Packet.Code.String()).Msg("Received unhandled CoA/DM code")
+				response := req.Packet.Response(layehradius.CodeCoANAK) // Generic NAK for unhandled
+				radiusClient.SendCoAResponse(response, req.Peer)
+			}
 		}
 	}()
 

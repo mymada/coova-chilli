@@ -15,6 +15,7 @@ import (
 type UserRuleManager interface {
 	AddAuthenticatedUser(ip net.IP, bandwidthMaxUp uint64, bandwidthMaxDown uint64) error
 	RemoveAuthenticatedUser(ip net.IP) error
+	UpdateUserBandwidth(ip net.IP, bandwidthMaxUp uint64, bandwidthMaxDown uint64) error
 }
 
 const (
@@ -305,6 +306,34 @@ func (f *Firewall) RemoveAuthenticatedUser(ip net.IP) error {
 	}
 
 	f.logger.Info().Str("ip", ip.String()).Msg("Removed firewall rules for user")
+	return nil
+}
+
+// UpdateUserBandwidth dynamically changes the bandwidth limits for an already authenticated user.
+func (f *Firewall) UpdateUserBandwidth(ip net.IP, bandwidthMaxUp uint64, bandwidthMaxDown uint64) error {
+	// For now, we only support changing download bandwidth for IPv4 users.
+	if bandwidthMaxDown > 0 {
+		ipBytes := ip.To4()
+		if ipBytes != nil {
+			handle := ipBytes[3]
+			rate := bandwidthMaxDown / 1000 // tc uses kbit
+			if rate == 0 {
+				rate = 1 // Minimum rate of 1kbit
+			}
+
+			classID := fmt.Sprintf("1:%x", handle)
+			f.logger.Info().Str("ip", ip.String()).Str("rate", fmt.Sprintf("%dkbit", rate)).Str("classid", classID).Msg("Changing download bandwidth limit")
+
+			// Use 'tc class change' which is idempotent and safe to run even if the class has the same rate.
+			if err := f.runCommand("tc", "class", "change", "dev", f.cfg.TUNDev, "parent", "1:", "classid", classID, "htb", "rate", fmt.Sprintf("%dkbit", rate)); err != nil {
+				f.logger.Error().Err(err).Msg("Failed to change TC class for user")
+				return err
+			}
+		}
+	}
+	// Note: If bandwidthMaxDown is 0, we could remove the limit, but for now we only handle updates.
+	// Upload shaping is not implemented.
+
 	return nil
 }
 
