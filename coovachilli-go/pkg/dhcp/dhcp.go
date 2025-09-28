@@ -3,6 +3,7 @@ package dhcp
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -248,22 +249,49 @@ func (s *Server) sendDHCPv6Response(respBytes []byte, reqPacket gopacket.Packet)
 }
 
 func (s *Server) relayDHCPv4(packet gopacket.Packet) error {
-	dhcpLayer := packet.Layer(layers.LayerTypeDHCPv4)
-	if dhcpLayer == nil {
-		return fmt.Errorf("cannot relay packet without DHCPv4 layer")
+	var dhcpPayload []byte
+	if dhcpLayer := packet.Layer(layers.LayerTypeDHCPv4); dhcpLayer != nil {
+		dhcpPayload = dhcpLayer.LayerContents()
+	} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+		// Fallback for test packets where gopacket might not decode the DHCP layer
+		udp, _ := udpLayer.(*layers.UDP)
+		dhcpPayload = udp.Payload
 	}
-	dhcpPacket, err := dhcpv4.FromBytes(dhcpLayer.LayerContents())
+
+	if len(dhcpPayload) == 0 {
+		return fmt.Errorf("cannot relay packet without DHCPv4 layer or payload")
+	}
+
+	dhcpPacket, err := dhcpv4.FromBytes(dhcpPayload)
 	if err != nil {
 		return fmt.Errorf("failed to parse dhcpv4 packet for relay: %w", err)
 	}
 
 	dhcpPacket.GatewayIPAddr = s.cfg.DHCPListen
-	opt82 := dhcpv4.OptRelayAgentInfo(dhcpv4.OptGeneric(dhcpv4.OptionRelayAgentInformation, []byte("coovachilli-go")))
+
+	// Create a sub-option for the relay agent information.
+	agentCircuitID := dhcpv4.OptGeneric(dhcpv4.AgentCircuitIDSubOption, []byte("coovachilli-go"))
+
+	// Create the main Relay Agent Information option (Option 82) and add the sub-option to it.
+	opt82 := dhcpv4.OptRelayAgentInfo(agentCircuitID)
 	dhcpPacket.UpdateOption(opt82)
 
+	host, portStr, err := net.SplitHostPort(s.cfg.DHCPUpstream)
+	if err != nil {
+		return fmt.Errorf("invalid upstream address format '%s': %w", s.cfg.DHCPUpstream, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return fmt.Errorf("invalid upstream port '%s': %w", portStr, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("invalid upstream IP address '%s'", host)
+	}
+
 	upstreamAddr := &net.UDPAddr{
-		IP:   net.ParseIP(s.cfg.DHCPUpstream),
-		Port: 67,
+		IP:   ip,
+		Port: port,
 	}
 	conn, err := net.DialUDP("udp", nil, upstreamAddr)
 	if err != nil {

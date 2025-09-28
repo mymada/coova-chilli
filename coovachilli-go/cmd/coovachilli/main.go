@@ -252,6 +252,33 @@ func main() {
 		}
 	}()
 
+	log.Info().Msg("CoovaChilli-Go is running. Press Ctrl-C to stop.")
+
+	// Graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
+
+	log.Info().Msg("Shutting down CoovaChilli-Go...")
+
+	// Save active sessions to state file
+	if err := sessionManager.SaveSessions(cfg.StateFile); err != nil {
+		log.Error().Err(err).Msg("Failed to save sessions to state file")
+	} else {
+		log.Info().Msg("Successfully saved sessions to state file.")
+	}
+
+	// Perform cleanup tasks here
+	// For example, send accounting stop for all active sessions
+	for _, session := range sessionManager.GetAllSessions() {
+		if session.Authenticated {
+			disconnectManager.Disconnect(session, "NAS-Reboot")
+		}
+	}
+
+	// The deferred fw.Cleanup() will run now
+}
+
 func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config.Config, sessionManager *core.SessionManager, logger zerolog.Logger) {
 	log := logger.With().Str("component", "dispatcher").Logger()
 	for rawPacket := range packetChan {
@@ -328,31 +355,4 @@ func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config
 		session.OutputPackets++
 		session.Unlock()
 	}
-}
-
-	log.Info().Msg("CoovaChilli-Go is running. Press Ctrl-C to stop.")
-
-	// Graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
-
-	log.Info().Msg("Shutting down CoovaChilli-Go...")
-
-	// Save active sessions to state file
-	if err := sessionManager.SaveSessions(cfg.StateFile); err != nil {
-		log.Error().Err(err).Msg("Failed to save sessions to state file")
-	} else {
-		log.Info().Msg("Successfully saved sessions to state file.")
-	}
-
-	// Perform cleanup tasks here
-	// For example, send accounting stop for all active sessions
-	for _, session := range sessionManager.GetAllSessions() {
-		if session.Authenticated {
-			disconnectManager.Disconnect(session, "NAS-Reboot")
-		}
-	}
-
-	// The deferred fw.Cleanup() will run now
 }

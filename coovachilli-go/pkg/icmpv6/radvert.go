@@ -46,7 +46,7 @@ func BuildRouterAdvertisement(cfg *config.Config, soliciterIP net.IP) ([]byte, e
 	}
 
 	optSrcLLAddr := layers.ICMPv6Option{
-		Type: layers.ICMPv6OptionSourceLinkLayerAddress,
+		Type: layers.ICMPv6OptSourceAddress,
 		Data: routerMAC,
 	}
 
@@ -59,7 +59,7 @@ func BuildRouterAdvertisement(cfg *config.Config, soliciterIP net.IP) ([]byte, e
 	copy(optPrefixInfoData[16:], cfg.NetV6.IP.To16())
 
 	optPrefixInfo := layers.ICMPv6Option{
-		Type: layers.ICMPv6OptionPrefixInfo,
+		Type: layers.ICMPv6OptPrefixInfo,
 		Data: optPrefixInfoData,
 	}
 
