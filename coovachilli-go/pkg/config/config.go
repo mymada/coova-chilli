@@ -57,6 +57,9 @@ type Config struct {
 	RadiusSecret       string `yaml:"radiussecret"`
 	RadiusNASID        string `yaml:"radiusnasid"`
 	CoaPort            int    `yaml:"coaport"`
+	MACAuth            bool   `yaml:"macauth"`
+	MACPasswd          string `yaml:"macpasswd"`
+	MACSuffix          string `yaml:"macsuffix"`
 
 	// UAM/Captive Portal settings
 	UAMPort             int      `yaml:"uamport"`

@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -76,7 +77,7 @@ func main() {
 		// Re-apply firewall rules for reloaded sessions
 		for _, s := range sessionManager.GetAllSessions() {
 			if s.Authenticated {
-				if err := fw.AddAuthenticatedUser(s.HisIP); err != nil {
+				if err := fw.AddAuthenticatedUser(s.HisIP, s.SessionParams.BandwidthMaxUp, s.SessionParams.BandwidthMaxDown); err != nil {
 					log.Error().Err(err).Str("user", s.Redir.Username).Msg("Failed to re-apply firewall rule for loaded session")
 				}
 			}
@@ -87,7 +88,7 @@ func main() {
 	radiusClient := radius.NewClient(cfg, log.Logger)
 	disconnectManager := disconnect.NewManager(cfg, sessionManager, fw, radiusClient, scriptRunner, log.Logger)
 
-	reaper := core.NewReaper(cfg, sessionManager, disconnectManager, log.Logger)
+	reaper := core.NewReaper(cfg, sessionManager, disconnectManager, radiusClient, log.Logger)
 	reaper.Start()
 	defer reaper.Stop()
 
@@ -180,14 +181,36 @@ func main() {
 	go func() {
 		for session := range radiusReqChan {
 			go func(s *core.Session) {
+				var username, password string
+
+				// If username is empty, it's a MAC auth attempt from the DHCP handler
+				if s.Redir.Username == "" {
+					username = strings.ToUpper(strings.Replace(s.HisMAC.String(), ":", "-", -1))
+					if cfg.MACSuffix != "" {
+						username += cfg.MACSuffix
+					}
+
+					if cfg.MACPasswd != "" {
+						password = cfg.MACPasswd
+					} else {
+						password = username // Default password is the username
+					}
+					s.Redir.Username = username // Store generated username in session
+					log.Info().Str("mac", s.HisMAC.String()).Str("user", username).Msg("Attempting MAC authentication")
+				} else {
+					// It's a UAM login, use credentials from the session
+					username = s.Redir.Username
+					password = s.Redir.Password
+				}
+
 				// Try local authentication first if enabled
 				if cfg.UseLocalUsers {
-					authenticated, err := auth.AuthenticateLocalUser(cfg.LocalUsersFile, s.Redir.Username, s.Redir.Password)
+					authenticated, err := auth.AuthenticateLocalUser(cfg.LocalUsersFile, username, password)
 					if err != nil {
-						log.Error().Err(err).Str("user", s.Redir.Username).Msg("Error during local authentication")
+						log.Error().Err(err).Str("user", username).Msg("Error during local authentication")
 						// Fall through to RADIUS
 					} else if authenticated {
-						log.Info().Str("user", s.Redir.Username).Msg("Local authentication successful")
+						log.Info().Str("user", username).Msg("Local authentication successful")
 						s.Lock()
 						s.Authenticated = true
 						// Apply default session parameters for local users
@@ -195,7 +218,10 @@ func main() {
 						s.SessionParams.IdleTimeout = cfg.DefIdleTimeout
 						s.SessionParams.BandwidthMaxDown = cfg.DefBandwidthMaxDown
 						s.SessionParams.BandwidthMaxUp = cfg.DefBandwidthMaxUp
-						fw.AddAuthenticatedUser(s.HisIP)
+						if err := fw.AddAuthenticatedUser(s.HisIP, s.SessionParams.BandwidthMaxUp, s.SessionParams.BandwidthMaxDown); err != nil {
+							log.Error().Err(err).Str("user", s.Redir.Username).Msg("Error adding firewall/TC rules for local user")
+							// We can still proceed, but log the error
+						}
 						s.Unlock()
 						s.AuthResult <- true
 						return
@@ -203,10 +229,10 @@ func main() {
 				}
 
 				// Proceed with RADIUS authentication
-				log.Info().Str("session", s.SessionID).Msg("Processing RADIUS request")
-				resp, err := radiusClient.SendAccessRequest(s, s.Redir.Username, s.Redir.Password)
+				log.Info().Str("user", username).Msg("Processing RADIUS request")
+				resp, err := radiusClient.SendAccessRequest(s, username, password)
 				if err != nil {
-					log.Error().Err(err).Str("session", s.SessionID).Msg("Error sending RADIUS Access-Request")
+					log.Error().Err(err).Str("user", username).Msg("Error sending RADIUS Access-Request")
 					s.AuthResult <- false
 					return
 				}
@@ -232,14 +258,18 @@ func main() {
 						s.SessionParams.BandwidthMaxUp = uint64(bwMaxUp)
 					}
 
-					if err := fw.AddAuthenticatedUser(s.HisIP); err != nil {
-						log.Error().Err(err).Str("user", s.Redir.Username).Msg("Error adding firewall rule")
+					if err := fw.AddAuthenticatedUser(s.HisIP, s.SessionParams.BandwidthMaxUp, s.SessionParams.BandwidthMaxDown); err != nil {
+						log.Error().Err(err).Str("user", s.Redir.Username).Msg("Error adding firewall/TC rules")
 						s.AuthResult <- false // Signal failure if firewall rule fails
 						return
 					}
 
+					now := core.MonotonicTime()
+					s.LastInterimUpdateTime = now // Set initial time for interim updates
+
 					// Send accounting start
-					go radiusClient.SendAccountingRequest(s, rfc2866.AcctStatusType(1)) // 1 = Start
+					// Use integer value 1 for Start as the named constant is not available in this library version.
+					go radiusClient.SendAccountingRequest(s, rfc2866.AcctStatusType(1), "Start")
 					// Run conup script
 					scriptRunner.RunScript(cfg.ConUp, s, 0)
 					s.AuthResult <- true

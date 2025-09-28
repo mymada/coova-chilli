@@ -607,54 +607,46 @@ func (s *Server) handleRequest(req *dhcpv4.DHCPv4) ([]byte, error) {
 		return nil, fmt.Errorf("no requested IP address in DHCPREQUEST from client")
 	}
 
-	isRenewal := false
-	if _, ok := s.leasesV4[req.ClientHWAddr.String()]; ok {
-		isRenewal = true
-	}
-
-	if !isRenewal {
-		// The IP was already marked as 'used' by getFreeIP during the DISCOVER phase.
-		// The check for "already in use" was flawed because it would conflict
-		// with our own reservation. We now proceed directly to RADIUS auth.
-	}
-
 	session, ok := s.sessionManager.GetSessionByMAC(req.ClientHWAddr)
 	if !ok {
-		if isRenewal {
-			s.logger.Error().Str("mac", req.ClientHWAddr.String()).Msg("No session found for renewing MAC. Denying.")
-			return s.makeNak(req)
-		}
+		// This is a new client
 		s.logger.Debug().Str("mac", req.ClientHWAddr.String()).Msg("Creating new session for DHCPREQUEST")
 		session = s.sessionManager.CreateSession(reqIP, req.ClientHWAddr, s.cfg)
-	}
 
-	s.logger.Debug().Str("mac", req.ClientHWAddr.String()).Msg("Sending session to RADIUS for authorization")
-	s.radiusReqChan <- session
+		if s.cfg.MACAuth {
+			s.logger.Info().Str("mac", req.ClientHWAddr.String()).Msg("MAC authentication enabled, attempting RADIUS auth")
+			s.radiusReqChan <- session
 
-	select {
-	case authOK := <-session.AuthResult:
-		if !authOK {
-			s.logger.Warn().Str("mac", req.ClientHWAddr.String()).Msg("Authentication failed, sending NAK")
-			if isRenewal {
-				delete(s.leasesV4, req.ClientHWAddr.String())
+			select {
+			case authOK := <-session.AuthResult:
+				if !authOK {
+					s.logger.Warn().Str("mac", req.ClientHWAddr.String()).Msg("MAC authentication failed, sending NAK")
+					s.poolV4.Lock()
+					delete(s.poolV4.used, reqIP.String())
+					s.poolV4.Unlock()
+					return s.makeNak(req)
+				}
+				s.logger.Info().Str("mac", req.ClientHWAddr.String()).Msg("MAC authentication successful")
+				// Fall through to ACK
+			case <-time.After(5 * time.Second):
+				s.logger.Error().Str("mac", req.ClientHWAddr.String()).Msg("MAC authentication timed out, sending NAK")
+				s.poolV4.Lock()
+				delete(s.poolV4.used, reqIP.String())
+				s.poolV4.Unlock()
+				return s.makeNak(req)
 			}
-			s.poolV4.Lock()
-			delete(s.poolV4.used, reqIP.String())
-			s.poolV4.Unlock()
-			return s.makeNak(req)
+		} else {
+			s.logger.Debug().Str("mac", req.ClientHWAddr.String()).Msg("MAC authentication disabled, proceeding with UAM flow")
 		}
-	case <-time.After(5 * time.Second):
-		s.logger.Error().Str("mac", req.ClientHWAddr.String()).Msg("Authentication timed out, sending NAK")
-		if isRenewal {
-			delete(s.leasesV4, req.ClientHWAddr.String())
-		}
-		s.poolV4.Lock()
-		delete(s.poolV4.used, reqIP.String())
-		s.poolV4.Unlock()
-		return s.makeNak(req)
+	} else {
+		// This is a renewal for an existing client.
+		// We just ACK to renew their lease. If they are not authenticated,
+		// the firewall will continue to handle redirection.
+		s.logger.Debug().Str("mac", req.ClientHWAddr.String()).Bool("authenticated", session.Authenticated).Msg("Renewing lease for existing session")
 	}
 
-	s.logger.Info().Str("mac", req.ClientHWAddr.String()).Bool("renewal", isRenewal).Msg("Authentication successful, creating lease")
+	// If we reach here, it means either auth was successful or not required.
+	// We grant the lease.
 	lease := &Lease{
 		IP:      reqIP,
 		MAC:     req.ClientHWAddr,
