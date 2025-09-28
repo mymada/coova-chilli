@@ -12,6 +12,7 @@ import (
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
 	"coovachilli-go/pkg/dhcp"
+	"coovachilli-go/pkg/dns"
 	"coovachilli-go/pkg/firewall"
 	"coovachilli-go/pkg/cmdsock"
 	"coovachilli-go/pkg/http"
@@ -68,6 +69,7 @@ func main() {
 
 	scriptRunner := script.NewRunner(log.Logger, cfg)
 	sessionManager := core.NewSessionManager()
+	dnsProxy := dns.NewProxy(cfg, log.Logger)
 
 	// Load previous sessions
 	if err := sessionManager.LoadSessions(cfg.StateFile); err != nil {
@@ -109,7 +111,7 @@ func main() {
 	go tun.ReadPackets(ifce, packetChan, log.Logger)
 
 	// Pass the TUN interface to the dispatcher so it can write packets back (for RAs)
-	go processPackets(ifce, packetChan, cfg, sessionManager, log.Logger)
+	go processPackets(ifce, packetChan, cfg, sessionManager, dnsProxy, fw, log.Logger)
 
 	cmdChan := make(chan string)
 	cmdSockListener := cmdsock.NewListener(cfg.CmdSockPath, cmdChan, log.Logger)
@@ -120,8 +122,16 @@ func main() {
 
 	// Command socket processing loop
 	go func() {
-		for cmd := range cmdChan {
-			if cmd == "list" {
+		for rawCmd := range cmdChan {
+			parts := strings.Fields(rawCmd)
+			if len(parts) == 0 {
+				continue
+			}
+			cmd := parts[0]
+			args := parts[1:]
+
+			switch cmd {
+			case "list":
 				log.Info().Msg("--- Active Sessions ---")
 				for _, s := range sessionManager.GetAllSessions() {
 					log.Info().
@@ -132,7 +142,78 @@ func main() {
 						Msg("Session")
 				}
 				log.Info().Msg("-----------------------")
-			} else {
+			// Placeholder for future commands
+			case "logout":
+				if len(args) != 1 {
+					log.Warn().Msg("Usage: logout <mac_or_ip>")
+					continue
+				}
+				target := args[0]
+				var sessionToDisconnect *core.Session
+
+				// Try parsing as MAC address first
+				if mac, err := net.ParseMAC(target); err == nil {
+					sessionToDisconnect, _ = sessionManager.GetSessionByMAC(mac)
+				} else if ip := net.ParseIP(target); ip != nil {
+					// Try parsing as IP address
+					sessionToDisconnect, _ = sessionManager.GetSessionByIP(ip)
+				}
+
+				if sessionToDisconnect != nil {
+					log.Info().Str("target", target).Msg("Disconnecting user by admin command")
+					disconnectManager.Disconnect(sessionToDisconnect, "Admin-Reset")
+				} else {
+					log.Warn().Str("target", target).Msg("Could not find session to disconnect")
+				}
+
+			case "authorize":
+				if len(args) != 1 {
+					log.Warn().Msg("Usage: authorize <mac>")
+					continue
+				}
+				targetMAC, err := net.ParseMAC(args[0])
+				if err != nil {
+					log.Warn().Err(err).Msg("Invalid MAC address provided for authorize command")
+					continue
+				}
+
+				sessionToAuthorize, ok := sessionManager.GetSessionByMAC(targetMAC)
+				if !ok {
+					log.Warn().Str("mac", args[0]).Msg("Could not find session to authorize")
+					continue
+				}
+
+				sessionToAuthorize.Lock()
+				if sessionToAuthorize.Authenticated {
+					log.Warn().Str("mac", args[0]).Msg("Session is already authenticated")
+					sessionToAuthorize.Unlock()
+					continue
+				}
+
+				log.Info().Str("mac", args[0]).Msg("Authorizing user by admin command")
+				sessionToAuthorize.Authenticated = true
+				// Apply default session parameters
+				sessionToAuthorize.SessionParams.SessionTimeout = cfg.DefSessionTimeout
+				sessionToAuthorize.SessionParams.IdleTimeout = cfg.DefIdleTimeout
+				sessionToAuthorize.SessionParams.BandwidthMaxDown = cfg.DefBandwidthMaxDown
+				sessionToAuthorize.SessionParams.BandwidthMaxUp = cfg.DefBandwidthMaxUp
+
+				bwUp := sessionToAuthorize.SessionParams.BandwidthMaxUp
+				bwDown := sessionToAuthorize.SessionParams.BandwidthMaxDown
+				sessionIP := sessionToAuthorize.HisIP
+
+				sessionToAuthorize.Unlock()
+
+				// Grant network access
+				if err := fw.AddAuthenticatedUser(sessionIP, bwUp, bwDown); err != nil {
+					log.Error().Err(err).Str("mac", args[0]).Msg("Failed to apply firewall rules for authorized user")
+					// Revert auth status on failure? For now, just log.
+				}
+
+				// Send accounting start
+				go radiusClient.SendAccountingRequest(sessionToAuthorize, rfc2866.AcctStatusType(1), "Admin-Authorize")
+
+			default:
 				log.Warn().Str("cmd", cmd).Msg("Unknown command")
 			}
 		}
@@ -349,7 +430,7 @@ func main() {
 	// The deferred fw.Cleanup() will run now
 }
 
-func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config.Config, sessionManager *core.SessionManager, logger zerolog.Logger) {
+func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config.Config, sessionManager *core.SessionManager, dnsProxy *dns.Proxy, fw *firewall.Firewall, logger zerolog.Logger) {
 	log := logger.With().Str("component", "dispatcher").Logger()
 	for rawPacket := range packetChan {
 		if len(rawPacket) == 0 {
@@ -417,6 +498,36 @@ func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config
 			continue
 		}
 
+		// DNS Interception for Walled Garden by Domain
+		session.RLock()
+		isAuthenticated := session.Authenticated
+		session.RUnlock()
+
+		if !isAuthenticated {
+			if dnsLayer := packet.Layer(layers.LayerTypeDNS); dnsLayer != nil {
+				dnsQuery, _ := dnsLayer.(*layers.DNS)
+				if dnsQuery.QR == false && dnsQuery.OpCode == layers.DNSOpCodeQuery {
+					responseBytes, resolvedIPs, err := dnsProxy.HandleQuery(dnsQuery)
+					if err != nil {
+						log.Error().Err(err).Msg("DNS proxy failed to handle query")
+					} else if responseBytes != nil {
+						// Add resolved IPs to the walled garden
+						for ip, ttl := range resolvedIPs {
+							if err := fw.AddToWalledGarden(ip, ttl); err != nil {
+								log.Error().Err(err).Str("ip", ip.String()).Msg("Failed to add IP to walled garden")
+							}
+						}
+						// Send the DNS response back to the client
+						if err := sendDNSResponse(ifce, packet, responseBytes); err != nil {
+							log.Error().Err(err).Msg("Failed to send DNS response to client")
+						}
+					}
+					// We always stop processing DNS packets from unauthenticated users here.
+					continue
+				}
+			}
+		}
+
 		// Update session activity and stats
 		session.Lock()
 		session.LastSeen = time.Now()
@@ -425,4 +536,46 @@ func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config
 		session.OutputPackets++
 		session.Unlock()
 	}
+}
+
+func sendDNSResponse(ifce *water.Interface, reqPacket gopacket.Packet, respPayload []byte) error {
+	// Extract layers from the original request to build the response
+	reqIPv4, okIPv4 := reqPacket.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+	reqUDP, okUDP := reqPacket.Layer(layers.LayerTypeUDP).(*layers.UDP)
+
+	if !okIPv4 || !okUDP {
+		return fmt.Errorf("could not parse original DNS request layers (not IPv4/UDP)")
+	}
+
+	ipLayer := &layers.IPv4{
+		Version:  4,
+		IHL:      5,
+		TTL:      64,
+		Protocol: layers.IPProtocolUDP,
+		SrcIP:    reqIPv4.DstIP, // Our IP is the source
+		DstIP:    reqIPv4.SrcIP, // Client's IP is the destination
+	}
+
+	udpLayer := &layers.UDP{
+		SrcPort: reqUDP.DstPort, // DNS port 53
+		DstPort: reqUDP.SrcPort, // Client's ephemeral port
+	}
+	if err := udpLayer.SetNetworkLayerForChecksum(ipLayer); err != nil {
+		return fmt.Errorf("failed to set network layer for DNS response checksum: %w", err)
+	}
+
+	buffer := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{
+		ComputeChecksums: true,
+		FixLengths:       true,
+	}
+
+	if err := gopacket.SerializeLayers(buffer, opts, ipLayer, udpLayer, gopacket.Payload(respPayload)); err != nil {
+		return fmt.Errorf("failed to serialize DNS response: %w", err)
+	}
+
+	if _, err := ifce.Write(buffer.Bytes()); err != nil {
+		return fmt.Errorf("failed to write DNS response to TUN interface: %w", err)
+	}
+	return nil
 }

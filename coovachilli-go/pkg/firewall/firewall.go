@@ -36,12 +36,25 @@ type IPTables interface {
 	ListChains(table string) ([]string, error)
 }
 
+import (
+	"sync"
+	"time"
+)
+
+type dynamicWalledGardenEntry struct {
+	IP        net.IP
+	ExpiresAt time.Time
+}
+
 // Firewall manages the system's firewall rules.
 type Firewall struct {
 	cfg    *config.Config
 	ipt    IPTables
 	ip6t   IPTables
 	logger zerolog.Logger
+
+	dynamicWalledGarden   map[string]dynamicWalledGardenEntry
+	dynamicWalledGardenMu sync.RWMutex
 }
 
 // NewFirewall creates a new Firewall manager.
@@ -66,10 +79,11 @@ func NewFirewall(cfg *config.Config, logger zerolog.Logger) (*Firewall, error) {
 	}
 
 	return &Firewall{
-		cfg:    cfg,
-		ipt:    ipt,
-		ip6t:   ip6t,
-		logger: logger.With().Str("component", "firewall").Logger(),
+		cfg:                   cfg,
+		ipt:                   ipt,
+		ip6t:                  ip6t,
+		logger:                logger.With().Str("component", "firewall").Logger(),
+		dynamicWalledGarden:   make(map[string]dynamicWalledGardenEntry),
 	}, nil
 }
 
@@ -143,6 +157,8 @@ func (f *Firewall) Initialize() error {
 		// Don't return an error, as the firewall might still be useful.
 	}
 
+	// Start the reaper for dynamic walled garden entries
+	go f.reapWalledGarden()
 
 	f.logger.Info().Msg("Firewall initialized successfully")
 	return nil
@@ -307,6 +323,73 @@ func (f *Firewall) RemoveAuthenticatedUser(ip net.IP) error {
 
 	f.logger.Info().Str("ip", ip.String()).Msg("Removed firewall rules for user")
 	return nil
+}
+
+// AddToWalledGarden adds a single IP address to the walled garden chain with a specific TTL.
+func (f *Firewall) AddToWalledGarden(ip net.IP, ttl uint32) error {
+	var handler IPTables
+	if ip.To4() != nil {
+		handler = f.ipt
+	} else if f.ip6t != nil {
+		handler = f.ip6t
+	} else {
+		return nil // Neither IPv4 nor IPv6, do nothing
+	}
+
+	ruleSpec := []string{"-d", ip.String(), "-j", "ACCEPT"}
+
+	// Check if the rule already exists to avoid duplicates
+	exists, err := handler.Exists("filter", chainWalledGarden, ruleSpec...)
+	if err != nil {
+		f.logger.Warn().Err(err).Str("ip", ip.String()).Msg("Failed to check for existing walled garden rule")
+	}
+	if !exists {
+		if err := handler.Append("filter", chainWalledGarden, ruleSpec...); err != nil {
+			return fmt.Errorf("failed to add IP %s to walled garden: %w", ip.String(), err)
+		}
+		f.logger.Info().Str("ip", ip.String()).Uint32("ttl", ttl).Msg("Added IP to dynamic walled garden")
+	}
+
+	// Add or update the entry in our tracking map
+	f.dynamicWalledGardenMu.Lock()
+	defer f.dynamicWalledGardenMu.Unlock()
+	f.dynamicWalledGarden[ip.String()] = dynamicWalledGardenEntry{
+		IP:        ip,
+		ExpiresAt: time.Now().Add(time.Duration(ttl) * time.Second),
+	}
+
+	return nil
+}
+
+func (f *Firewall) reapWalledGarden() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		f.dynamicWalledGardenMu.Lock()
+		now := time.Now()
+		for key, entry := range f.dynamicWalledGarden {
+			if now.After(entry.ExpiresAt) {
+				f.logger.Info().Str("ip", entry.IP.String()).Msg("Walled garden entry expired, removing rule")
+
+				var handler IPTables
+				if entry.IP.To4() != nil {
+					handler = f.ipt
+				} else if f.ip6t != nil {
+					handler = f.ip6t
+				}
+
+				if handler != nil {
+					ruleSpec := []string{"-d", entry.IP.String(), "-j", "ACCEPT"}
+					if err := handler.Delete("filter", chainWalledGarden, ruleSpec...); err != nil {
+						f.logger.Warn().Err(err).Str("ip", entry.IP.String()).Msg("Failed to delete expired walled garden rule")
+					}
+				}
+				delete(f.dynamicWalledGarden, key)
+			}
+		}
+		f.dynamicWalledGardenMu.Unlock()
+	}
 }
 
 // UpdateUserBandwidth dynamically changes the bandwidth limits for an already authenticated user.
