@@ -50,7 +50,6 @@ func NewFirewall(cfg *config.Config, logger zerolog.Logger) (*Firewall, error) {
 
 	var ip6t IPTables
 	if cfg.IPv6Enable {
-		// Attempt to create an ip6tables handler, but don't fail if it's not available.
 		if ip6tReal, err := iptables.NewWithProtocol(iptables.ProtocolIPv6); err != nil {
 			logger.Warn().Err(err).Msg("Failed to create ip6tables handler, IPv6 firewall will be disabled")
 			ip6t = nil
@@ -75,14 +74,12 @@ func NewFirewall(cfg *config.Config, logger zerolog.Logger) (*Firewall, error) {
 func (f *Firewall) setupChains(handler IPTables, protocol string) error {
 	for _, chain := range []string{chainChilli, chainWalledGarden} {
 		for _, table := range []string{"nat", "filter"} {
-			// Special handling for IPv6 NAT, which might not be supported.
 			if protocol == "IPv6" && table == "nat" {
-				// Check if the table exists at all. If not, disable ip6t and return.
 				if _, err := handler.ListChains(table); err != nil {
 					if strings.Contains(err.Error(), "No such file or directory") || strings.Contains(err.Error(), "table nat does not exist") {
 						f.logger.Warn().Err(err).Msg("IPv6 NAT table not supported, disabling IPv6 firewall.")
 						f.ip6t = nil // Permanently disable for this run.
-						return nil   // Not a fatal error, just skip IPv6 setup.
+						return nil
 					}
 				}
 			}
@@ -117,7 +114,6 @@ func (f *Firewall) Initialize() error {
 		if err := f.setupChains(f.ip6t, "IPv6"); err != nil {
 			return err
 		}
-		// setupChains might disable ip6t if NAT is not supported.
 		if f.ip6t != nil {
 			f.initializeIPv6Rules()
 		}
@@ -128,26 +124,21 @@ func (f *Firewall) Initialize() error {
 }
 
 func (f *Firewall) initializeIPv4Rules() error {
-	// NAT rules
 	if f.cfg.ExtIf != "" {
 		f.ipt.Append("nat", "POSTROUTING", "-s", f.cfg.Net.String(), "-o", f.cfg.ExtIf, "-j", "MASQUERADE")
 	}
 
-	// Redirect unauthenticated users to the captive portal
 	f.ipt.Append("nat", "PREROUTING", "-i", f.cfg.TUNDev, "-j", chainChilli)
 	f.ipt.Append("nat", chainChilli, "-j", chainWalledGarden)
 	for _, domain := range f.cfg.UAMAllowed {
 		f.ipt.Append("nat", chainWalledGarden, "-d", domain, "-j", "RETURN")
 	}
-	// For everything else, redirect HTTP to the portal
 	f.ipt.Append("nat", chainChilli, "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-ports", fmt.Sprintf("%d", f.cfg.UAMPort))
 
-	// Filter rules
 	if f.cfg.ClientIsolation {
 		f.ipt.Append("filter", "FORWARD", "-i", f.cfg.TUNDev, "-o", f.cfg.TUNDev, "-j", "DROP")
 	}
 	f.ipt.Append("filter", "FORWARD", "-i", f.cfg.TUNDev, "-j", chainChilli)
-	// Open specified TCP/UDP ports for all users
 	for _, port := range f.cfg.TCPPorts {
 		f.ipt.Append("filter", chainChilli, "-p", "tcp", "--dport", fmt.Sprintf("%d", port), "-j", "ACCEPT")
 	}
@@ -158,26 +149,21 @@ func (f *Firewall) initializeIPv4Rules() error {
 }
 
 func (f *Firewall) initializeIPv6Rules() error {
-	// NAT rules
 	if f.cfg.ExtIf != "" && f.cfg.NetV6.IP != nil {
 		f.ip6t.Append("nat", "POSTROUTING", "-s", f.cfg.NetV6.String(), "-o", f.cfg.ExtIf, "-j", "MASQUERADE")
 	}
 
-	// Redirect unauthenticated users to the captive portal
 	f.ip6t.Append("nat", "PREROUTING", "-i", f.cfg.TUNDev, "-j", chainChilli)
 	f.ip6t.Append("nat", chainChilli, "-j", chainWalledGarden)
 	for _, domain := range f.cfg.UAMAllowedV6 {
 		f.ip6t.Append("nat", chainWalledGarden, "-d", domain, "-j", "RETURN")
 	}
-	// For everything else, redirect HTTP to the portal
 	f.ip6t.Append("nat", chainChilli, "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-ports", fmt.Sprintf("%d", f.cfg.UAMPort))
 
-	// Filter rules
 	if f.cfg.ClientIsolation {
 		f.ip6t.Append("filter", "FORWARD", "-i", f.cfg.TUNDev, "-o", f.cfg.TUNDev, "-j", "DROP")
 	}
 	f.ip6t.Append("filter", "FORWARD", "-i", f.cfg.TUNDev, "-j", chainChilli)
-	// Open specified TCP/UDP ports for all users
 	for _, port := range f.cfg.TCPPorts {
 		f.ip6t.Append("filter", chainChilli, "-p", "tcp", "--dport", fmt.Sprintf("%d", port), "-j", "ACCEPT")
 	}
@@ -195,7 +181,7 @@ func (f *Firewall) AddAuthenticatedUser(ip net.IP) error {
 	} else if f.ip6t != nil {
 		handler = f.ip6t
 	} else {
-		return nil // No-op if IPv6 is not supported/enabled
+		return nil
 	}
 
 	if err := handler.Insert("nat", chainChilli, 1, "-s", ip.String(), "-j", "RETURN"); err != nil {
@@ -217,7 +203,7 @@ func (f *Firewall) RemoveAuthenticatedUser(ip net.IP) error {
 	} else if f.ip6t != nil {
 		handler = f.ip6t
 	} else {
-		return nil // No-op if IPv6 is not supported/enabled
+		return nil
 	}
 
 	if err := handler.Delete("nat", chainChilli, "-s", ip.String(), "-j", "RETURN"); err != nil {
@@ -234,10 +220,8 @@ func (f *Firewall) RemoveAuthenticatedUser(ip net.IP) error {
 // Cleanup removes all firewall rules and chains created by the application.
 func (f *Firewall) Cleanup() {
 	f.logger.Info().Msg("Cleaning up firewall rules...")
-	// IPv4 cleanup
 	f.cleanupHandler(f.ipt, f.cfg.Net.String(), false)
 
-	// IPv6 cleanup
 	if f.ip6t != nil {
 		var netV6 string
 		if f.cfg.NetV6.IP != nil {
@@ -249,7 +233,6 @@ func (f *Firewall) Cleanup() {
 }
 
 func (f *Firewall) cleanupHandler(handler IPTables, network string, isIPv6 bool) {
-	// Delete main rules
 	if f.cfg.ExtIf != "" && network != "" {
 		handler.Delete("nat", "POSTROUTING", "-s", network, "-o", f.cfg.ExtIf, "-j", "MASQUERADE")
 	}
@@ -259,9 +242,7 @@ func (f *Firewall) cleanupHandler(handler IPTables, network string, isIPv6 bool)
 		handler.Delete("filter", "FORWARD", "-i", f.cfg.TUNDev, "-o", f.cfg.TUNDev, "-j", "DROP")
 	}
 
-	// Clear and delete custom chains
 	for _, chain := range []string{chainChilli, chainWalledGarden} {
-		// For IPv6, the NAT table might not exist, so check before clearing/deleting.
 		if isIPv6 {
 			if _, err := handler.ListChains("nat"); err == nil {
 				handler.ClearChain("nat", chain)

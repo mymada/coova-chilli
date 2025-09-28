@@ -21,8 +21,8 @@ import (
 	"coovachilli-go/pkg/tun"
 
 	"github.com/songgao/water"
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 	"github.com/rs/zerolog"
 
 	"github.com/rs/zerolog/log"
@@ -115,10 +115,9 @@ func main() {
 	go cmdSockListener.Start()
 
 	coaReqChan := make(chan radius.CoAIncomingRequest)
-	// The CoA listener will handle both IPv4 and IPv6 based on the config
 	go radiusClient.StartCoAListener(coaReqChan)
 
-	// CoA processing loop
+	// Command socket processing loop
 	go func() {
 		for cmd := range cmdChan {
 			if cmd == "list" {
