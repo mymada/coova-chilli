@@ -2,9 +2,11 @@ package main
 
 import (
 	"flag"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
@@ -13,12 +15,14 @@ import (
 	"coovachilli-go/pkg/cmdsock"
 	"coovachilli-go/pkg/http"
 	"coovachilli-go/pkg/disconnect"
+	"coovachilli-go/pkg/icmpv6"
 	"coovachilli-go/pkg/radius"
 	"coovachilli-go/pkg/script"
 	"coovachilli-go/pkg/tun"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/songgao/water"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 	"github.com/rs/zerolog"
 
 	"github.com/rs/zerolog/log"
@@ -102,6 +106,9 @@ func main() {
 
 	packetChan := make(chan []byte)
 	go tun.ReadPackets(ifce, packetChan, log.Logger)
+
+	// Pass the TUN interface to the dispatcher so it can write packets back (for RAs)
+	go processPackets(ifce, packetChan, cfg, sessionManager, log.Logger)
 
 	cmdChan := make(chan string)
 	cmdSockListener := cmdsock.NewListener(cfg.CmdSockPath, cmdChan, log.Logger)
@@ -245,30 +252,83 @@ func main() {
 		}
 	}()
 
-	// Packet dispatcher
-	go func() {
-		for rawPacket := range packetChan {
-			packet := gopacket.NewPacket(rawPacket, layers.LayerTypeIPv4, gopacket.Default)
+func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config.Config, sessionManager *core.SessionManager, logger zerolog.Logger) {
+	log := logger.With().Str("component", "dispatcher").Logger()
+	for rawPacket := range packetChan {
+		if len(rawPacket) == 0 {
+			continue
+		}
+
+		var srcIP, dstIP net.IP
+		var payloadLength uint64
+
+		// Read the IP version from the first 4 bits of the packet
+		ipVersion := rawPacket[0] >> 4
+		packet := gopacket.NewPacket(rawPacket, layers.LayerTypeIPv4, gopacket.Lazy)
+
+		switch ipVersion {
+		case 4:
+			packet = gopacket.NewPacket(rawPacket, layers.LayerTypeIPv4, gopacket.Default)
 			if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
 				ipv4, _ := ipv4Layer.(*layers.IPv4)
-				log.Debug().
-					Str("src", ipv4.SrcIP.String()).
-					Str("dst", ipv4.DstIP.String()).
-					Str("proto", ipv4.Protocol.String()).
-					Msg("TUN In: IPv4 packet")
-
-			} else if ipv6Layer := packet.Layer(layers.LayerTypeIPv6); ipv6Layer != nil {
-				ipv6, _ := ipv6Layer.(*layers.IPv6)
-				log.Debug().
-					Str("src", ipv6.SrcIP.String()).
-					Str("dst", ipv6.DstIP.String()).
-					Str("proto", ipv6.NextHeader.String()).
-					Msg("TUN In: IPv6 packet")
-			} else {
-				log.Warn().Int("size", len(rawPacket)).Msg("Received non-IP packet from TUN")
+				srcIP, dstIP = ipv4.SrcIP, ipv4.DstIP
+				payloadLength = uint64(len(ipv4.Payload))
+				log.Debug().Str("src", srcIP.String()).Str("dst", dstIP.String()).Str("proto", ipv4.Protocol.String()).Msg("TUN In: IPv4")
 			}
+		case 6:
+			packet = gopacket.NewPacket(rawPacket, layers.LayerTypeIPv6, gopacket.Default)
+			if ipv6Layer := packet.Layer(layers.LayerTypeIPv6); ipv6Layer != nil {
+				ipv6, _ := ipv6Layer.(*layers.IPv6)
+				srcIP, dstIP = ipv6.SrcIP, ipv6.DstIP
+				payloadLength = uint64(len(ipv6.Payload))
+				log.Debug().Str("src", srcIP.String()).Str("dst", dstIP.String()).Str("proto", ipv6.NextHeader.String()).Msg("TUN In: IPv6")
+
+				// Check for ICMPv6 Router Solicitation
+				if icmpv6Layer := packet.Layer(layers.LayerTypeICMPv6); icmpv6Layer != nil {
+					icmpv6Packet, _ := icmpv6Layer.(*layers.ICMPv6)
+					if icmpv6Packet.TypeCode.Type() == layers.ICMPv6TypeRouterSolicitation {
+						log.Info().Str("src", srcIP.String()).Msg("Received Router Solicitation")
+						if cfg.IPv6Enable && cfg.NetV6.IP != nil {
+							raPacket, err := icmpv6.BuildRouterAdvertisement(cfg, srcIP)
+							if err != nil {
+								log.Error().Err(err).Msg("Failed to build Router Advertisement")
+							} else {
+								if err := tun.WritePacket(ifce, raPacket); err != nil {
+									log.Error().Err(err).Msg("Failed to send Router Advertisement")
+								} else {
+									log.Info().Str("dst", srcIP.String()).Msg("Sent Router Advertisement")
+								}
+							}
+						}
+						continue // Don't process RS as a session packet
+					}
+				}
+			}
+		default:
+			log.Warn().Int("size", len(rawPacket)).Uint8("ipVersion", ipVersion).Msg("Received non-IP packet from TUN")
+			continue
 		}
-	}()
+
+		if srcIP == nil {
+			continue // Couldn't parse packet
+		}
+
+		// For now, we only care about traffic originating from the client
+		session, ok := sessionManager.GetSessionByIP(srcIP)
+		if !ok {
+			log.Debug().Str("ip", srcIP.String()).Msg("Packet from unknown source IP")
+			continue
+		}
+
+		// Update session activity and stats
+		session.Lock()
+		session.LastSeen = time.Now()
+		session.LastActivityTimeSec = core.MonotonicTime()
+		session.OutputOctets += payloadLength
+		session.OutputPackets++
+		session.Unlock()
+	}
+}
 
 	log.Info().Msg("CoovaChilli-Go is running. Press Ctrl-C to stop.")
 

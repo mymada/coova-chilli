@@ -23,8 +23,11 @@ type Config struct {
 	// Network settings
 	NetStr string    `yaml:"net"`
 	Net    net.IPNet `yaml:"-"` // Parsed from NetStr
-	NetV6Str string  `yaml:"net_v6"`
-	NetV6  net.IPNet `yaml:"-"` // Parsed from NetV6Str
+
+	// IPv6 Network Settings
+	IPv6Enable bool    `yaml:"ipv6enable"` // Master switch for IPv6 functionality
+	NetV6Str   string  `yaml:"net_v6"`
+	NetV6      net.IPNet `yaml:"-"` // Parsed from NetV6Str
 	UAMListen net.IP `yaml:"uamlisten"`
 	UAMListenV6 net.IP `yaml:"uamlisten_v6"`
 	DHCPListen net.IP `yaml:"dhcplisten"`
@@ -64,6 +67,7 @@ type Config struct {
 	CertFile            string   `yaml:"certfile"`
 	KeyFile             string   `yaml:"keyfile"`
 	UAMAllowed          []string `yaml:"uamallowed"`
+	UAMAllowedV6        []string `yaml:"uamallowed_v6"`
 	UAMDomains          []string `yaml:"uamdomains"`
 	UAMUrl              string   `yaml:"uamurl"`
 	DefSessionTimeout   uint32   `yaml:"defsessiontimeout"`

@@ -49,16 +49,17 @@ func (c *Client) SendAccessRequest(session *core.Session, username, password str
 	rfc2865.NASIdentifier_SetString(packet, c.cfg.RadiusNASID)
 	rfc2865.NASIPAddress_Set(packet, c.cfg.RadiusListen)
 
-	// Add IPv4 and IPv6 attributes if available
-	if session.HisIP != nil && session.HisIP.To4() != nil {
-		rfc2865.FramedIPAddress_Set(packet, session.HisIP)
-	}
-	if session.HisIPv6 != nil {
-		prefix := &net.IPNet{
-			IP:   session.HisIPv6,
-			Mask: net.CIDRMask(128, 128),
+	// Add Framed-IP-Address or Framed-IPv6-Prefix attribute
+	if session.HisIP != nil {
+		if session.HisIP.To4() != nil {
+			rfc2865.FramedIPAddress_Set(packet, session.HisIP)
+		} else if c.cfg.IPv6Enable { // Only add IPv6 attributes if enabled
+			prefix := &net.IPNet{
+				IP:   session.HisIP,
+				Mask: net.CIDRMask(128, 128), // /128 for a single host address
+			}
+			rfc3162.FramedIPv6Prefix_Add(packet, prefix)
 		}
-		rfc3162.FramedIPv6Prefix_Add(packet, prefix)
 	}
 
 	// Add MAC address
@@ -93,16 +94,17 @@ func (c *Client) SendAccountingRequest(session *core.Session, statusType rfc2866
 	rfc2866.AcctOutputPackets_Set(packet, rfc2866.AcctOutputPackets(session.OutputPackets))
 	rfc2866.AcctSessionTime_Set(packet, rfc2866.AcctSessionTime(session.LastSeen.Sub(session.StartTime).Seconds()))
 
-	// Add IPv4 and IPv6 attributes if available
-	if session.HisIP != nil && session.HisIP.To4() != nil {
-		rfc2865.FramedIPAddress_Set(packet, session.HisIP)
-	}
-	if session.HisIPv6 != nil {
-		prefix := &net.IPNet{
-			IP:   session.HisIPv6,
-			Mask: net.CIDRMask(128, 128),
+	// Add Framed-IP-Address or Framed-IPv6-Prefix attribute
+	if session.HisIP != nil {
+		if session.HisIP.To4() != nil {
+			rfc2865.FramedIPAddress_Set(packet, session.HisIP)
+		} else if c.cfg.IPv6Enable { // Only add IPv6 attributes if enabled
+			prefix := &net.IPNet{
+				IP:   session.HisIP,
+				Mask: net.CIDRMask(128, 128), // /128 for a single host address
+			}
+			rfc3162.FramedIPv6Prefix_Add(packet, prefix)
 		}
-		rfc3162.FramedIPv6Prefix_Add(packet, prefix)
 	}
 
 	// Add MAC address
@@ -119,17 +121,43 @@ func (c *Client) SendAccountingRequest(session *core.Session, statusType rfc2866
 	return response, nil
 }
 
-// StartCoAListener listens for incoming CoA and Disconnect requests.
+// StartCoAListener starts listeners for incoming CoA and Disconnect requests.
 func (c *Client) StartCoAListener(coaReqChan chan<- CoAIncomingRequest) {
-	addr := fmt.Sprintf(":%d", c.cfg.CoaPort)
-	conn, err := net.ListenPacket("udp", addr)
+	// Listener for IPv4. If no specific address is configured, listen on all interfaces.
+	ipv4Addr := "0.0.0.0"
+	if c.cfg.RadiusListen != nil {
+		// Ensure it's an IPv4 address
+		if c.cfg.RadiusListen.To4() != nil {
+			ipv4Addr = c.cfg.RadiusListen.String()
+		}
+	}
+	go c.listen("udp4", fmt.Sprintf("%s:%d", ipv4Addr, c.cfg.CoaPort), coaReqChan)
+
+	// Listener for IPv6, if enabled. If no specific address is configured, listen on all interfaces.
+	if c.cfg.IPv6Enable {
+		ipv6Addr := "::"
+		if c.cfg.RadiusListenV6 != nil {
+			// Ensure it's an IPv6 address
+			if c.cfg.RadiusListenV6.To4() == nil {
+				ipv6Addr = c.cfg.RadiusListenV6.String()
+			}
+		}
+		go c.listen("udp6", fmt.Sprintf("%s:%d", ipv6Addr, c.cfg.CoaPort), coaReqChan)
+	}
+}
+
+// listen is a helper function to listen on a specific address and protocol.
+func (c *Client) listen(network, addr string, coaReqChan chan<- CoAIncomingRequest) {
+	conn, err := net.ListenPacket(network, addr)
 	if err != nil {
-		c.logger.Fatal().Err(err).Str("addr", addr).Msg("Failed to start CoA listener")
+		// Log as an error instead of fatal, as one of the listeners might fail (e.g., no IPv6 on host)
+		// while the other succeeds.
+		c.logger.Error().Err(err).Str("addr", addr).Msg("Failed to start CoA listener")
 		return
 	}
 	defer conn.Close()
 
-	c.logger.Info().Str("addr", addr).Msg("CoA listener started")
+	c.logger.Info().Str("addr", conn.LocalAddr().String()).Msg("CoA listener started")
 
 	for {
 		buf := make([]byte, 4096)
@@ -144,6 +172,7 @@ func (c *Client) StartCoAListener(coaReqChan chan<- CoAIncomingRequest) {
 			c.logger.Error().Err(err).Msg("Failed to parse incoming CoA packet")
 			continue
 		}
+
 
 		c.logger.Info().Str("code", packet.Code.String()).Str("peer", peer.String()).Msg("Received CoA/Disconnect request")
 		coaReqChan <- CoAIncomingRequest{

@@ -51,6 +51,16 @@ func (m *mockIPTables) DeleteChain(table, chain string) error {
 	return nil
 }
 
+func (m *mockIPTables) Exists(table, chain string, rulespec ...string) (bool, error) {
+	// For the mock, assume chains don't exist initially so they are always created.
+	return false, nil
+}
+
+func (m *mockIPTables) ListChains(table string) ([]string, error) {
+	// Return an empty list, can be expanded if needed for more complex tests.
+	return []string{}, nil
+}
+
 // Ensure mockIPTables satisfies the IPTables interface
 var _ IPTables = &mockIPTables{}
 
