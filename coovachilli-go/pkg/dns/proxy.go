@@ -27,7 +27,7 @@ func NewProxy(cfg *config.Config, logger zerolog.Logger) *Proxy {
 
 // HandleQuery forwards a DNS query to an upstream server if the domain is allowed.
 // It returns the response packet and a map of resolved IPs (as strings) to their TTLs.
-func (p *Proxy) HandleQuery(query *layers.DNS) ([]byte, map[string]uint32, error) {
+func (p *Proxy) HandleQuery(query *layers.DNS, upstreamAddr string) ([]byte, map[string]uint32, error) {
 	if len(query.Questions) == 0 {
 		return nil, nil, fmt.Errorf("DNS query has no questions")
 	}
@@ -44,12 +44,12 @@ func (p *Proxy) HandleQuery(query *layers.DNS) ([]byte, map[string]uint32, error
 
 	if !allowed {
 		p.logger.Debug().Str("domain", domain).Msg("Domain not in walled garden, dropping DNS query")
-		return nil, nil, nil // Not an error, just not handling it.
+		return nil, nil, nil
 	}
 
-	p.logger.Info().Str("domain", domain).Msg("Forwarding allowed DNS query to upstream")
+	p.logger.Info().Str("domain", domain).Str("upstream", upstreamAddr).Msg("Forwarding allowed DNS query to upstream")
 
-	conn, err := net.Dial("udp", p.cfg.DNS1.String()+":53")
+	conn, err := net.Dial("udp", upstreamAddr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to connect to upstream DNS server: %w", err)
 	}
@@ -69,16 +69,17 @@ func (p *Proxy) HandleQuery(query *layers.DNS) ([]byte, map[string]uint32, error
 	p.logger.Info().Str("domain", domain).Int("bytes", n).Msg("Received DNS response from upstream")
 
 	resolvedIPs := make(map[string]uint32)
-	dnsResponse := &layers.DNS{}
-	if err := dnsResponse.DecodeFromBytes(responseBytes, gopacket.NilDecodeFeedback); err == nil {
+	packet := gopacket.NewPacket(responseBytes, layers.LayerTypeDNS, gopacket.Default)
+	if dnsLayer := packet.Layer(layers.LayerTypeDNS); dnsLayer != nil {
+		dnsResponse, _ := dnsLayer.(*layers.DNS)
 		for _, ans := range dnsResponse.Answers {
-			if ans.Type == layers.DNSTypeA {
+			if ans.Type == layers.DNSTypeA && ans.IP != nil {
 				resolvedIPs[ans.IP.String()] = ans.TTL
 				p.logger.Debug().Str("domain", domain).Str("ip", ans.IP.String()).Uint32("ttl", ans.TTL).Msg("Resolved IPv4 address")
 			}
 		}
 	} else {
-		p.logger.Warn().Err(err).Msg("Failed to decode DNS response from upstream")
+		p.logger.Warn().Msg("Failed to decode DNS layer from upstream response")
 	}
 
 	return responseBytes, resolvedIPs, nil

@@ -27,7 +27,6 @@ const (
 )
 
 // IPTables is an interface that wraps the go-iptables methods used by the firewall.
-// This allows for mocking in tests.
 type IPTables interface {
 	Append(table, chain string, rulespec ...string) error
 	Insert(table, chain string, pos int, rulespec ...string) error
@@ -39,9 +38,33 @@ type IPTables interface {
 	ListChains(table string) ([]string, error)
 }
 
+// CommandRunner defines an interface for running external commands.
+type CommandRunner interface {
+	Run(name string, args ...string) error
+}
+
 type dynamicWalledGardenEntry struct {
 	IP        net.IP
 	ExpiresAt time.Time
+}
+
+// realCommandRunner is the actual implementation that executes commands.
+type realCommandRunner struct {
+	logger zerolog.Logger
+}
+
+func (r *realCommandRunner) Run(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// Don't log error for "del" commands if the object doesn't exist
+		if !(strings.Contains(string(output), "No such file or directory") || strings.Contains(string(output), "does not exist")) {
+			r.logger.Error().Err(err).Str("cmd", name+" "+strings.Join(args, " ")).Bytes("output", output).Msg("Command execution failed")
+		}
+		return fmt.Errorf("command '%s' failed: %w, output: %s", cmd.String(), err, output)
+	}
+	r.logger.Debug().Str("cmd", name+" "+strings.Join(args, " ")).Bytes("output", output).Msg("Command executed successfully")
+	return nil
 }
 
 // Firewall manages the system's firewall rules.
@@ -50,6 +73,7 @@ type Firewall struct {
 	ipt                   IPTables
 	ip6t                  IPTables
 	logger                zerolog.Logger
+	runner                CommandRunner
 	dynamicWalledGarden   map[string]dynamicWalledGardenEntry
 	dynamicWalledGardenMu sync.RWMutex
 }
@@ -60,7 +84,6 @@ func NewFirewall(cfg *config.Config, logger zerolog.Logger) (*Firewall, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create iptables handler: %w", err)
 	}
-
 	var ip6t IPTables
 	if cfg.IPv6Enable {
 		if ip6tReal, err := iptables.NewWithProtocol(iptables.ProtocolIPv6); err != nil {
@@ -74,12 +97,13 @@ func NewFirewall(cfg *config.Config, logger zerolog.Logger) (*Firewall, error) {
 		logger.Info().Msg("IPv6 is disabled in configuration, IPv6 firewall will not be used.")
 		ip6t = nil
 	}
-
+	fwLogger := logger.With().Str("component", "firewall").Logger()
 	return &Firewall{
 		cfg:                   cfg,
 		ipt:                   ipt,
 		ip6t:                  ip6t,
-		logger:                logger.With().Str("component", "firewall").Logger(),
+		logger:                fwLogger,
+		runner:                &realCommandRunner{logger: fwLogger},
 		dynamicWalledGarden:   make(map[string]dynamicWalledGardenEntry),
 	}, nil
 }
@@ -92,12 +116,11 @@ func (f *Firewall) setupChains(handler IPTables, protocol string) error {
 				if _, err := handler.ListChains(table); err != nil {
 					if strings.Contains(err.Error(), "No such file or directory") || strings.Contains(err.Error(), "table nat does not exist") {
 						f.logger.Warn().Err(err).Msg("IPv6 NAT table not supported, disabling IPv6 firewall.")
-						f.ip6t = nil // Permanently disable for this run.
+						f.ip6t = nil
 						return nil
 					}
 				}
 			}
-
 			exists, _ := handler.Exists(table, chain)
 			if exists {
 				if err := handler.ClearChain(table, chain); err != nil {
@@ -113,70 +136,53 @@ func (f *Firewall) setupChains(handler IPTables, protocol string) error {
 	return nil
 }
 
-// runCommand executes a shell command and logs its output.
-func (f *Firewall) runCommand(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		f.logger.Error().Err(err).Str("cmd", name+" "+strings.Join(args, " ")).Bytes("output", output).Msg("Command execution failed")
-		return fmt.Errorf("command '%s' failed: %w, output: %s", cmd.String(), err, output)
-	}
-	f.logger.Debug().Str("cmd", name+" "+strings.Join(args, " ")).Bytes("output", output).Msg("Command executed successfully")
-	return nil
-}
-
 // Initialize sets up the necessary firewall chains and rules.
 func (f *Firewall) Initialize() error {
 	f.logger.Debug().Msg("Initializing firewall rules")
-
 	if err := f.setupChains(f.ipt, "IPv4"); err != nil {
 		return err
 	}
 	if err := f.initializeIPv4Rules(); err != nil {
 		return err
 	}
-
 	if f.ip6t != nil {
 		if err := f.setupChains(f.ip6t, "IPv6"); err != nil {
 			return err
 		}
-		if f.ip6t != nil {
-			if err := f.initializeIPv6Rules(); err != nil {
-				return err
-			}
+		if err := f.initializeIPv6Rules(); err != nil {
+			return err
 		}
 	}
 
 	f.logger.Info().Msg("Setting up TC for download shaping")
-	_ = f.runCommand("tc", "qdisc", "del", "dev", f.cfg.TUNDev, "root") // Ignore error
-	if err := f.runCommand("tc", "qdisc", "add", "dev", f.cfg.TUNDev, "root", "handle", "1:", "htb", "default", "10"); err != nil {
+	_ = f.runner.Run("tc", "qdisc", "del", "dev", f.cfg.TUNDev, "root")
+	if err := f.runner.Run("tc", "qdisc", "add", "dev", f.cfg.TUNDev, "root", "handle", "1:", "htb", "default", "10"); err != nil {
 		f.logger.Error().Err(err).Msg("Failed to setup root TC HTB qdisc on TUN device. Download shaping will be disabled.")
 	}
 
 	f.logger.Info().Msg("Setting up IFB device and TC for upload shaping")
 	ifbDev := "ifb0"
-	if err := f.runCommand("modprobe", "ifb"); err != nil {
+	if err := f.runner.Run("modprobe", "ifb"); err != nil {
 		f.logger.Warn().Err(err).Msg("Failed to run modprobe for ifb. Module may be built-in, continuing.")
 	}
-	if err := f.runCommand("ip", "link", "set", ifbDev, "up"); err != nil {
+	if err := f.runner.Run("ip", "link", "set", ifbDev, "up"); err != nil {
 		f.logger.Error().Err(err).Msg("Failed to bring up IFB device. Upload shaping will be disabled.")
 	} else {
-		_ = f.runCommand("tc", "qdisc", "del", "dev", ifbDev, "root") // Ignore error
-		if err := f.runCommand("tc", "qdisc", "add", "dev", ifbDev, "root", "handle", "2:", "htb", "default", "10"); err != nil {
+		_ = f.runner.Run("tc", "qdisc", "del", "dev", ifbDev, "root")
+		if err := f.runner.Run("tc", "qdisc", "add", "dev", ifbDev, "root", "handle", "2:", "htb", "default", "10"); err != nil {
 			f.logger.Error().Err(err).Msg("Failed to setup root TC HTB qdisc on IFB device. Upload shaping will be disabled.")
 		} else {
-			_ = f.runCommand("tc", "qdisc", "del", "dev", f.cfg.TUNDev, "ingress") // Ignore error
-			if err := f.runCommand("tc", "qdisc", "add", "dev", f.cfg.TUNDev, "handle", "ffff:", "ingress"); err != nil {
+			_ = f.runner.Run("tc", "qdisc", "del", "dev", f.cfg.TUNDev, "ingress")
+			if err := f.runner.Run("tc", "qdisc", "add", "dev", f.cfg.TUNDev, "handle", "ffff:", "ingress"); err != nil {
 				f.logger.Error().Err(err).Msg("Failed to add ingress qdisc to TUN device. Upload shaping will be disabled.")
 			} else {
-				if err := f.runCommand("tc", "filter", "add", "dev", f.cfg.TUNDev, "parent", "ffff:", "protocol", "ip", "u32", "match", "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev", ifbDev); err != nil {
+				if err := f.runner.Run("tc", "filter", "add", "dev", f.cfg.TUNDev, "parent", "ffff:", "protocol", "ip", "u32", "match", "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev", ifbDev); err != nil {
 					f.logger.Error().Err(err).Msg("Failed to add filter to redirect ingress traffic to IFB. Upload shaping will be disabled.")
 				}
 			}
 		}
 	}
-
-	go f.reapWalledGarden()
+	go f.runWalledGardenReaper()
 	f.logger.Info().Msg("Firewall initialized successfully")
 	return nil
 }
@@ -229,7 +235,6 @@ func (f *Firewall) initializeIPv6Rules() error {
 	return nil
 }
 
-// AddAuthenticatedUser adds firewall rules to allow traffic for an authenticated user.
 func (f *Firewall) AddAuthenticatedUser(ip net.IP, bandwidthMaxUp uint64, bandwidthMaxDown uint64) error {
 	var handler IPTables
 	if ip.To4() != nil {
@@ -255,8 +260,8 @@ func (f *Firewall) AddAuthenticatedUser(ip net.IP, bandwidthMaxUp uint64, bandwi
 			}
 			classID := fmt.Sprintf("1:%x", handle)
 			f.logger.Debug().Str("ip", ip.String()).Str("rate", fmt.Sprintf("%dkbit", rate)).Str("classid", classID).Msg("Applying download bandwidth limit")
-			_ = f.runCommand("tc", "class", "add", "dev", f.cfg.TUNDev, "parent", "1:", "classid", classID, "htb", "rate", fmt.Sprintf("%dkbit", rate))
-			_ = f.runCommand("tc", "filter", "add", "dev", f.cfg.TUNDev, "protocol", "ip", "parent", "1:0", "prio", "1", "u32", "match", "ip", "dst", ip.String()+"/32", "flowid", classID)
+			_ = f.runner.Run("tc", "class", "add", "dev", f.cfg.TUNDev, "parent", "1:", "classid", classID, "htb", "rate", fmt.Sprintf("%dkbit", rate))
+			_ = f.runner.Run("tc", "filter", "add", "dev", f.cfg.TUNDev, "protocol", "ip", "parent", "1:0", "prio", "1", "u32", "match", "ip", "dst", ip.String()+"/32", "flowid", classID)
 		}
 	}
 	if bandwidthMaxUp > 0 {
@@ -270,15 +275,14 @@ func (f *Firewall) AddAuthenticatedUser(ip net.IP, bandwidthMaxUp uint64, bandwi
 			}
 			classID := fmt.Sprintf("2:%x", handle)
 			f.logger.Debug().Str("ip", ip.String()).Str("rate", fmt.Sprintf("%dkbit", rate)).Str("classid", classID).Msg("Applying upload bandwidth limit")
-			_ = f.runCommand("tc", "class", "add", "dev", ifbDev, "parent", "2:", "classid", classID, "htb", "rate", fmt.Sprintf("%dkbit", rate))
-			_ = f.runCommand("tc", "filter", "add", "dev", ifbDev, "protocol", "ip", "parent", "2:0", "prio", "1", "u32", "match", "ip", "src", ip.String()+"/32", "flowid", classID)
+			_ = f.runner.Run("tc", "class", "add", "dev", ifbDev, "parent", "2:", "classid", classID, "htb", "rate", fmt.Sprintf("%dkbit", rate))
+			_ = f.runner.Run("tc", "filter", "add", "dev", ifbDev, "protocol", "ip", "parent", "2:0", "prio", "1", "u32", "match", "ip", "src", ip.String()+"/32", "flowid", classID)
 		}
 	}
 	f.logger.Info().Str("ip", ip.String()).Msg("Added firewall rules for authenticated user")
 	return nil
 }
 
-// RemoveAuthenticatedUser removes firewall rules for a user.
 func (f *Firewall) RemoveAuthenticatedUser(ip net.IP) error {
 	var handler IPTables
 	if ip.To4() != nil {
@@ -293,13 +297,13 @@ func (f *Firewall) RemoveAuthenticatedUser(ip net.IP) error {
 		handle := ipBytes[3]
 		classIDDown := fmt.Sprintf("1:%x", handle)
 		f.logger.Debug().Str("ip", ip.String()).Str("classid", classIDDown).Msg("Removing download bandwidth limit")
-		_ = f.runCommand("tc", "filter", "del", "dev", f.cfg.TUNDev, "protocol", "ip", "parent", "1:0", "prio", "1", "u32", "match", "ip", "dst", ip.String()+"/32", "flowid", classIDDown)
-		_ = f.runCommand("tc", "class", "del", "dev", f.cfg.TUNDev, "parent", "1:", "classid", classIDDown)
+		_ = f.runner.Run("tc", "filter", "del", "dev", f.cfg.TUNDev, "protocol", "ip", "parent", "1:0", "prio", "1", "u32", "match", "ip", "dst", ip.String()+"/32", "flowid", classIDDown)
+		_ = f.runner.Run("tc", "class", "del", "dev", f.cfg.TUNDev, "parent", "1:", "classid", classIDDown)
 		ifbDev := "ifb0"
 		classIDUp := fmt.Sprintf("2:%x", handle)
 		f.logger.Debug().Str("ip", ip.String()).Str("classid", classIDUp).Msg("Removing upload bandwidth limit")
-		_ = f.runCommand("tc", "filter", "del", "dev", ifbDev, "protocol", "ip", "parent", "2:0", "prio", "1", "u32", "match", "ip", "src", ip.String()+"/32", "flowid", classIDUp)
-		_ = f.runCommand("tc", "class", "del", "dev", ifbDev, "parent", "2:", "classid", classIDUp)
+		_ = f.runner.Run("tc", "filter", "del", "dev", ifbDev, "protocol", "ip", "parent", "2:0", "prio", "1", "u32", "match", "ip", "src", ip.String()+"/32", "flowid", classIDUp)
+		_ = f.runner.Run("tc", "class", "del", "dev", ifbDev, "parent", "2:", "classid", classIDUp)
 	}
 	if err := handler.Delete("nat", chainChilli, "-s", ip.String(), "-j", "RETURN"); err != nil {
 		f.logger.Warn().Err(err).Msgf("failed to delete nat rule for user %s", ip)
@@ -311,7 +315,6 @@ func (f *Firewall) RemoveAuthenticatedUser(ip net.IP) error {
 	return nil
 }
 
-// AddToWalledGarden adds a single IP address to the walled garden chain with a specific TTL.
 func (f *Firewall) AddToWalledGarden(ip net.IP, ttl uint32) error {
 	var handler IPTables
 	if ip.To4() != nil {
@@ -341,35 +344,38 @@ func (f *Firewall) AddToWalledGarden(ip net.IP, ttl uint32) error {
 	return nil
 }
 
-func (f *Firewall) reapWalledGarden() {
+func (f *Firewall) runWalledGardenReaper() {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		f.dynamicWalledGardenMu.Lock()
-		now := time.Now()
-		for key, entry := range f.dynamicWalledGarden {
-			if now.After(entry.ExpiresAt) {
-				f.logger.Info().Str("ip", entry.IP.String()).Msg("Walled garden entry expired, removing rule")
-				var handler IPTables
-				if entry.IP.To4() != nil {
-					handler = f.ipt
-				} else if f.ip6t != nil {
-					handler = f.ip6t
-				}
-				if handler != nil {
-					ruleSpec := []string{"-d", entry.IP.String(), "-j", "ACCEPT"}
-					if err := handler.Delete("filter", chainWalledGarden, ruleSpec...); err != nil {
-						f.logger.Warn().Err(err).Str("ip", entry.IP.String()).Msg("Failed to delete expired walled garden rule")
-					}
-				}
-				delete(f.dynamicWalledGarden, key)
-			}
-		}
-		f.dynamicWalledGardenMu.Unlock()
+		f.reapWalledGardenEntries()
 	}
 }
 
-// UpdateUserBandwidth dynamically changes the bandwidth limits for an already authenticated user.
+func (f *Firewall) reapWalledGardenEntries() {
+	f.dynamicWalledGardenMu.Lock()
+	defer f.dynamicWalledGardenMu.Unlock()
+	now := time.Now()
+	for key, entry := range f.dynamicWalledGarden {
+		if now.After(entry.ExpiresAt) {
+			f.logger.Info().Str("ip", entry.IP.String()).Msg("Walled garden entry expired, removing rule")
+			var handler IPTables
+			if entry.IP.To4() != nil {
+				handler = f.ipt
+			} else if f.ip6t != nil {
+				handler = f.ip6t
+			}
+			if handler != nil {
+				ruleSpec := []string{"-d", entry.IP.String(), "-j", "ACCEPT"}
+				if err := handler.Delete("filter", chainWalledGarden, ruleSpec...); err != nil {
+					f.logger.Warn().Err(err).Str("ip", entry.IP.String()).Msg("Failed to delete expired walled garden rule")
+				}
+			}
+			delete(f.dynamicWalledGarden, key)
+		}
+	}
+}
+
 func (f *Firewall) UpdateUserBandwidth(ip net.IP, bandwidthMaxUp uint64, bandwidthMaxDown uint64) error {
 	ipBytes := ip.To4()
 	if ipBytes == nil {
@@ -384,7 +390,7 @@ func (f *Firewall) UpdateUserBandwidth(ip net.IP, bandwidthMaxUp uint64, bandwid
 		}
 		classID := fmt.Sprintf("1:%x", handle)
 		f.logger.Info().Str("ip", ip.String()).Str("rate", fmt.Sprintf("%dkbit", rate)).Str("classid", classID).Msg("Changing download bandwidth limit")
-		if err := f.runCommand("tc", "class", "change", "dev", f.cfg.TUNDev, "parent", "1:", "classid", classID, "htb", "rate", fmt.Sprintf("%dkbit", rate)); err != nil {
+		if err := f.runner.Run("tc", "class", "change", "dev", f.cfg.TUNDev, "parent", "1:", "classid", classID, "htb", "rate", fmt.Sprintf("%dkbit", rate)); err != nil {
 			f.logger.Error().Err(err).Msg("Failed to change TC class for user download shaping")
 		}
 	}
@@ -396,23 +402,22 @@ func (f *Firewall) UpdateUserBandwidth(ip net.IP, bandwidthMaxUp uint64, bandwid
 		}
 		classID := fmt.Sprintf("2:%x", handle)
 		f.logger.Info().Str("ip", ip.String()).Str("rate", fmt.Sprintf("%dkbit", rate)).Str("classid", classID).Msg("Changing upload bandwidth limit")
-		if err := f.runCommand("tc", "class", "change", "dev", ifbDev, "parent", "2:", "classid", classID, "htb", "rate", fmt.Sprintf("%dkbit", rate)); err != nil {
+		if err := f.runner.Run("tc", "class", "change", "dev", ifbDev, "parent", "2:", "classid", classID, "htb", "rate", fmt.Sprintf("%dkbit", rate)); err != nil {
 			f.logger.Error().Err(err).Msg("Failed to change TC class for user upload shaping")
 		}
 	}
 	return nil
 }
 
-// Cleanup removes all firewall rules and chains created by the application.
 func (f *Firewall) Cleanup() {
 	f.logger.Info().Msg("Cleaning up firewall and TC rules...")
 	ifbDev := "ifb0"
 	f.logger.Info().Msg("Deleting TC rules and qdiscs...")
-	_ = f.runCommand("tc", "qdisc", "del", "dev", f.cfg.TUNDev, "root")
-	_ = f.runCommand("tc", "qdisc", "del", "dev", f.cfg.TUNDev, "ingress")
-	_ = f.runCommand("tc", "qdisc", "del", "dev", ifbDev, "root")
+	_ = f.runner.Run("tc", "qdisc", "del", "dev", f.cfg.TUNDev, "root")
+	_ = f.runner.Run("tc", "qdisc", "del", "dev", f.cfg.TUNDev, "ingress")
+	_ = f.runner.Run("tc", "qdisc", "del", "dev", ifbDev, "root")
 	f.logger.Info().Msg("Bringing down IFB device...")
-	_ = f.runCommand("ip", "link", "set", ifbDev, "down")
+	_ = f.runner.Run("ip", "link", "set", ifbDev, "down")
 	f.cleanupHandler(f.ipt, f.cfg.Net.String(), false)
 	if f.ip6t != nil {
 		var netV6 string

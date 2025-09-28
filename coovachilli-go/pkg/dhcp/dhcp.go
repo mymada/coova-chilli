@@ -26,7 +26,7 @@ type Server struct {
 	radiusReqChan  chan<- *core.Session
 	leasesV4       map[string]*Lease
 	poolV4         *Pool
-	leasesV6       map[string]*Lease // Using the same Lease struct for v6 for now
+	leasesV6       map[string]*Lease
 	poolV6         *Pool
 	handle         *pcap.Handle
 	ifaceMAC       net.HardwareAddr
@@ -253,7 +253,6 @@ func (s *Server) relayDHCPv4(packet gopacket.Packet) error {
 	if dhcpLayer := packet.Layer(layers.LayerTypeDHCPv4); dhcpLayer != nil {
 		dhcpPayload = dhcpLayer.LayerContents()
 	} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
-		// Fallback for test packets where gopacket might not decode the DHCP layer
 		udp, _ := udpLayer.(*layers.UDP)
 		dhcpPayload = udp.Payload
 	}
@@ -269,10 +268,7 @@ func (s *Server) relayDHCPv4(packet gopacket.Packet) error {
 
 	dhcpPacket.GatewayIPAddr = s.cfg.DHCPListen
 
-	// Create a sub-option for the relay agent information.
 	agentCircuitID := dhcpv4.OptGeneric(dhcpv4.AgentCircuitIDSubOption, []byte("coovachilli-go"))
-
-	// Create the main Relay Agent Information option (Option 82) and add the sub-option to it.
 	opt82 := dhcpv4.OptRelayAgentInfo(agentCircuitID)
 	dhcpPacket.UpdateOption(opt82)
 
@@ -608,41 +604,37 @@ func (s *Server) handleRequest(req *dhcpv4.DHCPv4) ([]byte, error) {
 	}
 
 	session, ok := s.sessionManager.GetSessionByMAC(req.ClientHWAddr)
-	if !ok {
-		// This is a new client
-		s.logger.Debug().Str("mac", req.ClientHWAddr.String()).Msg("Creating new session for DHCPREQUEST")
+	isNew := !ok
+	if isNew {
 		session = s.sessionManager.CreateSession(reqIP, req.ClientHWAddr, s.cfg)
+	}
 
-		if s.cfg.MACAuth {
-			s.logger.Info().Str("mac", req.ClientHWAddr.String()).Msg("MAC authentication enabled, attempting RADIUS auth")
-			s.radiusReqChan <- session
-
-			select {
-			case authOK := <-session.AuthResult:
-				if !authOK {
-					s.logger.Warn().Str("mac", req.ClientHWAddr.String()).Msg("MAC authentication failed, sending NAK")
+	// If MACAuth is enabled, we must authenticate every DHCPREQUEST.
+	// This ensures re-authentication on lease renewal.
+	if s.cfg.MACAuth {
+		s.logger.Info().Str("mac", req.ClientHWAddr.String()).Msg("Performing MAC authentication for DHCPREQUEST")
+		s.radiusReqChan <- session
+		select {
+		case authOK := <-session.AuthResult:
+			if !authOK {
+				s.logger.Warn().Str("mac", req.ClientHWAddr.String()).Msg("Authentication failed, sending NAK")
+				if isNew {
 					s.poolV4.Lock()
 					delete(s.poolV4.used, reqIP.String())
 					s.poolV4.Unlock()
-					return s.makeNak(req)
 				}
-				s.logger.Info().Str("mac", req.ClientHWAddr.String()).Msg("MAC authentication successful")
-				// Fall through to ACK
-			case <-time.After(5 * time.Second):
-				s.logger.Error().Str("mac", req.ClientHWAddr.String()).Msg("MAC authentication timed out, sending NAK")
+				return s.makeNak(req)
+			}
+			s.logger.Info().Str("mac", req.ClientHWAddr.String()).Msg("Authentication successful")
+		case <-time.After(5 * time.Second):
+			s.logger.Error().Str("mac", req.ClientHWAddr.String()).Msg("Authentication timed out, sending NAK")
+			if isNew {
 				s.poolV4.Lock()
 				delete(s.poolV4.used, reqIP.String())
 				s.poolV4.Unlock()
-				return s.makeNak(req)
 			}
-		} else {
-			s.logger.Debug().Str("mac", req.ClientHWAddr.String()).Msg("MAC authentication disabled, proceeding with UAM flow")
+			return s.makeNak(req)
 		}
-	} else {
-		// This is a renewal for an existing client.
-		// We just ACK to renew their lease. If they are not authenticated,
-		// the firewall will continue to handle redirection.
-		s.logger.Debug().Str("mac", req.ClientHWAddr.String()).Bool("authenticated", session.Authenticated).Msg("Renewing lease for existing session")
 	}
 
 	// If we reach here, it means either auth was successful or not required.
