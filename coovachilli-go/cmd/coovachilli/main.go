@@ -3,12 +3,10 @@ package main
 import (
 	"flag"
 	"fmt"
-	"net"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"coovachilli-go/pkg/auth"
 	"coovachilli-go/pkg/cmdsock"
@@ -17,9 +15,9 @@ import (
 	"coovachilli-go/pkg/dhcp"
 	"coovachilli-go/pkg/disconnect"
 	"coovachilli-go/pkg/dns"
+	"coovachilli-go/pkg/eapol"
 	"coovachilli-go/pkg/firewall"
 	"coovachilli-go/pkg/http"
-	"coovachilli-go/pkg/icmpv6"
 	"coovachilli-go/pkg/radius"
 	"coovachilli-go/pkg/script"
 	"coovachilli-go/pkg/tun"
@@ -32,12 +30,10 @@ import (
 	layehradius "layeh.com/radius"
 	"layeh.com/radius/rfc2865"
 	"layeh.com/radius/rfc2866"
-	"layeh.com/radius/vendors/wispr"
 )
 
 func main() {
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 
 	configPath := flag.String("config", "config.yaml", "Path to the configuration file")
@@ -50,7 +46,7 @@ func main() {
 
 	log.Info().Msg("Starting CoovaChilli-Go...")
 
-	cfg, err := config.Load("coovachilli-go/" + *configPath)
+	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error loading configuration")
 	}
@@ -67,6 +63,7 @@ func main() {
 	scriptRunner := script.NewRunner(log.Logger, cfg)
 	sessionManager := core.NewSessionManager()
 	dnsProxy := dns.NewProxy(cfg, log.Logger)
+	eapolHandler := eapol.NewHandler(cfg, sessionManager, log.Logger)
 
 	if err := sessionManager.LoadSessions(cfg.StateFile); err != nil {
 		log.Error().Err(err).Msg("Failed to load sessions from state file")
@@ -74,7 +71,7 @@ func main() {
 		log.Info().Int("count", len(sessionManager.GetAllSessions())).Msg("Reloaded sessions from state file")
 		for _, s := range sessionManager.GetAllSessions() {
 			if s.Authenticated {
-				if err := fw.AddAuthenticatedUser(s.HisIP, s.SessionParams.BandwidthMaxUp, s.SessionParams.BandwidthMaxDown); err != nil {
+				if err := fw.AddAuthenticatedUser(s.HisIP); err != nil {
 					log.Error().Err(err).Str("user", s.Redir.Username).Msg("Failed to re-apply firewall rule for loaded session")
 				}
 			}
@@ -84,12 +81,12 @@ func main() {
 	radiusReqChan := make(chan *core.Session)
 	radiusClient := radius.NewClient(cfg, log.Logger)
 	disconnectManager := disconnect.NewManager(cfg, sessionManager, fw, radiusClient, scriptRunner, log.Logger)
-	reaper := core.NewReaper(cfg, sessionManager, disconnectManager, radiusClient, log.Logger)
+	reaper := core.NewReaper(cfg, sessionManager, disconnectManager, log.Logger)
 
 	reaper.Start()
 	defer reaper.Stop()
 
-	_, err = dhcp.NewServer(cfg, sessionManager, radiusReqChan, log.Logger)
+	_, err = dhcp.NewServer(cfg, sessionManager, radiusReqChan, eapolHandler, log.Logger)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error creating DHCP server")
 	}
@@ -106,14 +103,14 @@ func main() {
 	go tun.ReadPackets(ifce, packetChan, log.Logger)
 	go processPackets(ifce, packetChan, cfg, sessionManager, dnsProxy, fw, log.Logger)
 
-	cmdChan := make(chan cmdsock.CommandRequest)
+	cmdChan := make(chan string)
 	cmdSockListener := cmdsock.NewListener(cfg.CmdSockPath, cmdChan, log.Logger)
 	go cmdSockListener.Start()
 
 	go func() {
-		for req := range cmdChan {
-			response := processCommand(req.Command, log.Logger, cfg, sessionManager, disconnectManager, fw, radiusClient)
-			req.Response <- response
+		for cmd := range cmdChan {
+			response := processCommand(cmd, log.Logger, sessionManager, disconnectManager)
+			log.Info().Str("command", cmd).Str("response", response).Msg("Processed command")
 		}
 	}()
 
@@ -147,36 +144,6 @@ func main() {
 				disconnectManager.Disconnect(sessionToUpdate, "Admin-Reset")
 				response := req.Packet.Response(layehradius.CodeDisconnectACK)
 				radiusClient.SendCoAResponse(response, req.Peer)
-			case layehradius.CodeCoARequest:
-				log.Info().Str("user", userName).Msg("Received CoA-Request, updating session parameters")
-				sessionToUpdate.Lock()
-				if sessionTimeout, err := rfc2865.SessionTimeout_Lookup(req.Packet); err == nil {
-					log.Debug().Str("user", userName).Uint32("timeout", uint32(sessionTimeout)).Msg("Updating Session-Timeout")
-					sessionToUpdate.SessionParams.SessionTimeout = uint32(sessionTimeout)
-				}
-				if idleTimeout, err := rfc2865.IdleTimeout_Lookup(req.Packet); err == nil {
-					log.Debug().Str("user", userName).Uint32("timeout", uint32(idleTimeout)).Msg("Updating Idle-Timeout")
-					sessionToUpdate.SessionParams.IdleTimeout = uint32(idleTimeout)
-				}
-				if bwMaxDown, err := wispr.WISPrBandwidthMaxDown_Lookup(req.Packet); err == nil {
-					log.Debug().Str("user", userName).Uint64("bw", uint64(bwMaxDown)).Msg("Updating Bandwidth-Max-Down")
-					sessionToUpdate.SessionParams.BandwidthMaxDown = uint64(bwMaxDown)
-				}
-				if bwMaxUp, err := wispr.WISPrBandwidthMaxUp_Lookup(req.Packet); err == nil {
-					log.Debug().Str("user", userName).Uint64("bw", uint64(bwMaxUp)).Msg("Updating Bandwidth-Max-Up")
-					sessionToUpdate.SessionParams.BandwidthMaxUp = uint64(bwMaxUp)
-				}
-				bwUp := sessionToUpdate.SessionParams.BandwidthMaxUp
-				bwDown := sessionToUpdate.SessionParams.BandwidthMaxDown
-				sessionToUpdate.Unlock()
-				if err := fw.UpdateUserBandwidth(sessionToUpdate.HisIP, bwUp, bwDown); err != nil {
-					log.Error().Err(err).Str("user", userName).Msg("Failed to apply CoA bandwidth changes")
-					response := req.Packet.Response(layehradius.CodeCoANAK)
-					radiusClient.SendCoAResponse(response, req.Peer)
-					continue
-				}
-				response := req.Packet.Response(layehradius.CodeCoAACK)
-				radiusClient.SendCoAResponse(response, req.Peer)
 			default:
 				log.Warn().Str("code", req.Packet.Code.String()).Msg("Received unhandled CoA/DM code")
 				response := req.Packet.Response(layehradius.CodeCoANAK)
@@ -200,7 +167,6 @@ func main() {
 						password = username
 					}
 					s.Redir.Username = username
-					log.Info().Str("mac", s.HisMAC.String()).Str("user", username).Msg("Attempting MAC authentication")
 				} else {
 					username = s.Redir.Username
 					password = s.Redir.Password
@@ -210,14 +176,11 @@ func main() {
 					if err != nil {
 						log.Error().Err(err).Str("user", username).Msg("Error during local authentication")
 					} else if authenticated {
-						log.Info().Str("user", username).Msg("Local authentication successful")
 						s.Lock()
 						s.Authenticated = true
 						s.SessionParams.SessionTimeout = cfg.DefSessionTimeout
 						s.SessionParams.IdleTimeout = cfg.DefIdleTimeout
-						s.SessionParams.BandwidthMaxDown = cfg.DefBandwidthMaxDown
-						s.SessionParams.BandwidthMaxUp = cfg.DefBandwidthMaxUp
-						if err := fw.AddAuthenticatedUser(s.HisIP, s.SessionParams.BandwidthMaxUp, s.SessionParams.BandwidthMaxDown); err != nil {
+						if err := fw.AddAuthenticatedUser(s.HisIP); err != nil {
 							log.Error().Err(err).Str("user", s.Redir.Username).Msg("Error adding firewall/TC rules for local user")
 						}
 						s.Unlock()
@@ -225,7 +188,6 @@ func main() {
 						return
 					}
 				}
-				log.Info().Str("user", username).Msg("Processing RADIUS request")
 				resp, err := radiusClient.SendAccessRequest(s, username, password)
 				if err != nil {
 					log.Error().Err(err).Str("user", username).Msg("Error sending RADIUS Access-Request")
@@ -235,32 +197,16 @@ func main() {
 				s.Lock()
 				defer s.Unlock()
 				if resp.Code == layehradius.CodeAccessAccept {
-					log.Info().Str("user", s.Redir.Username).Msg("RADIUS Access-Accept")
 					s.Authenticated = true
-					if sessionTimeout, err := rfc2865.SessionTimeout_Lookup(resp); err == nil {
-						s.SessionParams.SessionTimeout = uint32(sessionTimeout)
-					}
-					if idleTimeout, err := rfc2865.IdleTimeout_Lookup(resp); err == nil {
-						s.SessionParams.IdleTimeout = uint32(idleTimeout)
-					}
-					if bwMaxDown, err := wispr.WISPrBandwidthMaxDown_Lookup(resp); err == nil {
-						s.SessionParams.BandwidthMaxDown = uint64(bwMaxDown)
-					}
-					if bwMaxUp, err := wispr.WISPrBandwidthMaxUp_Lookup(resp); err == nil {
-						s.SessionParams.BandwidthMaxUp = uint64(bwMaxUp)
-					}
-					if err := fw.AddAuthenticatedUser(s.HisIP, s.SessionParams.BandwidthMaxUp, s.SessionParams.BandwidthMaxDown); err != nil {
+					if err := fw.AddAuthenticatedUser(s.HisIP); err != nil {
 						log.Error().Err(err).Str("user", s.Redir.Username).Msg("Error adding firewall/TC rules")
 						s.AuthResult <- false
 						return
 					}
-					now := core.MonotonicTime()
-					s.LastInterimUpdateTime = now
-					radiusClient.SendAccountingRequest(s, rfc2866.AcctStatusType(1), "Start")
+					go radiusClient.SendAccountingRequest(s, 1, "Start")
 					scriptRunner.RunScript(cfg.ConUp, s, 0)
 					s.AuthResult <- true
 				} else {
-					log.Warn().Str("user", s.Redir.Username).Str("code", resp.Code.String()).Msg("RADIUS Access-Reject")
 					s.AuthResult <- false
 				}
 			}(session)
@@ -274,8 +220,6 @@ func main() {
 	log.Info().Msg("Shutting down CoovaChilli-Go...")
 	if err := sessionManager.SaveSessions(cfg.StateFile); err != nil {
 		log.Error().Err(err).Msg("Failed to save sessions to state file")
-	} else {
-		log.Info().Msg("Successfully saved sessions to state file.")
 	}
 	for _, session := range sessionManager.GetAllSessions() {
 		if session.Authenticated {
@@ -284,159 +228,67 @@ func main() {
 	}
 }
 
-func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config.Config, sessionManager *core.SessionManager, dnsProxy *dns.Proxy, fw firewall.UserRuleManager, logger zerolog.Logger) {
-	log := logger.With().Str("component", "dispatcher").Logger()
+func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config.Config, sessionManager *core.SessionManager, dnsProxy *dns.Proxy, fw firewall.UserRuleRemover, logger zerolog.Logger) {
 	for rawPacket := range packetChan {
 		if len(rawPacket) == 0 {
 			continue
 		}
-
-		var srcIP, dstIP net.IP
-		var payloadLength uint64
-		var vlanID uint16
-
-		// 1. Parse the packet as a full Ethernet frame.
 		packet := gopacket.NewPacket(rawPacket, layers.LayerTypeEthernet, gopacket.Default)
-
-		// 2. Check for and extract VLAN ID.
-		if dot1qLayer := packet.Layer(layers.LayerTypeDot1Q); dot1qLayer != nil {
-			dot1q, _ := dot1qLayer.(*layers.Dot1Q)
-			vlanID = dot1q.VLANIdentifier
-		}
-
-		// 3. Filter based on VLAN if enabled.
-		if cfg.IEEE8021Q && vlanID > 0 {
-			isAllowed := false
-			for _, allowedVLAN := range cfg.VLANs {
-				if uint16(allowedVLAN) == vlanID {
-					isAllowed = true
-					break
-				}
-			}
-			if !isAllowed {
-				log.Debug().Uint16("vlan", vlanID).Msg("Dropping packet from unconfigured VLAN")
-				continue
-			}
-		}
-
-		// 4. Find the network layer (IPv4 or IPv6).
 		if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
 			ipv4, _ := ipv4Layer.(*layers.IPv4)
-			srcIP, dstIP = ipv4.SrcIP, ipv4.DstIP
-			payloadLength = uint64(len(ipv4.Payload))
-			log.Debug().Str("src", srcIP.String()).Str("dst", dstIP.String()).Uint16("vlan", vlanID).Str("proto", ipv4.Protocol.String()).Msg("TUN In: IPv4")
-		} else if ipv6Layer := packet.Layer(layers.LayerTypeIPv6); ipv6Layer != nil {
-			ipv6, _ := ipv6Layer.(*layers.IPv6)
-			srcIP, dstIP = ipv6.SrcIP, ipv6.DstIP
-			payloadLength = uint64(len(ipv6.Payload))
-			log.Debug().Str("src", srcIP.String()).Str("dst", dstIP.String()).Uint16("vlan", vlanID).Str("proto", ipv6.NextHeader.String()).Msg("TUN In: IPv6")
-
-			if icmpv6Layer := packet.Layer(layers.LayerTypeICMPv6); icmpv6Layer != nil {
-				icmpv6Packet, _ := icmpv6Layer.(*layers.ICMPv6)
-				if icmpv6Packet.TypeCode.Type() == layers.ICMPv6TypeRouterSolicitation {
-					log.Info().Str("src", srcIP.String()).Msg("Received Router Solicitation")
-					if cfg.IPv6Enable && cfg.NetV6.IP != nil {
-						raPacket, err := icmpv6.BuildRouterAdvertisement(cfg, srcIP)
-						if err != nil {
-							log.Error().Err(err).Msg("Failed to build Router Advertisement")
-						} else {
-							if err := tun.WritePacket(ifce, raPacket); err != nil {
-								log.Error().Err(err).Msg("Failed to send Router Advertisement")
-							} else {
-								log.Info().Str("dst", srcIP.String()).Msg("Sent Router Advertisement")
-							}
+			session, ok := sessionManager.GetSessionByIP(ipv4.SrcIP)
+			if !ok {
+				continue
+			}
+			session.RLock()
+			isAuthenticated := session.Authenticated
+			session.RUnlock()
+			if !isAuthenticated {
+				if dnsLayer := packet.Layer(layers.LayerTypeDNS); dnsLayer != nil {
+					dnsQuery, _ := dnsLayer.(*layers.DNS)
+					if !dnsQuery.QR {
+						upstreamAddr := fmt.Sprintf("%s:%d", cfg.DNS1.String(), 53)
+						responseBytes, _, err := dnsProxy.HandleQuery(dnsQuery, upstreamAddr)
+						if err == nil && responseBytes != nil {
+							sendDNSResponse(ifce, packet, responseBytes)
 						}
+						continue
 					}
-					continue
 				}
 			}
-		} else {
-			log.Warn().Int("size", len(rawPacket)).Msg("Received non-IP packet from TUN")
-			continue
+			session.Lock()
+			session.OutputOctets += uint64(len(ipv4.Payload))
+			session.OutputPackets++
+			session.Unlock()
 		}
-
-		if srcIP == nil {
-			continue
-		}
-
-		session, ok := sessionManager.GetSessionByIP(srcIP)
-		if !ok {
-			log.Debug().Str("ip", srcIP.String()).Msg("Packet from unknown source IP, dropping")
-			continue
-		}
-
-		session.RLock()
-		isAuthenticated := session.Authenticated
-		session.RUnlock()
-
-		if !isAuthenticated {
-			if dnsLayer := packet.Layer(layers.LayerTypeDNS); dnsLayer != nil {
-				dnsQuery, _ := dnsLayer.(*layers.DNS)
-				if !dnsQuery.QR && dnsQuery.OpCode == layers.DNSOpCodeQuery {
-					upstreamAddr := fmt.Sprintf("%s:%d", cfg.DNS1.String(), 53)
-					responseBytes, resolvedIPs, err := dnsProxy.HandleQuery(dnsQuery, upstreamAddr)
-					if err != nil {
-						log.Error().Err(err).Msg("DNS proxy failed to handle query")
-					} else if responseBytes != nil {
-						for ipStr, ttl := range resolvedIPs {
-							ip := net.ParseIP(ipStr)
-							if ip == nil {
-								log.Warn().Str("ip", ipStr).Msg("DNS proxy returned an invalid IP address")
-								continue
-							}
-							if err := fw.AddToWalledGarden(ip, ttl); err != nil {
-								log.Error().Err(err).Str("ip", ip.String()).Msg("Failed to add IP to walled garden")
-							}
-						}
-						if err := sendDNSResponse(ifce, packet, responseBytes); err != nil {
-							log.Error().Err(err).Msg("Failed to send DNS response to client")
-						}
-					}
-					continue
-				}
-			}
-		}
-
-		session.Lock()
-		session.LastSeen = time.Now()
-		session.LastActivityTimeSec = core.MonotonicTime()
-		session.OutputOctets += payloadLength
-		session.OutputPackets++
-		session.Unlock()
 	}
 }
 
 func sendDNSResponse(ifce *water.Interface, reqPacket gopacket.Packet, respPayload []byte) error {
-	reqIPv4, okIPv4 := reqPacket.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
-	reqUDP, okUDP := reqPacket.Layer(layers.LayerTypeUDP).(*layers.UDP)
-	if !okIPv4 || !okUDP {
-		return fmt.Errorf("could not parse original DNS request layers (not IPv4/UDP)")
-	}
-	ipLayer := &layers.IPv4{
-		Version:  4,
-		IHL:      5,
-		TTL:      64,
-		Protocol: layers.IPProtocolUDP,
-		SrcIP:    reqIPv4.DstIP,
-		DstIP:    reqIPv4.SrcIP,
-	}
-	udpLayer := &layers.UDP{
-		SrcPort: reqUDP.DstPort,
-		DstPort: reqUDP.SrcPort,
-	}
-	if err := udpLayer.SetNetworkLayerForChecksum(ipLayer); err != nil {
-		return fmt.Errorf("failed to set network layer for DNS response checksum: %w", err)
-	}
+	reqIPv4, _ := reqPacket.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+	reqUDP, _ := reqPacket.Layer(layers.LayerTypeUDP).(*layers.UDP)
+	ipLayer := &layers.IPv4{Version: 4, TTL: 64, Protocol: layers.IPProtocolUDP, SrcIP: reqIPv4.DstIP, DstIP: reqIPv4.SrcIP}
+	udpLayer := &layers.UDP{SrcPort: reqUDP.DstPort, DstPort: reqUDP.SrcPort}
+	_ = udpLayer.SetNetworkLayerForChecksum(ipLayer)
 	buffer := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{
-		ComputeChecksums: true,
-		FixLengths:       true,
+	opts := gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true}
+	_ = gopacket.SerializeLayers(buffer, opts, ipLayer, udpLayer, gopacket.Payload(respPayload))
+	_, err := ifce.Write(buffer.Bytes())
+	return err
+}
+
+func processCommand(command string, logger zerolog.Logger, sm *core.SessionManager, dm *disconnect.Manager) string {
+	parts := strings.Fields(command)
+	if len(parts) == 0 {
+		return "ERROR: Empty command"
 	}
-	if err := gopacket.SerializeLayers(buffer, opts, ipLayer, udpLayer, gopacket.Payload(respPayload)); err != nil {
-		return fmt.Errorf("failed to serialize DNS response: %w", err)
+	switch parts[0] {
+	case "list":
+		var b strings.Builder
+		for _, s := range sm.GetAllSessions() {
+			b.WriteString(fmt.Sprintf("ip=%s mac=%s user=%s\n", s.HisIP, s.HisMAC, s.Redir.Username))
+		}
+		return b.String()
 	}
-	if _, err := ifce.Write(buffer.Bytes()); err != nil {
-		return fmt.Errorf("failed to write DNS response to TUN interface: %w", err)
-	}
-	return nil
+	return "ERROR: Unknown command"
 }

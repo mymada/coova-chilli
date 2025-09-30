@@ -5,29 +5,22 @@ import (
 	"net"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/rs/zerolog"
 )
 
-// CommandRequest encapsulates a command sent over the unix socket and includes a channel for the response.
-type CommandRequest struct {
-	Command  string
-	Response chan string
-}
-
 // Listener holds the state for the command socket listener.
 type Listener struct {
-	path    string
-	logger  zerolog.Logger
-	cmdChan chan<- CommandRequest
+	path   string
+	logger zerolog.Logger
+	cmdChan chan<- string
 }
 
 // NewListener creates a new command socket listener.
-func NewListener(path string, cmdChan chan<- CommandRequest, logger zerolog.Logger) *Listener {
+func NewListener(path string, cmdChan chan<- string, logger zerolog.Logger) *Listener {
 	return &Listener{
-		path:    path,
-		logger:  logger.With().Str("component", "cmdsock").Logger(),
+		path:   path,
+		logger: logger.With().Str("component", "cmdsock").Logger(),
 		cmdChan: cmdChan,
 	}
 }
@@ -39,6 +32,7 @@ func (l *Listener) Start() {
 		return
 	}
 
+	// Remove old socket file if it exists
 	if err := os.Remove(l.path); err != nil && !os.IsNotExist(err) {
 		l.logger.Fatal().Err(err).Msg("Failed to remove old command socket")
 	}
@@ -68,31 +62,15 @@ func (l *Listener) handleConnection(conn net.Conn) {
 
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
-		cmdStr := strings.TrimSpace(scanner.Text())
-		if cmdStr == "" {
+		cmd := strings.TrimSpace(scanner.Text())
+		if cmd == "" {
 			continue
 		}
-		l.logger.Info().Str("cmd", cmdStr).Msg("Received command")
-
-		// Create a request with a response channel
-		req := CommandRequest{
-			Command:  cmdStr,
-			Response: make(chan string, 1),
-		}
-
-		// Send the request to the main processing loop
-		l.cmdChan <- req
-
-		// Wait for a response or timeout
-		select {
-		case response := <-req.Response:
-			if _, err := conn.Write([]byte(response + "\n")); err != nil {
-				l.logger.Error().Err(err).Msg("Failed to write response to command socket")
-			}
-		case <-time.After(2 * time.Second):
-			l.logger.Warn().Str("cmd", cmdStr).Msg("Timeout waiting for command response")
-			_, _ = conn.Write([]byte("ERROR: Timeout waiting for response\n"))
-		}
+		l.logger.Info().Str("cmd", cmd).Msg("Received command")
+		l.cmdChan <- cmd
+		// TODO: Get a response from the main loop and write it back to the socket.
+		// This would require a more complex channel structure (e.g., chan of a struct with a response chan).
+		// For now, it's fire-and-forget.
 	}
 
 	if err := scanner.Err(); err != nil {

@@ -55,9 +55,6 @@ type Session struct {
 
 	// Token is a secure token for cookie-based auto-login.
 	Token string
-
-	// Accounting
-	LastInterimUpdateTime uint32 `json:"-"` // Monotonic time of the last interim update
 }
 
 // SessionParams holds RADIUS-provisioned session parameters.

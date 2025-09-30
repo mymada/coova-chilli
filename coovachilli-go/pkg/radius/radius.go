@@ -16,30 +16,7 @@ import (
 
 // AccountingSender defines the interface for sending RADIUS accounting packets.
 type AccountingSender interface {
-	SendAccountingRequest(session *core.Session, statusType rfc2866.AcctStatusType, reason string)
-}
-
-// A map to convert string reasons to RADIUS Acct-Terminate-Cause codes
-// Using integer values as the library version does not export these constants.
-var terminateCauseMap = map[string]rfc2866.AcctTerminateCause{
-	"User-Request":         rfc2866.AcctTerminateCause(1),
-	"Lost-Carrier":         rfc2866.AcctTerminateCause(2),
-	"Lost-Service":         rfc2866.AcctTerminateCause(3),
-	"Idle-Timeout":         rfc2866.AcctTerminateCause(4),
-	"Session-Timeout":      rfc2866.AcctTerminateCause(5),
-	"Admin-Reset":          rfc2866.AcctTerminateCause(6),
-	"Admin-Reboot":         rfc2866.AcctTerminateCause(7),
-	"Port-Error":           rfc2866.AcctTerminateCause(8),
-	"NAS-Error":            rfc2866.AcctTerminateCause(9),
-	"NAS-Request":          rfc2866.AcctTerminateCause(10),
-	"Port-Unneeded":        rfc2866.AcctTerminateCause(11),
-	"Port-Preempted":       rfc2866.AcctTerminateCause(12),
-	"Port-Suspended":       rfc2866.AcctTerminateCause(13),
-	"Service-Unavailable":  rfc2866.AcctTerminateCause(14),
-	"Callback":             rfc2866.AcctTerminateCause(15),
-	"User-Error":           rfc2866.AcctTerminateCause(16),
-	"Host-Request":         rfc2866.AcctTerminateCause(17),
-	"Data-Limit-Reached":   rfc2866.AcctTerminateCause(5), // Using SessionTimeout as a proxy
+	SendAccountingRequest(session *core.Session, statusType rfc2866.AcctStatusType) (*radius.Packet, error)
 }
 
 // CoAIncomingRequest holds a parsed CoA/Disconnect packet and the sender's address.
@@ -88,12 +65,6 @@ func (c *Client) SendAccessRequest(session *core.Session, username, password str
 	// Add MAC address
 	rfc2865.CallingStationID_SetString(packet, session.HisMAC.String())
 
-	// Add Port Type and VLAN ID if available
-	rfc2865.NASPortType_Set(packet, rfc2865.NASPortType(19)) // 19 for Wireless-Other, matches C version
-	if session.VLANID > 0 {
-		rfc2865.NASPortID_SetString(packet, fmt.Sprintf("vlan-%d", session.VLANID))
-	}
-
 	// Send the packet
 	server := fmt.Sprintf("%s:%d", c.cfg.RadiusServer1, c.cfg.RadiusAuthPort)
 	response, err := radius.Exchange(context.Background(), packet, server)
@@ -105,66 +76,49 @@ func (c *Client) SendAccessRequest(session *core.Session, username, password str
 	return response, nil
 }
 
-// SendAccountingRequest sends a RADIUS Accounting-Request packet asynchronously.
-func (c *Client) SendAccountingRequest(session *core.Session, statusType rfc2866.AcctStatusType, reason string) {
-	go func() {
-		packet := radius.New(radius.CodeAccountingRequest, []byte(c.cfg.RadiusSecret))
+// SendAccountingRequest sends a RADIUS Accounting-Request packet.
+func (c *Client) SendAccountingRequest(session *core.Session, statusType rfc2866.AcctStatusType) (*radius.Packet, error) {
+	packet := radius.New(radius.CodeAccountingRequest, []byte(c.cfg.RadiusSecret))
 
-		// Add standard attributes
-		rfc2866.AcctStatusType_Set(packet, statusType)
-		rfc2866.AcctSessionID_SetString(packet, session.SessionID)
-		rfc2865.UserName_SetString(packet, session.Redir.Username)
-		rfc2865.NASIdentifier_SetString(packet, c.cfg.RadiusNASID)
-		rfc2865.NASIPAddress_Set(packet, c.cfg.RadiusListen)
+	// Add standard attributes
+	rfc2866.AcctStatusType_Set(packet, statusType)
+	rfc2866.AcctSessionID_SetString(packet, session.SessionID)
+	rfc2865.UserName_SetString(packet, session.Redir.Username)
+	rfc2865.NASIdentifier_SetString(packet, c.cfg.RadiusNASID)
+	rfc2865.NASIPAddress_Set(packet, c.cfg.RadiusListen)
 
-		// Add accounting data
-		rfc2866.AcctInputOctets_Set(packet, rfc2866.AcctInputOctets(session.InputOctets))
-		rfc2866.AcctOutputOctets_Set(packet, rfc2866.AcctOutputOctets(session.OutputOctets))
-		rfc2866.AcctInputPackets_Set(packet, rfc2866.AcctInputPackets(session.InputPackets))
-		rfc2866.AcctOutputPackets_Set(packet, rfc2866.AcctOutputPackets(session.OutputPackets))
-		rfc2866.AcctSessionTime_Set(packet, rfc2866.AcctSessionTime(session.LastSeen.Sub(session.StartTime).Seconds()))
+	// Add accounting data
+	rfc2866.AcctInputOctets_Set(packet, rfc2866.AcctInputOctets(session.InputOctets))
+	rfc2866.AcctOutputOctets_Set(packet, rfc2866.AcctOutputOctets(session.OutputOctets))
+	rfc2866.AcctInputPackets_Set(packet, rfc2866.AcctInputPackets(session.InputPackets))
+	rfc2866.AcctOutputPackets_Set(packet, rfc2866.AcctOutputPackets(session.OutputPackets))
+	rfc2866.AcctSessionTime_Set(packet, rfc2866.AcctSessionTime(session.LastSeen.Sub(session.StartTime).Seconds()))
 
-		// Add Framed-IP-Address or Framed-IPv6-Prefix attribute
-		if session.HisIP != nil {
-			if session.HisIP.To4() != nil {
-				rfc2865.FramedIPAddress_Set(packet, session.HisIP)
-			} else if c.cfg.IPv6Enable {
-				prefix := &net.IPNet{IP: session.HisIP, Mask: net.CIDRMask(128, 128)}
-				rfc3162.FramedIPv6Prefix_Add(packet, prefix)
+	// Add Framed-IP-Address or Framed-IPv6-Prefix attribute
+	if session.HisIP != nil {
+		if session.HisIP.To4() != nil {
+			rfc2865.FramedIPAddress_Set(packet, session.HisIP)
+		} else if c.cfg.IPv6Enable { // Only add IPv6 attributes if enabled
+			prefix := &net.IPNet{
+				IP:   session.HisIP,
+				Mask: net.CIDRMask(128, 128), // /128 for a single host address
 			}
+			rfc3162.FramedIPv6Prefix_Add(packet, prefix)
 		}
-
-		// Add MAC address
-		rfc2865.CallingStationID_SetString(packet, session.HisMAC.String())
-
-	// Add Port Type and VLAN ID if available
-	rfc2865.NASPortType_Set(packet, rfc2865.NASPortType(19)) // 19 for Wireless-Other
-	if session.VLANID > 0 {
-		rfc2865.NASPortID_SetString(packet, fmt.Sprintf("vlan-%d", session.VLANID))
 	}
 
-		// Add terminate cause if this is a stop packet
-		if statusType == rfc2866.AcctStatusType(2) { // 2 = Stop
-			if cause, ok := terminateCauseMap[reason]; ok {
-				rfc2866.AcctTerminateCause_Set(packet, cause)
-			} else {
-				// 9 = NAS-Error
-				rfc2866.AcctTerminateCause_Set(packet, rfc2866.AcctTerminateCause(9))
-				c.logger.Warn().Str("reason", reason).Msg("Unknown terminate cause reason")
-			}
-		}
+	// Add MAC address
+	rfc2865.CallingStationID_SetString(packet, session.HisMAC.String())
 
+	// Send the packet
+	server := fmt.Sprintf("%s:%d", c.cfg.RadiusServer1, c.cfg.RadiusAcctPort)
+	response, err := radius.Exchange(context.Background(), packet, server)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send RADIUS Accounting-Request: %w", err)
+	}
 
-		// Send the packet
-		server := fmt.Sprintf("%s:%d", c.cfg.RadiusServer1, c.cfg.RadiusAcctPort)
-		response, err := radius.Exchange(context.Background(), packet, server)
-		if err != nil {
-			c.logger.Error().Err(err).Str("type", statusType.String()).Msg("Failed to send RADIUS Accounting-Request")
-			return
-		}
-
-		c.logger.Debug().Str("code", response.Code.String()).Str("user", session.Redir.Username).Msg("Received RADIUS accounting response")
-	}()
+	c.logger.Debug().Str("code", response.Code.String()).Str("user", session.Redir.Username).Msg("Received RADIUS accounting response")
+	return response, nil
 }
 
 // StartCoAListener starts listeners for incoming CoA and Disconnect requests.

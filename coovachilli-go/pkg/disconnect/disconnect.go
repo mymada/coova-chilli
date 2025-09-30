@@ -14,14 +14,14 @@ import (
 type Manager struct {
 	cfg          *config.Config
 	sm           *core.SessionManager
-	fw           firewall.UserRuleManager
+	fw           firewall.UserRuleRemover
 	radiusClient radius.AccountingSender
 	scriptRunner *script.Runner
 	logger       zerolog.Logger
 }
 
 // NewManager creates a new disconnection manager.
-func NewManager(cfg *config.Config, sm *core.SessionManager, fw firewall.UserRuleManager, radiusClient radius.AccountingSender, scriptRunner *script.Runner, logger zerolog.Logger) *Manager {
+func NewManager(cfg *config.Config, sm *core.SessionManager, fw firewall.UserRuleRemover, radiusClient radius.AccountingSender, scriptRunner *script.Runner, logger zerolog.Logger) *Manager {
 	return &Manager{
 		cfg:          cfg,
 		sm:           sm,
@@ -52,8 +52,10 @@ func (m *Manager) Disconnect(session *core.Session, reason string) {
 
 	// 1. Send RADIUS Accounting-Stop packet
 	if m.radiusClient != nil {
-		// Use integer value 2 for Stop as the named constant is not available in this library version.
-		m.radiusClient.SendAccountingRequest(session, rfc2866.AcctStatusType(2), reason)
+		_, err := m.radiusClient.SendAccountingRequest(session, rfc2866.AcctStatusType(2)) // 2 = Stop
+		if err != nil {
+			m.logger.Error().Err(err).Msg("Failed to send RADIUS accounting stop packet")
+		}
 	}
 
 	// 2. Run connection-down script

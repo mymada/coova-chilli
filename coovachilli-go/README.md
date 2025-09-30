@@ -64,30 +64,3 @@ sudo apt-get update && sudo apt-get install -y golang-go build-essential libpcap
     sudo ./coovachilli
     ```
     The application needs `sudo` because it requires elevated privileges to create TUN interfaces and manage firewall rules.
-
-## Configuration
-
-The application is configured using the `config.yaml` file. Here are some of the key settings:
-
-### Network Settings
-
-*   `dhcpif`: The main network interface on which the DHCP server will listen for client requests.
-*   `net`: The IPv4 subnet for the captive portal clients (e.g., `10.1.0.0/24`).
-*   `uamlisten`: The IP address of the TUN interface, which serves the captive portal.
-*   `dns1`, `dns2`: The IP addresses of the DNS servers to be assigned to clients.
-
-### VLAN Settings
-
-*   `ieee8021q`: (boolean) Set to `true` to enable 802.1Q VLAN processing. When enabled, `dhcpif` is treated as a trunk port, and the application will listen for traffic on the specified VLANs.
-*   `vlans`: (list of integers) A list of VLAN IDs that the service should listen on when `ieee8021q` is enabled. Packets from other VLANs will be dropped.
-
-### RADIUS Settings
-
-*   `radiusserver1`: The IP address of the primary RADIUS server.
-*   `radiussecret`: The shared secret for communicating with the RADIUS server.
-*   `radiusnasid`: The identifier for this NAS (Network Access Server).
-
-### Walled Garden
-
-*   `uamallowed`: A list of IP addresses or subnets for the walled garden (pre-authentication access).
-*   `uamdomains`: A list of domain names for the walled garden. The application will dynamically resolve these domains and add their IPs to the walled garden rules.

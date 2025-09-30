@@ -5,7 +5,6 @@ import (
 
 	"coovachilli-go/pkg/config"
 	"github.com/rs/zerolog"
-	"layeh.com/radius/rfc2866"
 )
 
 // Disconnector defines the interface for disconnecting a session.
@@ -14,31 +13,24 @@ type Disconnector interface {
 	Disconnect(session *Session, reason string)
 }
 
-// AccountingSender defines an interface for sending accounting packets.
-type AccountingSender interface {
-	SendAccountingRequest(session *Session, statusType rfc2866.AcctStatusType, reason string)
-}
-
 // Reaper periodically checks for expired sessions and disconnects them.
 type Reaper struct {
-	cfg              *config.Config
-	sm               *SessionManager
-	disconnecter     Disconnector
-	accountingSender AccountingSender
-	logger           zerolog.Logger
-	ticker           *time.Ticker
-	quit             chan struct{}
+	cfg          *config.Config
+	sm           *SessionManager
+	disconnecter Disconnector
+	logger       zerolog.Logger
+	ticker       *time.Ticker
+	quit         chan struct{}
 }
 
 // NewReaper creates a new session reaper.
-func NewReaper(cfg *config.Config, sm *SessionManager, disconnecter Disconnector, accountingSender AccountingSender, logger zerolog.Logger) *Reaper {
+func NewReaper(cfg *config.Config, sm *SessionManager, disconnecter Disconnector, logger zerolog.Logger) *Reaper {
 	return &Reaper{
-		cfg:              cfg,
-		sm:               sm,
-		disconnecter:     disconnecter,
-		accountingSender: accountingSender,
-		logger:           logger.With().Str("component", "reaper").Logger(),
-		quit:             make(chan struct{}),
+		cfg:          cfg,
+		sm:           sm,
+		disconnecter: disconnecter,
+		logger:       logger.With().Str("component", "reaper").Logger(),
+		quit:         make(chan struct{}),
 	}
 }
 
@@ -85,59 +77,29 @@ func (r *Reaper) reapSessions() {
 		}
 
 		session.RLock()
-		// Copy all necessary params under read lock
-		p := session.SessionParams
-		inputOctets := session.InputOctets
-		outputOctets := session.OutputOctets
+		sessionTimeout := session.SessionParams.SessionTimeout
+		idleTimeout := session.SessionParams.IdleTimeout
 		startTime := session.StartTimeSec
 		lastActivityTime := session.LastActivityTimeSec
-		lastInterimUpdateTime := session.LastInterimUpdateTime
 		session.RUnlock()
 
 		// Check session timeout
-		if p.SessionTimeout > 0 {
-			if (now - startTime) >= p.SessionTimeout {
-				r.logger.Info().Str("user", session.Redir.Username).Str("ip", session.HisIP.String()).Msg("Session timeout reached")
+		if sessionTimeout > 0 {
+			sessionDuration := now - startTime
+			if sessionDuration >= sessionTimeout {
+				r.logger.Info().Str("session_id", session.ChilliSessionID).Str("mac", session.HisMAC.String()).Msg("Session timeout reached")
 				r.disconnecter.Disconnect(session, "Session-Timeout")
-				continue // Disconnected, move to next session
+				continue // Move to the next session
 			}
 		}
 
 		// Check idle timeout
-		if p.IdleTimeout > 0 {
-			if (now - lastActivityTime) >= p.IdleTimeout {
-				r.logger.Info().Str("user", session.Redir.Username).Str("ip", session.HisIP.String()).Msg("Idle timeout reached")
+		if idleTimeout > 0 {
+			idleDuration := now - lastActivityTime
+			if idleDuration >= idleTimeout {
+				r.logger.Info().Str("session_id", session.ChilliSessionID).Str("mac", session.HisMAC.String()).Msg("Idle timeout reached")
 				r.disconnecter.Disconnect(session, "Idle-Timeout")
-				continue // Disconnected, move to next session
-			}
-		}
-
-		// Check data quotas
-		if p.MaxTotalOctets > 0 && (inputOctets+outputOctets) >= p.MaxTotalOctets {
-			r.logger.Info().Str("user", session.Redir.Username).Str("ip", session.HisIP.String()).Msg("Total data quota reached")
-			r.disconnecter.Disconnect(session, "Data-Limit-Reached")
-			continue
-		}
-		if p.MaxInputOctets > 0 && inputOctets >= p.MaxInputOctets {
-			r.logger.Info().Str("user", session.Redir.Username).Str("ip", session.HisIP.String()).Msg("Input data quota reached")
-			r.disconnecter.Disconnect(session, "Data-Limit-Reached")
-			continue
-		}
-		if p.MaxOutputOctets > 0 && outputOctets >= p.MaxOutputOctets {
-			r.logger.Info().Str("user", session.Redir.Username).Str("ip", session.HisIP.String()).Msg("Output data quota reached")
-			r.disconnecter.Disconnect(session, "Data-Limit-Reached")
-			continue
-		}
-
-		// Check for interim accounting update
-		if p.InterimInterval > 0 {
-			if (now - lastInterimUpdateTime) >= p.InterimInterval {
-				r.logger.Debug().Str("user", session.Redir.Username).Str("ip", session.HisIP.String()).Msg("Sending interim accounting update")
-				// Use integer value 3 for Interim-Update as the named constant is not available in this library version.
-				r.accountingSender.SendAccountingRequest(session, rfc2866.AcctStatusType(3), "Interim-Update")
-				session.Lock()
-				session.LastInterimUpdateTime = now
-				session.Unlock()
+				continue // Move to the next session
 			}
 		}
 	}

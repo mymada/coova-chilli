@@ -1,7 +1,6 @@
 package cmdsock
 
 import (
-	"bufio"
 	"net"
 	"os"
 	"testing"
@@ -13,36 +12,29 @@ import (
 
 func TestCmdSockListener(t *testing.T) {
 	// Setup
-	socketPath := "/tmp/coovachilli_test.sock"
-	cmdChan := make(chan CommandRequest, 1)
+	sockPath := "/tmp/coovachilli-test.sock"
+	cmdChan := make(chan string, 1)
 	logger := zerolog.Nop()
+	listener := NewListener(sockPath, cmdChan, logger)
 
-	listener := NewListener(socketPath, cmdChan, logger)
 	go listener.Start()
-	time.Sleep(50 * time.Millisecond) // Give the listener time to start
+	time.Sleep(50 * time.Millisecond) // Give listener time to start
+	defer os.Remove(sockPath)
 
-	// Test client connection
-	conn, err := net.Dial("unix", socketPath)
+	// Connect to the socket
+	conn, err := net.Dial("unix", sockPath)
 	require.NoError(t, err)
 	defer conn.Close()
 
-	// Goroutine to handle the command and send a response
-	go func() {
-		req := <-cmdChan
-		require.Equal(t, "test command", req.Command)
-		req.Response <- "OK"
-	}()
-
-	// Send a command
-	_, err = conn.Write([]byte("test command\n"))
+	// Write a command
+	_, err = conn.Write([]byte("list\n"))
 	require.NoError(t, err)
 
-	// Read the response
-	reader := bufio.NewReader(conn)
-	response, err := reader.ReadString('\n')
-	require.NoError(t, err)
-	require.Equal(t, "OK\n", response)
-
-	// Cleanup
-	os.Remove(socketPath)
+	// Assert that the command is received on the channel
+	select {
+	case cmd := <-cmdChan:
+		require.Equal(t, "list", cmd)
+	case <-time.After(1 * time.Second):
+		t.Fatal("Did not receive command on channel")
+	}
 }

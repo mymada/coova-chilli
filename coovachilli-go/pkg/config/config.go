@@ -35,8 +35,6 @@ type Config struct {
 
 	// DHCP settings
 	DHCPIf         string `yaml:"dhcpif"`
-	IEEE8021Q      bool   `yaml:"ieee8021q"`
-	VLANs          []int  `yaml:"vlans"`
 	DHCPRelay      bool   `yaml:"dhcprelay"`
 	DHCPUpstream   string `yaml:"dhcpupstream"`
 	DHCPStart      net.IP `yaml:"dhcpstart"`
@@ -59,9 +57,6 @@ type Config struct {
 	RadiusSecret       string `yaml:"radiussecret"`
 	RadiusNASID        string `yaml:"radiusnasid"`
 	CoaPort            int    `yaml:"coaport"`
-	MACAuth            bool   `yaml:"macauth"`
-	MACPasswd          string `yaml:"macpasswd"`
-	MACSuffix          string `yaml:"macsuffix"`
 
 	// UAM/Captive Portal settings
 	UAMPort             int      `yaml:"uamport"`
@@ -75,6 +70,12 @@ type Config struct {
 	UAMAllowedV6        []string `yaml:"uamallowed_v6"`
 	UAMDomains          []string `yaml:"uamdomains"`
 	UAMUrl              string   `yaml:"uamurl"`
+	MACAuth             bool     `yaml:"macauth"`
+	MACSuffix           string   `yaml:"macsuffix"`
+	MACPasswd           string   `yaml:"macpasswd"`
+	EAPOL               bool     `yaml:"eapol"`
+	IEEE8021Q           bool     `yaml:"ieee8021q"`
+	VLANs               []int    `yaml:"vlans"`
 	DefSessionTimeout   uint32   `yaml:"defsessiontimeout"`
 	DefIdleTimeout      uint32   `yaml:"defidletimeout"`
 	DefBandwidthMaxDown uint64   `yaml:"defbandwidthmaxdown"`
