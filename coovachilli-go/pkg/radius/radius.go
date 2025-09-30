@@ -2,7 +2,10 @@ package radius
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"io/ioutil"
 	"net"
 
 	"coovachilli-go/pkg/config"
@@ -27,8 +30,9 @@ type CoAIncomingRequest struct {
 
 // Client holds the state for the RADIUS client.
 type Client struct {
-	cfg    *config.Config
-	logger zerolog.Logger
+	cfg        *config.Config
+	logger     zerolog.Logger
+	radsecConn net.Conn
 }
 
 // NewClient creates a new RADIUS client.
@@ -37,6 +41,81 @@ func NewClient(cfg *config.Config, logger zerolog.Logger) *Client {
 		cfg:    cfg,
 		logger: logger.With().Str("component", "radius").Logger(),
 	}
+}
+
+func (c *Client) dialRadSec() (net.Conn, error) {
+	cert, err := tls.LoadX509KeyPair(c.cfg.RadSecCertFile, c.cfg.RadSecKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("could not load radsec key pair: %w", err)
+	}
+
+	caCert, err := ioutil.ReadFile(c.cfg.RadSecCAFile)
+	if err != nil {
+		return nil, fmt.Errorf("could not load radsec ca file: %w", err)
+	}
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      caCertPool,
+	}
+
+	server := fmt.Sprintf("%s:%d", c.cfg.RadiusServer1, c.cfg.RadSecPort)
+	conn, err := tls.Dial("tcp", server, tlsConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial radsec server: %w", err)
+	}
+	c.logger.Info().Str("server", server).Msg("Successfully connected to RadSec server")
+	return conn, nil
+}
+
+func (c *Client) radsecExchange(packet *radius.Packet) (*radius.Packet, error) {
+	if c.radsecConn == nil {
+		conn, err := c.dialRadSec()
+		if err != nil {
+			return nil, err
+		}
+		c.radsecConn = conn
+	}
+
+	encoded, err := packet.Encode()
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode radius packet for radsec: %w", err)
+	}
+
+	_, err = c.radsecConn.Write(encoded)
+	if err != nil {
+		c.logger.Warn().Err(err).Msg("Failed to write to RadSec connection, attempting to redial")
+		c.radsecConn.Close() // Close the potentially broken connection
+		c.radsecConn = nil
+
+		conn, errDial := c.dialRadSec()
+		if errDial != nil {
+			return nil, errDial // Failed to redial
+		}
+		c.radsecConn = conn
+		_, err = c.radsecConn.Write(encoded) // Retry write
+		if err != nil {
+			return nil, fmt.Errorf("failed to write to radsec connection after redial: %w", err)
+		}
+	}
+
+	// Read response
+	buf := make([]byte, 4096)
+	n, err := c.radsecConn.Read(buf)
+	if err != nil {
+		c.radsecConn.Close()
+		c.radsecConn = nil
+		return nil, fmt.Errorf("failed to read from radsec connection: %w", err)
+	}
+
+	response, err := radius.Parse(buf[:n], []byte(c.cfg.RadiusSecret))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse radsec response: %w", err)
+	}
+
+	return response, nil
 }
 
 // SendAccessRequest sends a RADIUS Access-Request packet.
@@ -66,8 +145,14 @@ func (c *Client) SendAccessRequest(session *core.Session, username, password str
 	rfc2865.CallingStationID_SetString(packet, session.HisMAC.String())
 
 	// Send the packet
-	server := fmt.Sprintf("%s:%d", c.cfg.RadiusServer1, c.cfg.RadiusAuthPort)
-	response, err := radius.Exchange(context.Background(), packet, server)
+	var response *radius.Packet
+	var err error
+	if c.cfg.RadSecEnable {
+		response, err = c.radsecExchange(packet)
+	} else {
+		server := fmt.Sprintf("%s:%d", c.cfg.RadiusServer1, c.cfg.RadiusAuthPort)
+		response, err = radius.Exchange(context.Background(), packet, server)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to send RADIUS Access-Request: %w", err)
 	}
@@ -111,8 +196,14 @@ func (c *Client) SendAccountingRequest(session *core.Session, statusType rfc2866
 	rfc2865.CallingStationID_SetString(packet, session.HisMAC.String())
 
 	// Send the packet
-	server := fmt.Sprintf("%s:%d", c.cfg.RadiusServer1, c.cfg.RadiusAcctPort)
-	response, err := radius.Exchange(context.Background(), packet, server)
+	var response *radius.Packet
+	var err error
+	if c.cfg.RadSecEnable {
+		response, err = c.radsecExchange(packet)
+	} else {
+		server := fmt.Sprintf("%s:%d", c.cfg.RadiusServer1, c.cfg.RadiusAcctPort)
+		response, err = radius.Exchange(context.Background(), packet, server)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to send RADIUS Accounting-Request: %w", err)
 	}

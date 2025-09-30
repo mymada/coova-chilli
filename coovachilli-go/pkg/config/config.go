@@ -57,6 +57,11 @@ type Config struct {
 	RadiusSecret       string `yaml:"radiussecret"`
 	RadiusNASID        string `yaml:"radiusnasid"`
 	CoaPort            int    `yaml:"coaport"`
+	RadSecEnable       bool   `yaml:"radsecenable"`
+	RadSecPort         int    `yaml:"radsecport"`
+	RadSecCertFile     string `yaml:"radseccertfile"`
+	RadSecKeyFile      string `yaml:"radseckeyfile"`
+	RadSecCAFile       string `yaml:"radseccafile"`
 
 	// UAM/Captive Portal settings
 	UAMPort             int      `yaml:"uamport"`
@@ -125,6 +130,11 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("invalid 'net_v6' CIDR value: %w", err)
 		}
 		cfg.NetV6 = *ipnet
+	}
+
+	// Default RadSec port if not provided
+	if cfg.RadSecEnable && cfg.RadSecPort == 0 {
+		cfg.RadSecPort = 2083
 	}
 
 	return &cfg, nil
