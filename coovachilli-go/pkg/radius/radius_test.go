@@ -278,3 +278,79 @@ func TestRadSecExchange(t *testing.T) {
 		t.Fatal("RadSec server timed out")
 	}
 }
+
+func TestRadiusFailover(t *testing.T) {
+	// Start mock secondary RADIUS server
+	serverErrChan := make(chan error, 1)
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer pc.Close()
+
+	go func() {
+		buf := make([]byte, 4096)
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+		packet, err := radius.Parse(buf[:n], []byte("1234567890123456"))
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+		if packet.Code != radius.CodeAccessRequest {
+			serverErrChan <- fmt.Errorf("expected Access-Request, got %v", packet.Code)
+			return
+		}
+		response := packet.Response(radius.CodeAccessAccept)
+		encoded, err := response.Encode()
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+		_, err = pc.WriteTo(encoded, addr)
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+		serverErrChan <- nil
+	}()
+
+	serverAddr := pc.LocalAddr().(*net.UDPAddr)
+	serverHost, serverPortStr, err := net.SplitHostPort(serverAddr.String())
+	require.NoError(t, err)
+	var serverPort int
+	_, err = fmt.Sscanf(serverPortStr, "%d", &serverPort)
+	require.NoError(t, err)
+
+	// Configure the radius.Client with a bad primary and good secondary
+	cfg := &config.Config{
+		RadiusServer1:  "127.0.0.1",
+		RadiusAuthPort: 1, // Invalid port to force failure
+		RadiusServer2:  serverHost,
+		RadiusAcctPort: serverPort, // For simplicity, use same port for auth/acct
+		RadiusSecret:   "1234567890123456",
+	}
+	cfg.RadiusAuthPort = serverPort // Point secondary auth to the mock server
+
+	// Create client and session
+	logger := zerolog.Nop()
+	client := NewClient(cfg, logger)
+	mac, _ := net.ParseMAC("00:01:02:03:04:05")
+	session := &core.Session{
+		HisIP:  net.ParseIP("10.0.0.1"),
+		HisMAC: mac,
+	}
+
+	// Call SendAccessRequest - it should fail over to the secondary
+	_, err = client.SendAccessRequest(session, "testuser", "1234567890123456")
+	require.NoError(t, err)
+
+	// Check that the secondary server received the request
+	select {
+	case err := <-serverErrChan:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second): // Allow time for the first server to time out
+		t.Fatal("RADIUS server timed out")
+	}
+}
