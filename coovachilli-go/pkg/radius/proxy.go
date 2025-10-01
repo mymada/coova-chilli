@@ -89,9 +89,16 @@ func (s *ProxyServer) handleProxyRequest(pc net.PacketConn, peer net.Addr, reque
 	var upstreamResponse *radius.Packet
 	switch request.Code {
 	case radius.CodeAccessRequest:
-		userName := rfc2865.UserName_GetString(request)
-		password := "" // We can't get the password, so we assume other attributes are used for auth
-		upstreamResponse, err = s.radiusClient.SendAccessRequest(session, userName, password)
+		// For a proxy, we must forward the original packet's attributes,
+		// especially the encrypted User-Password, which we cannot decrypt.
+		// We create a new packet and copy all attributes.
+		upstreamPacket := radius.New(request.Code, []byte(s.radiusClient.cfg.RadiusSecret))
+		upstreamPacket.Attributes = request.Attributes
+		upstreamPacket.Authenticator = request.Authenticator
+
+		// Use the client's exchange mechanism to send the request upstream.
+		upstreamResponse, err = s.radiusClient.exchangeWithFailover(upstreamPacket, true)
+
 	case radius.CodeAccountingRequest:
 		statusType := rfc2866.AcctStatusType_Get(request)
 		upstreamResponse, err = s.radiusClient.SendAccountingRequest(session, statusType)

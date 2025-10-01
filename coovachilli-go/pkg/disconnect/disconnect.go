@@ -14,14 +14,14 @@ import (
 type Manager struct {
 	cfg          *config.Config
 	sm           *core.SessionManager
-	fw           firewall.UserRuleRemover
+	fw           firewall.FirewallManager
 	radiusClient radius.AccountingSender
 	scriptRunner *script.Runner
 	logger       zerolog.Logger
 }
 
 // NewManager creates a new disconnection manager.
-func NewManager(cfg *config.Config, sm *core.SessionManager, fw firewall.UserRuleRemover, radiusClient radius.AccountingSender, scriptRunner *script.Runner, logger zerolog.Logger) *Manager {
+func NewManager(cfg *config.Config, sm *core.SessionManager, fw firewall.FirewallManager, radiusClient radius.AccountingSender, scriptRunner *script.Runner, logger zerolog.Logger) *Manager {
 	return &Manager{
 		cfg:          cfg,
 		sm:           sm,

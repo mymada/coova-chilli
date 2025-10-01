@@ -11,6 +11,7 @@ require (
 	github.com/rs/zerolog v1.30.0
 	github.com/songgao/water v0.0.0-20200317203138-2b4b6d7c09d8
 	github.com/stretchr/testify v1.8.4
+	golang.org/x/crypto v0.0.0-20200709230013-948cd5f35899
 	gopkg.in/yaml.v2 v2.4.0
 	layeh.com/radius v0.0.0-20210819152912-ad72663a72ab
 )

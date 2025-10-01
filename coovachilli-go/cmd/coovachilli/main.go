@@ -222,7 +222,7 @@ func main() {
 						s.AuthResult <- false
 						return
 					}
-					go radiusClient.SendAccountingRequest(s, 1, "Start")
+					go radiusClient.SendAccountingRequest(s, rfc2866.AcctStatusType(1)) // 1 = Start
 					scriptRunner.RunScript(cfg.ConUp, s, 0)
 					s.AuthResult <- true
 				} else {

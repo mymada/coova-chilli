@@ -1,2 +1,2 @@
-# Ignore the Go binary
-coovachilli-go/coovachilli
+# Ignore compiled Go binaries
+/coovachilli-go/cmd/coovachilli/coovachilli

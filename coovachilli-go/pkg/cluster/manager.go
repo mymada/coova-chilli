@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coovachilli/chilli/coovachilli-go/pkg/config"
+	"coovachilli-go/pkg/config"
 )
 
 // PeerManager manages the state of all peers in the cluster.
@@ -140,8 +140,11 @@ func (m *PeerManager) electNewActivePeer() {
 		m.currentState = PeerStateActive
 		m.peers[m.localID].State = PeerStateActive
 		// Immediately send a HELLO to notify others of the state change.
-		if err := m.SendClusterMessage(MsgTypeHello); err != nil {
-			log.Printf("Failed to send state change notification: %v", err)
+		// Guard against nil interface for testing purposes.
+		if m.iface != nil {
+			if err := m.SendClusterMessage(MsgTypeHello); err != nil {
+				log.Printf("Failed to send state change notification: %v", err)
+			}
 		}
 	}
 }

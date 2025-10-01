@@ -9,6 +9,7 @@ import (
 
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
+	"coovachilli-go/pkg/eapol"
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
 	"github.com/gopacket/gopacket/pcap"
@@ -24,6 +25,7 @@ type Server struct {
 	cfg            *config.Config
 	sessionManager *core.SessionManager
 	radiusReqChan  chan<- *core.Session
+	eapolHandler   *eapol.Handler
 	leasesV4       map[string]*Lease
 	poolV4         *Pool
 	leasesV6       map[string]*Lease // Using the same Lease struct for v6 for now
@@ -50,7 +52,7 @@ type Pool struct {
 }
 
 // NewServer creates a new DHCP server and starts listening for packets.
-func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<- *core.Session, logger zerolog.Logger) (*Server, error) {
+func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<- *core.Session, eapolHandler *eapol.Handler, logger zerolog.Logger) (*Server, error) {
 	var poolV4 *Pool
 	var poolV6 *Pool
 	var err error
@@ -103,6 +105,7 @@ func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<-
 		cfg:            cfg,
 		sessionManager: sm,
 		radiusReqChan:  radiusReqChan,
+		eapolHandler:   eapolHandler,
 		leasesV4:       make(map[string]*Lease),
 		poolV4:         poolV4,
 		leasesV6:       make(map[string]*Lease),
@@ -141,6 +144,16 @@ func (s *Server) reapLeases() {
 func (s *Server) listen() {
 	packetSource := gopacket.NewPacketSource(s.handle, s.handle.LinkType())
 	for packet := range packetSource.Packets() {
+		if ethLayer := packet.Layer(layers.LayerTypeEthernet); ethLayer != nil {
+			eth, _ := ethLayer.(*layers.Ethernet)
+			if eth.EthernetType == layers.EthernetTypeEAPOL {
+				if s.eapolHandler != nil {
+					s.eapolHandler.HandlePacket(packet)
+				}
+				continue
+			}
+		}
+
 		udpLayer := packet.Layer(layers.LayerTypeUDP)
 		if udpLayer == nil {
 			continue
@@ -159,7 +172,7 @@ func (s *Server) listen() {
 					s.logger.Error().Err(err).Msg("Error relaying DHCPv4 packet")
 				}
 			} else {
-				respBytes, req, err := s.HandleDHCPv4(dhcpLayer.LayerContents())
+				respBytes, req, err := s.HandleDHCPv4(dhcpLayer.LayerContents(), packet)
 				if err != nil {
 					s.logger.Error().Err(err).Msg("Error handling DHCPv4 packet")
 					continue
@@ -538,8 +551,8 @@ func (s *Server) handleRequestV6(req *dhcpv6.Message) (dhcpv6.DHCPv6, error) {
 	return resp, nil
 }
 
-func (s *Server) HandleDHCPv4(packet []byte) ([]byte, *dhcpv4.DHCPv4, error) {
-	req, err := dhcpv4.FromBytes(packet)
+func (s *Server) HandleDHCPv4(dhcpPayload []byte, packet gopacket.Packet) ([]byte, *dhcpv4.DHCPv4, error) {
+	req, err := dhcpv4.FromBytes(dhcpPayload)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse DHCPv4 request: %w", err)
 	}
@@ -551,7 +564,7 @@ func (s *Server) HandleDHCPv4(packet []byte) ([]byte, *dhcpv4.DHCPv4, error) {
 	case dhcpv4.MessageTypeDiscover:
 		respBytes, err = s.handleDiscover(req)
 	case dhcpv4.MessageTypeRequest:
-		respBytes, err = s.handleRequest(req)
+		respBytes, err = s.handleRequest(req, packet)
 	default:
 		s.logger.Warn().Str("type", req.MessageType().String()).Msg("Unhandled DHCPv4 message type")
 		return nil, nil, nil
@@ -591,7 +604,7 @@ func (s *Server) handleDiscover(req *dhcpv4.DHCPv4) ([]byte, error) {
 	return resp.ToBytes(), nil
 }
 
-func (s *Server) handleRequest(req *dhcpv4.DHCPv4) ([]byte, error) {
+func (s *Server) handleRequest(req *dhcpv4.DHCPv4, packet gopacket.Packet) ([]byte, error) {
 	s.logger.Debug().Msg("Handling DHCPREQUEST")
 	s.Lock()
 	defer s.Unlock()
@@ -625,7 +638,12 @@ func (s *Server) handleRequest(req *dhcpv4.DHCPv4) ([]byte, error) {
 			return s.makeNak(req)
 		}
 		s.logger.Debug().Str("mac", req.ClientHWAddr.String()).Msg("Creating new session for DHCPREQUEST")
-		session = s.sessionManager.CreateSession(reqIP, req.ClientHWAddr, s.cfg)
+		var vlanID uint16
+		if dot1qLayer := packet.Layer(layers.LayerTypeDot1Q); dot1qLayer != nil {
+			dot1q, _ := dot1qLayer.(*layers.Dot1Q)
+			vlanID = dot1q.VLANIdentifier
+		}
+		session = s.sessionManager.CreateSession(reqIP, req.ClientHWAddr, vlanID, s.cfg)
 	}
 
 	s.logger.Debug().Str("mac", req.ClientHWAddr.String()).Msg("Sending session to RADIUS for authorization")
