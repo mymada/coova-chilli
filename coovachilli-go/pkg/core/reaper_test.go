@@ -23,7 +23,7 @@ func (m *mockDisconnector) Disconnect(session *Session, reason string) {
 
 func TestReaper(t *testing.T) {
 	// Setup
-	sm := NewSessionManager()
+	sm := NewSessionManager(nil)
 	mockDc := &mockDisconnector{}
 	cfg := &config.Config{} // Empty config is fine for this test
 	logger := zerolog.Nop() // Disable logging output

@@ -8,7 +8,7 @@ import (
 )
 
 func TestSessionManager(t *testing.T) {
-	sm := NewSessionManager()
+	sm := NewSessionManager(nil)
 
 	mac, _ := net.ParseMAC("00:00:5e:00:53:01")
 	ip := net.ParseIP("10.1.0.100")
@@ -50,7 +50,7 @@ func TestSessionManager(t *testing.T) {
 }
 
 func TestCreateSession_Defaults(t *testing.T) {
-	sm := NewSessionManager()
+	sm := NewSessionManager(nil)
 	mac, _ := net.ParseMAC("00:00:5e:00:53:02")
 	ip := net.ParseIP("10.1.0.101")
 

@@ -27,8 +27,8 @@ func (m *mockDisconnector) Disconnect(session *core.Session, reason string) {
 
 func TestHandleStatus(t *testing.T) {
 	// Setup
-	sm := core.NewSessionManager()
-	server := NewServer(&config.Config{}, sm, nil, nil, zerolog.Nop())
+	sm := core.NewSessionManager(nil)
+	server := NewServer(&config.Config{}, sm, nil, nil, zerolog.Nop(), nil)
 
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
@@ -52,9 +52,9 @@ func TestHandleStatus(t *testing.T) {
 
 func TestHandleLogout(t *testing.T) {
 	// Setup
-	sm := core.NewSessionManager()
+	sm := core.NewSessionManager(nil)
 	mockDc := &mockDisconnector{}
-	server := NewServer(&config.Config{}, sm, nil, mockDc, zerolog.Nop())
+	server := NewServer(&config.Config{}, sm, nil, mockDc, zerolog.Nop(), nil)
 
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
@@ -77,8 +77,8 @@ func TestHandleLogout(t *testing.T) {
 
 func TestHandleApiStatus(t *testing.T) {
 	// Setup
-	sm := core.NewSessionManager()
-	server := NewServer(&config.Config{}, sm, nil, nil, zerolog.Nop())
+	sm := core.NewSessionManager(nil)
+	server := NewServer(&config.Config{}, sm, nil, nil, zerolog.Nop(), nil)
 
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
@@ -102,9 +102,9 @@ func TestHandleApiStatus(t *testing.T) {
 
 func TestHandleApiLogout(t *testing.T) {
 	// Setup
-	sm := core.NewSessionManager()
+	sm := core.NewSessionManager(nil)
 	mockDc := &mockDisconnector{}
-	server := NewServer(&config.Config{}, sm, nil, mockDc, zerolog.Nop())
+	server := NewServer(&config.Config{}, sm, nil, mockDc, zerolog.Nop(), nil)
 
 	// Create a mock session with a token
 	clientIP := net.ParseIP("10.0.0.15")
@@ -129,8 +129,8 @@ func TestHandleApiLogout(t *testing.T) {
 
 func TestHandleJsonpStatus(t *testing.T) {
 	// Setup
-	sm := core.NewSessionManager()
-	server := NewServer(&config.Config{}, sm, nil, nil, zerolog.Nop())
+	sm := core.NewSessionManager(nil)
+	server := NewServer(&config.Config{}, sm, nil, nil, zerolog.Nop(), nil)
 
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")

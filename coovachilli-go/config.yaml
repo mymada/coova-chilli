@@ -80,3 +80,9 @@ cluster:
   peerid: 0
   peerkey: "your-secret-key"
   interface: "eth1"
+
+# Metrics settings
+metrics:
+  enabled: true
+  backend: "prometheus"
+  listen: "0.0.0.0:9090"

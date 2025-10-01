@@ -20,9 +20,11 @@ import (
 	"coovachilli-go/pkg/eapol"
 	"coovachilli-go/pkg/firewall"
 	"coovachilli-go/pkg/http"
+	"coovachilli-go/pkg/metrics"
 	"coovachilli-go/pkg/radius"
 	"coovachilli-go/pkg/script"
 	"coovachilli-go/pkg/tun"
+	stdhttp "net/http"
 
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
@@ -53,6 +55,34 @@ func main() {
 		log.Fatal().Err(err).Msg("Error loading configuration")
 	}
 
+	// Initialize metrics recorder
+	var metricsRecorder metrics.Recorder
+	if cfg.Metrics.Enabled {
+		switch cfg.Metrics.Backend {
+		case "prometheus":
+			log.Info().Msg("Prometheus metrics enabled")
+			metricsRecorder = metrics.NewPrometheusRecorder()
+		default:
+			log.Warn().Str("backend", cfg.Metrics.Backend).Msg("Unknown metrics backend, defaulting to no-op")
+			metricsRecorder = metrics.NewNoopRecorder()
+		}
+	} else {
+		log.Info().Msg("Metrics are disabled")
+		metricsRecorder = metrics.NewNoopRecorder()
+	}
+
+	// Start metrics server if applicable
+	if handler := metricsRecorder.Handler(); handler != nil {
+		go func() {
+			log.Info().Str("addr", cfg.Metrics.Listen).Msg("Starting metrics server")
+			mux := stdhttp.NewServeMux()
+			mux.Handle("/metrics", handler)
+			if err := stdhttp.ListenAndServe(cfg.Metrics.Listen, mux); err != nil {
+				log.Error().Err(err).Msg("Metrics server failed")
+			}
+		}()
+	}
+
 	var peerManager *cluster.PeerManager
 	if cfg.Cluster.Enabled {
 		log.Info().Msg("Cluster mode enabled.")
@@ -73,7 +103,7 @@ func main() {
 	defer fw.Cleanup()
 
 	scriptRunner := script.NewRunner(log.Logger, cfg)
-	sessionManager := core.NewSessionManager()
+	sessionManager := core.NewSessionManager(metricsRecorder)
 	dnsProxy := dns.NewProxy(cfg, log.Logger)
 	eapolHandler := eapol.NewHandler(cfg, sessionManager, log.Logger)
 
@@ -91,19 +121,19 @@ func main() {
 	}
 
 	radiusReqChan := make(chan *core.Session)
-	radiusClient := radius.NewClient(cfg, log.Logger)
+	radiusClient := radius.NewClient(cfg, log.Logger, metricsRecorder)
 	disconnectManager := disconnect.NewManager(cfg, sessionManager, fw, radiusClient, scriptRunner, log.Logger)
 	reaper := core.NewReaper(cfg, sessionManager, disconnectManager, log.Logger)
 
 	reaper.Start()
 	defer reaper.Stop()
 
-	_, err = dhcp.NewServer(cfg, sessionManager, radiusReqChan, eapolHandler, log.Logger)
+	_, err = dhcp.NewServer(cfg, sessionManager, radiusReqChan, eapolHandler, log.Logger, metricsRecorder)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error creating DHCP server")
 	}
 
-	httpServer := http.NewServer(cfg, sessionManager, radiusReqChan, disconnectManager, log.Logger)
+	httpServer := http.NewServer(cfg, sessionManager, radiusReqChan, disconnectManager, log.Logger, metricsRecorder)
 	go httpServer.Start()
 
 	ifce, err := tun.New(cfg, log.Logger)

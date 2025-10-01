@@ -10,6 +10,7 @@ import (
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
 	"coovachilli-go/pkg/eapol"
+	"coovachilli-go/pkg/metrics"
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
 	"github.com/gopacket/gopacket/pcap"
@@ -26,6 +27,7 @@ type Server struct {
 	sessionManager *core.SessionManager
 	radiusReqChan  chan<- *core.Session
 	eapolHandler   *eapol.Handler
+	recorder       metrics.Recorder
 	leasesV4       map[string]*Lease
 	poolV4         *Pool
 	leasesV6       map[string]*Lease // Using the same Lease struct for v6 for now
@@ -52,7 +54,7 @@ type Pool struct {
 }
 
 // NewServer creates a new DHCP server and starts listening for packets.
-func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<- *core.Session, eapolHandler *eapol.Handler, logger zerolog.Logger) (*Server, error) {
+func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<- *core.Session, eapolHandler *eapol.Handler, logger zerolog.Logger, recorder metrics.Recorder) (*Server, error) {
 	var poolV4 *Pool
 	var poolV6 *Pool
 	var err error
@@ -101,11 +103,15 @@ func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<-
 		return nil, fmt.Errorf("failed to set BPF filter: %w", err)
 	}
 
+	if recorder == nil {
+		recorder = metrics.NewNoopRecorder()
+	}
 	server := &Server{
 		cfg:            cfg,
 		sessionManager: sm,
 		radiusReqChan:  radiusReqChan,
 		eapolHandler:   eapolHandler,
+		recorder:       recorder,
 		leasesV4:       make(map[string]*Lease),
 		poolV4:         poolV4,
 		leasesV6:       make(map[string]*Lease),
@@ -558,6 +564,9 @@ func (s *Server) HandleDHCPv4(dhcpPayload []byte, packet gopacket.Packet) ([]byt
 	}
 
 	s.logger.Debug().Str("type", req.MessageType().String()).Str("mac", req.ClientHWAddr.String()).Msg("Received DHCPv4 request")
+
+	labels := metrics.Labels{"type": req.MessageType().String()}
+	s.recorder.IncCounter("chilli_dhcp_requests_total", labels)
 
 	var respBytes []byte
 	switch req.MessageType() {

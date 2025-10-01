@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"coovachilli-go/pkg/config"
+	"coovachilli-go/pkg/metrics"
 )
 
 var startTime = time.Now()
@@ -99,15 +100,20 @@ type SessionManager struct {
 	sessionsByIPv6  map[string]*Session
 	sessionsByMAC   map[string]*Session
 	sessionsByToken map[string]*Session
+	recorder        metrics.Recorder
 }
 
 // NewSessionManager creates a new SessionManager.
-func NewSessionManager() *SessionManager {
+func NewSessionManager(recorder metrics.Recorder) *SessionManager {
+	if recorder == nil {
+		recorder = metrics.NewNoopRecorder()
+	}
 	return &SessionManager{
 		sessionsByIPv4:  make(map[string]*Session),
 		sessionsByIPv6:  make(map[string]*Session),
 		sessionsByMAC:   make(map[string]*Session),
 		sessionsByToken: make(map[string]*Session),
+		recorder:        recorder,
 	}
 }
 
@@ -146,6 +152,8 @@ func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID 
 		sm.sessionsByIPv6[ip.String()] = session
 	}
 	sm.sessionsByMAC[mac.String()] = session
+
+	sm.recorder.IncGauge("chilli_sessions_active_total", nil)
 
 	return session
 }
@@ -234,6 +242,7 @@ func (sm *SessionManager) DeleteSession(session *Session) {
 	if session.Token != "" {
 		delete(sm.sessionsByToken, session.Token)
 	}
+	sm.recorder.DecGauge("chilli_sessions_active_total", nil)
 }
 
 // GetAllSessions returns all active sessions.

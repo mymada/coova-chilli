@@ -8,9 +8,11 @@ import (
 	"io/ioutil"
 	"net"
 	"sync"
+	"time"
 
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
+	"coovachilli-go/pkg/metrics"
 	"github.com/rs/zerolog"
 	"layeh.com/radius"
 	"layeh.com/radius/rfc2865"
@@ -36,14 +38,19 @@ type Client struct {
 	radsecConns    map[string]net.Conn
 	radsecMutex    sync.Mutex
 	lastGoodServer int // 0 for server1, 1 for server2
+	recorder       metrics.Recorder
 }
 
 // NewClient creates a new RADIUS client.
-func NewClient(cfg *config.Config, logger zerolog.Logger) *Client {
+func NewClient(cfg *config.Config, logger zerolog.Logger, recorder metrics.Recorder) *Client {
+	if recorder == nil {
+		recorder = metrics.NewNoopRecorder()
+	}
 	return &Client{
 		cfg:         cfg,
 		logger:      logger.With().Str("component", "radius").Logger(),
 		radsecConns: make(map[string]net.Conn),
+		recorder:    recorder,
 	}
 }
 
@@ -135,11 +142,22 @@ func (c *Client) exchangeWithFailover(packet *radius.Packet, auth bool) (*radius
 		serverOrder = []int{0}
 	}
 
+	requestType := "acct"
+	if auth {
+		requestType = "auth"
+	}
+
 	var lastErr error
 	for _, serverIndex := range serverOrder {
 		serverAddr := servers[serverIndex]
 		if serverAddr == "" {
 			continue // Skip if server is not configured
+		}
+
+		now := time.Now()
+		labels := metrics.Labels{
+			"server": serverAddr,
+			"type":   requestType,
 		}
 
 		var response *radius.Packet
@@ -157,13 +175,19 @@ func (c *Client) exchangeWithFailover(packet *radius.Packet, auth bool) (*radius
 			response, err = radius.Exchange(context.Background(), packet, target)
 		}
 
+		c.recorder.ObserveHistogram("chilli_radius_request_duration_seconds", labels, time.Since(now).Seconds())
+
 		if err == nil {
 			c.logger.Info().Str("server", serverAddr).Msg("RADIUS request successful")
 			c.lastGoodServer = serverIndex // Update last good server
+			labels["status"] = "success"
+			c.recorder.IncCounter("chilli_radius_requests_total", labels)
 			return response, nil
 		}
 
 		c.logger.Warn().Err(err).Str("server", serverAddr).Msg("RADIUS request failed")
+		labels["status"] = "failure"
+		c.recorder.IncCounter("chilli_radius_requests_total", labels)
 		lastErr = err
 	}
 

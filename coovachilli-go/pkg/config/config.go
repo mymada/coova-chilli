@@ -112,6 +112,15 @@ type Config struct {
 
 	// Cluster settings
 	Cluster ClusterConfig `yaml:"cluster"`
+	// Metrics settings
+	Metrics MetricsConfig `yaml:"metrics"`
+}
+
+// MetricsConfig holds the configuration for the metrics system.
+type MetricsConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Backend string `yaml:"backend"`
+	Listen  string `yaml:"listen"`
 }
 
 // ClusterConfig holds the cluster-specific settings.

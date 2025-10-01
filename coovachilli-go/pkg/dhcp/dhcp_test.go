@@ -7,6 +7,7 @@ import (
 
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
+	"coovachilli-go/pkg/metrics"
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
 	"github.com/insomniacslk/dhcp/dhcpv4"
@@ -54,7 +55,7 @@ func TestHandleRequest_Renewal_AuthFailure(t *testing.T) {
 	cfg := &config.Config{
 		Lease: 1 * time.Hour,
 	}
-	sm := core.NewSessionManager()
+	sm := core.NewSessionManager(nil)
 	radiusReqChan := make(chan *core.Session, 1)
 	logger := zerolog.Nop() // Disable logging for the test
 
@@ -68,6 +69,7 @@ func TestHandleRequest_Renewal_AuthFailure(t *testing.T) {
 		leasesV4:       make(map[string]*Lease),
 		poolV4:         pool,
 		logger:         logger,
+		recorder:       metrics.NewNoopRecorder(),
 	}
 
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:01")
