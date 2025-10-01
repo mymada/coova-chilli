@@ -245,58 +245,48 @@ func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config
 			ipv4, _ := ipv4Layer.(*layers.IPv4)
 			packetSize := uint64(len(ipv4.Payload))
 
-			// Uplink traffic
-			if session, ok := sessionManager.GetSessionByIP(ipv4.SrcIP); ok {
-				isAuthenticated := session.Authenticated
-				if isAuthenticated {
-					if session.ShouldDropPacket(packetSize, true) {
-						logger.Debug().Str("user", session.Redir.Username).Msg("Dropping upload packet due to bandwidth limit")
-						continue
-					}
-					session.Lock()
-					session.OutputOctets += packetSize
-					session.OutputPackets++
-					session.Unlock()
-				}
-				continue // Packet handled
+			// Determine if the packet is uplink or downlink and find the session
+			session, isUplink := sessionManager.GetSessionByIPs(ipv4.SrcIP, ipv4.DstIP)
+			if session == nil {
+				continue // No session found for either IP, drop packet
 			}
 
-			// Downlink traffic
-			if session, ok := sessionManager.GetSessionByIP(ipv4.DstIP); ok {
-				isAuthenticated := session.Authenticated
-				if isAuthenticated {
-					if session.ShouldDropPacket(packetSize, false) {
-						logger.Debug().Str("user", session.Redir.Username).Msg("Dropping download packet due to bandwidth limit")
-						continue
-					}
-					session.Lock()
-					session.InputOctets += packetSize
-					session.InputPackets++
-					session.Unlock()
-				}
-				continue // Packet handled
-			}
-
-			// Unauthenticated traffic (DNS special handling)
-			session, ok := sessionManager.GetSessionByIP(ipv4.SrcIP)
-			if !ok {
-				continue
-			}
 			session.RLock()
 			isAuthenticated := session.Authenticated
 			session.RUnlock()
-			if !isAuthenticated {
-				if dnsLayer := packet.Layer(layers.LayerTypeDNS); dnsLayer != nil {
-					dnsQuery, _ := dnsLayer.(*layers.DNS)
-					if !dnsQuery.QR {
-						upstreamAddr := fmt.Sprintf("%s:%d", cfg.DNS1.String(), 53)
-						responseBytes, _, err := dnsProxy.HandleQuery(dnsQuery, upstreamAddr)
-						if err == nil && responseBytes != nil {
-							sendDNSResponse(ifce, packet, responseBytes)
+
+			if isAuthenticated {
+				// Apply bandwidth shaping for authenticated users
+				if session.ShouldDropPacket(packetSize, isUplink) {
+					logger.Debug().Str("user", session.Redir.Username).Bool("isUplink", isUplink).Msg("Dropping packet due to bandwidth limit")
+					continue
+				}
+
+				// Update accounting stats
+				session.Lock()
+				if isUplink {
+					session.OutputOctets += packetSize
+					session.OutputPackets++
+				} else {
+					session.InputOctets += packetSize
+					session.InputPackets++
+				}
+				session.Unlock()
+			} else {
+				// Handle unauthenticated traffic (DNS only)
+				if isUplink {
+					if dnsLayer := packet.Layer(layers.LayerTypeDNS); dnsLayer != nil {
+						dnsQuery, _ := dnsLayer.(*layers.DNS)
+						if !dnsQuery.QR {
+							upstreamAddr := fmt.Sprintf("%s:%d", cfg.DNS1.String(), 53)
+							responseBytes, _, err := dnsProxy.HandleQuery(dnsQuery, upstreamAddr)
+							if err == nil && responseBytes != nil {
+								sendDNSResponse(ifce, packet, responseBytes)
+							}
 						}
-						continue
 					}
 				}
+				// Other unauthenticated traffic is dropped implicitly
 			}
 		}
 	}

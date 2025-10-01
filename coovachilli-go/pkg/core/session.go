@@ -150,6 +150,30 @@ func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID 
 	return session
 }
 
+// GetSessionByIPs determines if an IP pair belongs to a session, returning the session and whether it's uplink.
+func (sm *SessionManager) GetSessionByIPs(srcIP, dstIP net.IP) (*Session, bool) {
+	sm.RLock()
+	defer sm.RUnlock()
+
+	if srcIP.To4() != nil {
+		if session, ok := sm.sessionsByIPv4[srcIP.String()]; ok {
+			return session, true // Uplink
+		}
+		if session, ok := sm.sessionsByIPv4[dstIP.String()]; ok {
+			return session, false // Downlink
+		}
+	} else {
+		if session, ok := sm.sessionsByIPv6[srcIP.String()]; ok {
+			return session, true // Uplink
+		}
+		if session, ok := sm.sessionsByIPv6[dstIP.String()]; ok {
+			return session, false // Downlink
+		}
+	}
+
+	return nil, false
+}
+
 // GetSessionByIP returns a session by IP address.
 func (sm *SessionManager) GetSessionByIP(ip net.IP) (*Session, bool) {
 	sm.RLock()

@@ -1,9 +1,11 @@
 package http
 
 import (
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"coovachilli-go/pkg/config"
@@ -31,7 +33,7 @@ func TestHandleStatus(t *testing.T) {
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:02")
-	session := sm.CreateSession(clientIP, clientMAC, &config.Config{})
+	session := sm.CreateSession(clientIP, clientMAC, 0, &config.Config{})
 	session.Authenticated = true
 	session.Redir.Username = "testuser"
 
@@ -57,7 +59,7 @@ func TestHandleLogout(t *testing.T) {
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:02")
-	session := sm.CreateSession(clientIP, clientMAC, &config.Config{})
+	session := sm.CreateSession(clientIP, clientMAC, 0, &config.Config{})
 
 	req := httptest.NewRequest("POST", "/logout", nil)
 	rr := httptest.NewRecorder()
@@ -81,7 +83,7 @@ func TestHandleApiStatus(t *testing.T) {
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:02")
-	session := sm.CreateSession(clientIP, clientMAC, &config.Config{})
+	session := sm.CreateSession(clientIP, clientMAC, 0, &config.Config{})
 	session.Authenticated = true
 	session.Redir.Username = "testuser"
 
@@ -107,7 +109,7 @@ func TestHandleApiLogout(t *testing.T) {
 	// Create a mock session with a token
 	clientIP := net.ParseIP("10.0.0.15")
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:02")
-	session := sm.CreateSession(clientIP, clientMAC, &config.Config{})
+	session := sm.CreateSession(clientIP, clientMAC, 0, &config.Config{})
 	session.Token = "testtoken"
 	sm.AssociateToken(session)
 
@@ -123,4 +125,44 @@ func TestHandleApiLogout(t *testing.T) {
 	// Assert that the disconnector was called
 	require.True(t, mockDc.Called, "Disconnect should have been called")
 	require.Equal(t, session, mockDc.Session, "Disconnect called with wrong session")
+}
+
+func TestHandleJsonpStatus(t *testing.T) {
+	// Setup
+	sm := core.NewSessionManager()
+	server := NewServer(&config.Config{}, sm, nil, nil, zerolog.Nop())
+
+	// Create a mock session
+	clientIP := net.ParseIP("10.0.0.15")
+	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:02")
+	session := sm.CreateSession(clientIP, clientMAC, 0, &config.Config{})
+	session.Authenticated = true
+	session.SessionParams.SessionTimeout = 3600
+	session.InputOctets = 1024
+	session.OutputOctets = 2048
+
+	req := httptest.NewRequest("GET", "/json/status?callback=myCallback", nil)
+	rr := httptest.NewRecorder()
+	req.RemoteAddr = clientIP.String() + ":12345"
+
+	server.handleJsonpStatus(rr, req)
+
+	// Assertions
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Equal(t, "application/javascript", rr.Header().Get("Content-Type"))
+
+	body := rr.Body.String()
+	require.True(t, strings.HasPrefix(body, "myCallback("), "Response should be a JSONP callback")
+	require.True(t, strings.HasSuffix(body, ");"), "Response should end correctly")
+
+	// Verify JSON content
+	jsonStr := body[len("myCallback(") : len(body)-2]
+	var resp jsonpStatusResponse
+	err := json.Unmarshal([]byte(jsonStr), &resp)
+	require.NoError(t, err)
+
+	require.Equal(t, 1, resp.ClientState)
+	require.Equal(t, uint32(3600), resp.SessionTimeout)
+	require.Equal(t, uint64(1024), resp.Accounting.InputOctets)
+	require.Equal(t, uint64(2048), resp.Accounting.OutputOctets)
 }

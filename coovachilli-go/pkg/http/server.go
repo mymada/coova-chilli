@@ -85,6 +85,7 @@ func (s *Server) Start() {
 	http.HandleFunc("/api/v1/status", s.handleApiStatus)
 	http.HandleFunc("/api/v1/login", s.handleApiLogin)
 	http.HandleFunc("/api/v1/logout", s.handleApiLogout)
+	http.HandleFunc("/json/status", s.handleJsonpStatus)
 
 	addr := fmt.Sprintf(":%d", s.cfg.UAMPort)
 
@@ -396,4 +397,65 @@ func (s *Server) handleApiLogout(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, "{\"status\":\"logged_out\"}")
+}
+
+// --- JSONP Handler ---
+
+type jsonpStatusResponse struct {
+	ClientState int    `json:"clientState"`
+	Message     string `json:"message,omitempty"`
+	core.SessionParams
+	Accounting jsonpAccounting `json:"accounting"`
+}
+
+type jsonpAccounting struct {
+	SessionTime  uint32 `json:"sessionTime"`
+	IdleTime     uint32 `json:"idleTime"`
+	InputOctets  uint64 `json:"inputOctets"`
+	OutputOctets uint64 `json:"outputOctets"`
+}
+
+func (s *Server) handleJsonpStatus(w http.ResponseWriter, r *http.Request) {
+	callback := r.URL.Query().Get("callback")
+	if callback == "" {
+		http.Error(w, "Callback function name is required", http.StatusBadRequest)
+		return
+	}
+
+	ipStr, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		ipStr = r.RemoteAddr
+	}
+	ip := net.ParseIP(ipStr)
+
+	session, ok := s.sessionManager.GetSessionByIP(ip)
+
+	var resp jsonpStatusResponse
+	if !ok || !session.Authenticated {
+		resp = jsonpStatusResponse{
+			ClientState: 0, // Not authenticated
+		}
+	} else {
+		session.RLock()
+		resp = jsonpStatusResponse{
+			ClientState:   1, // Authenticated
+			SessionParams: session.SessionParams,
+			Accounting: jsonpAccounting{
+				SessionTime:  uint32(time.Since(session.StartTime).Seconds()),
+				IdleTime:     uint32(time.Since(session.LastSeen).Seconds()),
+				InputOctets:  session.InputOctets,
+				OutputOctets: session.OutputOctets,
+			},
+		}
+		session.RUnlock()
+	}
+
+	jsonBytes, err := json.Marshal(resp)
+	if err != nil {
+		http.Error(w, "Failed to serialize response", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/javascript")
+	fmt.Fprintf(w, "%s(%s);", callback, string(jsonBytes))
 }
