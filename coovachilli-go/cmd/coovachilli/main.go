@@ -42,7 +42,8 @@ import (
 )
 
 var (
-	stop = flag.Bool("stop", false, "send stop signal to the daemon")
+	stop     = flag.Bool("stop", false, "send stop signal to the daemon")
+	reloader *config.Reloader
 )
 
 func main() {
@@ -52,6 +53,7 @@ func main() {
 
 	// The daemon library takes over signal handling, so we need to register our commands.
 	daemon.AddCommand(daemon.BoolFlag(stop), syscall.SIGTERM, termHandler)
+	daemon.AddCommand(daemon.BoolFlag(nil), syscall.SIGHUP, reloadHandler)
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -87,6 +89,9 @@ func main() {
 		zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	}
 
+	// Initialize the reloader
+	reloader = config.NewReloader(*configPath, log.Logger)
+
 	// Daemonize if not in foreground
 	if !cfg.Foreground {
 		cntxt := &daemon.Context{
@@ -116,7 +121,7 @@ func main() {
 	}
 
 	log.Info().Msg("Starting CoovaChilli-Go...")
-	runApp(cfg)
+	runApp(cfg, reloader)
 	log.Info().Msg("CoovaChilli-Go has shut down.")
 }
 
@@ -126,7 +131,18 @@ func termHandler(sig os.Signal) error {
 	return daemon.ErrStop
 }
 
-func runApp(cfg *config.Config) {
+// reloadHandler is the signal handler for SIGHUP.
+func reloadHandler(sig os.Signal) error {
+	log.Info().Msg("SIGHUP signal received. Triggering configuration reload.")
+	if reloader != nil {
+		reloader.PerformReload()
+	} else {
+		log.Error().Msg("Reloader not initialized, cannot reload configuration.")
+	}
+	return nil
+}
+
+func runApp(cfg *config.Config, reloader *config.Reloader) {
 	// Initialize metrics recorder
 	var metricsRecorder metrics.Recorder
 	if cfg.Metrics.Enabled {
@@ -207,9 +223,13 @@ func runApp(cfg *config.Config) {
 	}
 
 	scriptRunner := script.NewRunner(log.Logger, cfg)
-	sessionManager := core.NewSessionManager(metricsRecorder)
+	sessionManager := core.NewSessionManager(cfg, metricsRecorder)
 	dnsProxy := dns.NewProxy(cfg, log.Logger)
 	eapolHandler := eapol.NewHandler(cfg, sessionManager, log.Logger)
+
+	// Register reconfigurable components
+	reloader.Register(fw)
+	reloader.Register(sessionManager)
 
 	if err := sessionManager.LoadSessions(cfg.StateFile); err != nil {
 		log.Error().Err(err).Msg("Failed to load sessions from state file")

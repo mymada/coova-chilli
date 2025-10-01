@@ -101,10 +101,11 @@ type SessionManager struct {
 	sessionsByMAC   map[string]*Session
 	sessionsByToken map[string]*Session
 	recorder        metrics.Recorder
+	cfg             *config.Config
 }
 
 // NewSessionManager creates a new SessionManager.
-func NewSessionManager(recorder metrics.Recorder) *SessionManager {
+func NewSessionManager(cfg *config.Config, recorder metrics.Recorder) *SessionManager {
 	if recorder == nil {
 		recorder = metrics.NewNoopRecorder()
 	}
@@ -114,6 +115,7 @@ func NewSessionManager(recorder metrics.Recorder) *SessionManager {
 		sessionsByMAC:   make(map[string]*Session),
 		sessionsByToken: make(map[string]*Session),
 		recorder:        recorder,
+		cfg:             cfg,
 	}
 }
 
@@ -124,7 +126,7 @@ type StateData struct {
 }
 
 // CreateSession creates a new session for a client.
-func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID uint16, cfg *config.Config) *Session {
+func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID uint16) *Session {
 	sm.Lock()
 	defer sm.Unlock()
 
@@ -139,10 +141,10 @@ func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID 
 		StartTimeSec:        now,
 		LastActivityTimeSec: now,
 		SessionParams: SessionParams{
-			SessionTimeout:   cfg.DefSessionTimeout,
-			IdleTimeout:      cfg.DefIdleTimeout,
-			BandwidthMaxDown: cfg.DefBandwidthMaxDown,
-			BandwidthMaxUp:   cfg.DefBandwidthMaxUp,
+			SessionTimeout:   sm.cfg.DefSessionTimeout,
+			IdleTimeout:      sm.cfg.DefIdleTimeout,
+			BandwidthMaxDown: sm.cfg.DefBandwidthMaxDown,
+			BandwidthMaxUp:   sm.cfg.DefBandwidthMaxUp,
 		},
 	}
 
@@ -243,6 +245,14 @@ func (sm *SessionManager) DeleteSession(session *Session) {
 		delete(sm.sessionsByToken, session.Token)
 	}
 	sm.recorder.DecGauge("chilli_sessions_active_total", nil)
+}
+
+// Reconfigure updates the configuration for the SessionManager.
+func (sm *SessionManager) Reconfigure(newConfig *config.Config) error {
+	sm.Lock()
+	defer sm.Unlock()
+	sm.cfg = newConfig
+	return nil
 }
 
 // GetAllSessions returns all active sessions.

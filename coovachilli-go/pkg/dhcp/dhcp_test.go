@@ -55,7 +55,7 @@ func TestHandleRequest_Renewal_AuthFailure(t *testing.T) {
 	cfg := &config.Config{
 		Lease: 1 * time.Hour,
 	}
-	sm := core.NewSessionManager(nil)
+	sm := core.NewSessionManager(cfg, nil)
 	radiusReqChan := make(chan *core.Session, 1)
 	logger := zerolog.Nop() // Disable logging for the test
 
@@ -81,7 +81,7 @@ func TestHandleRequest_Renewal_AuthFailure(t *testing.T) {
 		MAC:     clientMAC,
 		Expires: time.Now().Add(30 * time.Minute),
 	}
-	session := sm.CreateSession(clientIP, clientMAC, 0, cfg)
+	session := sm.CreateSession(clientIP, clientMAC, 0)
 
 	// 2. Create a DHCPREQUEST packet for renewal
 	reqPacket, err := dhcpv4.New(

@@ -82,7 +82,7 @@ func (s *ProxyServer) handleProxyRequest(pc net.PacketConn, peer net.Addr, reque
 		if ip == nil {
 			ip = net.ParseIP("0.0.0.0")
 		}
-		session = s.sessionManager.CreateSession(ip, mac, 0, s.cfg)
+		session = s.sessionManager.CreateSession(ip, mac, 0)
 		session.Redir.Username = rfc2865.UserName_GetString(request)
 	}
 

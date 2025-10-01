@@ -20,6 +20,7 @@ type FirewallManager interface {
 	Cleanup()
 	AddAuthenticatedUser(ip net.IP) error
 	RemoveAuthenticatedUser(ip net.IP) error
+	Reconfigure(newConfig *config.Config) error
 }
 
 var lookPath = exec.LookPath

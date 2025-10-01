@@ -210,6 +210,42 @@ func (f *IPTablesFirewall) RemoveAuthenticatedUser(ip net.IP) error {
 	return nil
 }
 
+// Reconfigure applies a new configuration to the firewall.
+// It focuses on updating the walled garden rules.
+func (f *IPTablesFirewall) Reconfigure(newConfig *config.Config) error {
+	f.logger.Info().Msg("Reconfiguring firewall walled garden...")
+
+	// Update the internal configuration reference
+	f.cfg = newConfig
+
+	// Re-apply walled garden rules for IPv4
+	if err := f.ipt.ClearChain("nat", chainWalledGarden); err != nil {
+		return fmt.Errorf("failed to clear IPv4 walled garden: %w", err)
+	}
+	for _, domain := range f.cfg.UAMAllowed {
+		if err := f.ipt.Append("nat", chainWalledGarden, "-d", domain, "-j", "RETURN"); err != nil {
+			f.logger.Error().Err(err).Str("domain", domain).Msg("Failed to add IPv4 walled garden rule")
+		}
+	}
+
+	// Re-apply walled garden rules for IPv6
+	if f.ip6t != nil {
+		if err := f.ip6t.ClearChain("nat", chainWalledGarden); err != nil {
+			// Don't return error here, as IPv6 NAT might not be supported on all systems
+			f.logger.Error().Err(err).Msg("Failed to clear IPv6 walled garden")
+		} else {
+			for _, domain := range f.cfg.UAMAllowedV6 {
+				if err := f.ip6t.Append("nat", chainWalledGarden, "-d", domain, "-j", "RETURN"); err != nil {
+					f.logger.Error().Err(err).Str("domain", domain).Msg("Failed to add IPv6 walled garden rule")
+				}
+			}
+		}
+	}
+
+	f.logger.Info().Msg("Firewall reconfigured successfully.")
+	return nil
+}
+
 func (f *IPTablesFirewall) Cleanup() {
 	f.logger.Info().Msg("Cleaning up iptables rules...")
 	f.cleanupHandler(f.ipt, f.cfg.Net.String(), false)

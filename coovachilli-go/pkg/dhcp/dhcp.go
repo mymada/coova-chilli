@@ -652,7 +652,7 @@ func (s *Server) handleRequest(req *dhcpv4.DHCPv4, packet gopacket.Packet) ([]by
 			dot1q, _ := dot1qLayer.(*layers.Dot1Q)
 			vlanID = dot1q.VLANIdentifier
 		}
-		session = s.sessionManager.CreateSession(reqIP, req.ClientHWAddr, vlanID, s.cfg)
+		session = s.sessionManager.CreateSession(reqIP, req.ClientHWAddr, vlanID)
 	}
 
 	s.logger.Debug().Str("mac", req.ClientHWAddr.String()).Msg("Sending session to RADIUS for authorization")
