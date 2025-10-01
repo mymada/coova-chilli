@@ -58,6 +58,10 @@ bwbucketupsize: 0
 bwbucketdnsize: 0
 bwbucketminsize: 0
 
+# Firewall settings
+# Backend can be 'auto', 'iptables', or 'ufw'
+firewallbackend: "auto"
+
 # Management
 cmdsockpath: /var/run/chilli.sock
 statefile: /tmp/chilli.state

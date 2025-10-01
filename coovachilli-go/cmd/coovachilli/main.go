@@ -51,7 +51,7 @@ func main() {
 		log.Fatal().Err(err).Msg("Error loading configuration")
 	}
 
-	fw, err := firewall.NewFirewall(cfg, log.Logger)
+	fw, err := firewall.New(cfg, log.Logger)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error creating firewall manager")
 	}
@@ -230,7 +230,7 @@ func main() {
 	}
 }
 
-func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config.Config, sessionManager *core.SessionManager, dnsProxy *dns.Proxy, fw firewall.UserRuleRemover, logger zerolog.Logger) {
+func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config.Config, sessionManager *core.SessionManager, dnsProxy *dns.Proxy, fw firewall.FirewallManager, logger zerolog.Logger) {
 	for rawPacket := range packetChan {
 		if len(rawPacket) == 0 {
 			continue

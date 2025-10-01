@@ -90,6 +90,7 @@ type Config struct {
 	BwBucketMinSize     uint64   `yaml:"bwbucketminsize"`
 
 	// Firewall settings
+	FirewallBackend   string   `yaml:"firewallbackend"`
 	ExtIf             string   `yaml:"extif"`
 	ClientIsolation   bool     `yaml:"clientisolation"`
 	IPTables          string   `yaml:"iptables"`
@@ -138,6 +139,10 @@ func Load(path string) (*Config, error) {
 	// Default RadSec port if not provided
 	if cfg.RadSecEnable && cfg.RadSecPort == 0 {
 		cfg.RadSecPort = 2083
+	}
+
+	if cfg.FirewallBackend == "" {
+		cfg.FirewallBackend = "auto"
 	}
 
 	return &cfg, nil

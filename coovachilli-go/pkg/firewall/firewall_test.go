@@ -1,8 +1,9 @@
 package firewall
 
 import (
-	"fmt"
+	"errors"
 	"net"
+	"os/exec"
 	"testing"
 
 	"coovachilli-go/pkg/config"
@@ -10,111 +11,96 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// mockIPTables is a mock implementation of the iptables.IPTables interface.
-type mockIPTables struct {
-	commands [][]string
+// mockIPTablesFirewall is a dummy implementation for testing the factory.
+type mockIPTablesFirewall struct{}
+
+func (m *mockIPTablesFirewall) Initialize() error                      { return nil }
+func (m *mockIPTablesFirewall) Cleanup()                               {}
+func (m *mockIPTablesFirewall) AddAuthenticatedUser(ip net.IP) error   { return nil }
+func (m *mockIPTablesFirewall) RemoveAuthenticatedUser(ip net.IP) error { return nil }
+
+func TestNewFirewall(t *testing.T) {
+	logger := zerolog.Nop()
+	cfg := &config.Config{}
+
+	// Mock the iptables constructor to avoid system calls
+	originalNewIPTablesFirewall := newIPTablesFirewall
+	newIPTablesFirewall = func(cfg *config.Config, logger zerolog.Logger) (*IPTablesFirewall, error) {
+		return &IPTablesFirewall{}, nil
+	}
+	defer func() { newIPTablesFirewall = originalNewIPTablesFirewall }()
+
+	// --- Test case 1: Auto-detect UFW ---
+	cfg.FirewallBackend = "auto"
+	originalLookPath := lookPath
+	lookPath = func(file string) (string, error) {
+		if file == "ufw" {
+			return "/usr/sbin/ufw", nil
+		}
+		return "", errors.New("not found")
+	}
+
+	fw, err := New(cfg, logger)
+	require.NoError(t, err)
+	_, isUfw := fw.(*UfwFirewall)
+	require.True(t, isUfw, "Expected UFW firewall backend")
+
+	// --- Test case 2: Auto-detect fallback to iptables ---
+	lookPath = func(file string) (string, error) {
+		return "", errors.New("not found")
+	}
+	fw, err = New(cfg, logger)
+	require.NoError(t, err)
+	_, isIptables := fw.(*IPTablesFirewall)
+	require.True(t, isIptables, "Expected iptables firewall backend")
+
+	// --- Test case 3: Explicitly select ufw ---
+	cfg.FirewallBackend = "ufw"
+	fw, err = New(cfg, logger)
+	require.NoError(t, err)
+	_, isUfw = fw.(*UfwFirewall)
+	require.True(t, isUfw, "Expected UFW firewall backend when explicitly selected")
+
+	// --- Test case 4: Explicitly select iptables ---
+	cfg.FirewallBackend = "iptables"
+	fw, err = New(cfg, logger)
+	require.NoError(t, err)
+	_, isIptables = fw.(*IPTablesFirewall)
+	require.True(t, isIptables, "Expected iptables firewall backend when explicitly selected")
+
+	// Restore original functions
+	lookPath = originalLookPath
 }
 
-func (m *mockIPTables) Append(table, chain string, rulespec ...string) error {
-	cmd := append([]string{"-A", table, chain}, rulespec...)
-	m.commands = append(m.commands, cmd)
-	return nil
-}
-
-func (m *mockIPTables) Insert(table, chain string, pos int, rulespec ...string) error {
-	cmd := append([]string{"-I", table, chain, fmt.Sprintf("%d", pos)}, rulespec...)
-	m.commands = append(m.commands, cmd)
-	return nil
-}
-
-func (m *mockIPTables) Delete(table, chain string, rulespec ...string) error {
-	cmd := append([]string{"-D", table, chain}, rulespec...)
-	m.commands = append(m.commands, cmd)
-	return nil
-}
-
-func (m *mockIPTables) NewChain(table, chain string) error {
-	cmd := append([]string{"-N", table, chain})
-	m.commands = append(m.commands, cmd)
-	return nil
-}
-
-func (m *mockIPTables) ClearChain(table, chain string) error {
-	cmd := append([]string{"-X", table, chain})
-	m.commands = append(m.commands, cmd)
-	return nil
-}
-
-func (m *mockIPTables) DeleteChain(table, chain string) error {
-	cmd := append([]string{"-X", table, chain})
-	m.commands = append(m.commands, cmd)
-	return nil
-}
-
-func (m *mockIPTables) Exists(table, chain string, rulespec ...string) (bool, error) {
-	// For the mock, assume chains don't exist initially so they are always created.
-	return false, nil
-}
-
-func (m *mockIPTables) ListChains(table string) ([]string, error) {
-	// Return an empty list, can be expanded if needed for more complex tests.
-	return []string{}, nil
-}
-
-// Ensure mockIPTables satisfies the IPTables interface
-var _ IPTables = &mockIPTables{}
-
-func TestFirewall_Initialize_OpenPorts(t *testing.T) {
+func TestUfwFirewallCommands(t *testing.T) {
 	cfg := &config.Config{
 		TUNDev: "tun0",
-		Net: net.IPNet{
-			IP:   net.ParseIP("10.0.0.0"),
-			Mask: net.CIDRMask(24, 32),
-		},
-		TCPPorts: []int{8080, 8443},
-		UDPPorts: []int{53, 123},
 	}
 	logger := zerolog.Nop()
-	mockIPT := &mockIPTables{}
 
-	fw := &Firewall{
-		cfg:    cfg,
-		ipt:    mockIPT,
-		logger: logger,
+	var executedCmds [][]string
+
+	// Mock the ufw command execution
+	originalUfwCommand := ufwCommand
+	ufwCommand = func(name string, arg ...string) *exec.Cmd {
+		require.Equal(t, "ufw", name)
+		executedCmds = append(executedCmds, arg)
+		// Return a dummy command that will succeed
+		return exec.Command("true")
 	}
+	defer func() { ufwCommand = originalUfwCommand }()
 
-	err := fw.Initialize()
+	fw, err := newUfwFirewall(cfg, logger)
 	require.NoError(t, err)
 
-	expectedCommands := [][]string{
-		{"-A", "filter", "chilli", "-p", "tcp", "--dport", "8080", "-j", "ACCEPT"},
-		{"-A", "filter", "chilli", "-p", "tcp", "--dport", "8443", "-j", "ACCEPT"},
-		{"-A", "filter", "chilli", "-p", "udp", "--dport", "53", "-j", "ACCEPT"},
-		{"-A", "filter", "chilli", "-p", "udp", "--dport", "123", "-j", "ACCEPT"},
-	}
+	// Test AddAuthenticatedUser
+	ip := net.ParseIP("10.1.0.123")
+	err = fw.AddAuthenticatedUser(ip)
+	require.NoError(t, err)
+	require.Contains(t, executedCmds, []string{"insert", "1", "route", "allow", "in", "on", "tun0", "from", "10.1.0.123"})
 
-	// Check that the expected commands were called
-	for _, expected := range expectedCommands {
-		found := false
-		for _, actual := range mockIPT.commands {
-			if equal(expected, actual) {
-				found = true
-				break
-			}
-		}
-		require.True(t, found, "Expected command not found: %v", expected)
-	}
-}
-
-// equal checks if two string slices are equal.
-func equal(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i, v := range a {
-		if v != b[i] {
-			return false
-		}
-	}
-	return true
+	// Test RemoveAuthenticatedUser
+	err = fw.RemoveAuthenticatedUser(ip)
+	require.NoError(t, err)
+	require.Contains(t, executedCmds, []string{"delete", "route", "allow", "in", "on", "tun0", "from", "10.1.0.123"})
 }
