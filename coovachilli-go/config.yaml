@@ -54,6 +54,9 @@ defsessiontimeout: 86400 # 24 hours
 defidletimeout: 600     # 10 minutes
 defbandwidthmaxdown: 1000000 # 1 Mbps
 defbandwidthmaxup: 256000    # 256 Kbps
+bwbucketupsize: 0
+bwbucketdnsize: 0
+bwbucketminsize: 0
 
 # Management
 cmdsockpath: /var/run/chilli.sock

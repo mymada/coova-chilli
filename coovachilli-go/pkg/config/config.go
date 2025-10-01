@@ -85,6 +85,9 @@ type Config struct {
 	DefIdleTimeout      uint32   `yaml:"defidletimeout"`
 	DefBandwidthMaxDown uint64   `yaml:"defbandwidthmaxdown"`
 	DefBandwidthMaxUp   uint64   `yaml:"defbandwidthmaxup"`
+	BwBucketUpSize      uint64   `yaml:"bwbucketupsize"`
+	BwBucketDnSize      uint64   `yaml:"bwbucketdnsize"`
+	BwBucketMinSize     uint64   `yaml:"bwbucketminsize"`
 
 	// Firewall settings
 	ExtIf             string   `yaml:"extif"`

@@ -180,6 +180,7 @@ func main() {
 						s.Authenticated = true
 						s.SessionParams.SessionTimeout = cfg.DefSessionTimeout
 						s.SessionParams.IdleTimeout = cfg.DefIdleTimeout
+						s.InitializeShaper(cfg)
 						if err := fw.AddAuthenticatedUser(s.HisIP); err != nil {
 							log.Error().Err(err).Str("user", s.Redir.Username).Msg("Error adding firewall/TC rules for local user")
 						}
@@ -198,6 +199,7 @@ func main() {
 				defer s.Unlock()
 				if resp.Code == layehradius.CodeAccessAccept {
 					s.Authenticated = true
+					s.InitializeShaper(cfg)
 					if err := fw.AddAuthenticatedUser(s.HisIP); err != nil {
 						log.Error().Err(err).Str("user", s.Redir.Username).Msg("Error adding firewall/TC rules")
 						s.AuthResult <- false
@@ -236,6 +238,41 @@ func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config
 		packet := gopacket.NewPacket(rawPacket, layers.LayerTypeEthernet, gopacket.Default)
 		if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
 			ipv4, _ := ipv4Layer.(*layers.IPv4)
+			packetSize := uint64(len(ipv4.Payload))
+
+			// Uplink traffic
+			if session, ok := sessionManager.GetSessionByIP(ipv4.SrcIP); ok {
+				isAuthenticated := session.Authenticated
+				if isAuthenticated {
+					if session.ShouldDropPacket(packetSize, true) {
+						logger.Debug().Str("user", session.Redir.Username).Msg("Dropping upload packet due to bandwidth limit")
+						continue
+					}
+					session.Lock()
+					session.OutputOctets += packetSize
+					session.OutputPackets++
+					session.Unlock()
+				}
+				continue // Packet handled
+			}
+
+			// Downlink traffic
+			if session, ok := sessionManager.GetSessionByIP(ipv4.DstIP); ok {
+				isAuthenticated := session.Authenticated
+				if isAuthenticated {
+					if session.ShouldDropPacket(packetSize, false) {
+						logger.Debug().Str("user", session.Redir.Username).Msg("Dropping download packet due to bandwidth limit")
+						continue
+					}
+					session.Lock()
+					session.InputOctets += packetSize
+					session.InputPackets++
+					session.Unlock()
+				}
+				continue // Packet handled
+			}
+
+			// Unauthenticated traffic (DNS special handling)
 			session, ok := sessionManager.GetSessionByIP(ipv4.SrcIP)
 			if !ok {
 				continue
@@ -256,10 +293,6 @@ func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config
 					}
 				}
 			}
-			session.Lock()
-			session.OutputOctets += uint64(len(ipv4.Payload))
-			session.OutputPackets++
-			session.Unlock()
 		}
 	}
 }

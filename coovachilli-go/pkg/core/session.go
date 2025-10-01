@@ -47,6 +47,13 @@ type Session struct {
 	InputPackets  uint64
 	OutputPackets uint64
 
+	// Leaky Bucket for Bandwidth Shaping
+	BucketUp       uint64
+	BucketDown     uint64
+	BucketUpSize   uint64
+	BucketDownSize uint64
+	LastBWTime     time.Time
+
 	// UAM/Redir state
 	Redir RedirState
 
