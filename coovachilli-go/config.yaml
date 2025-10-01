@@ -73,3 +73,10 @@ statefile: /tmp/chilli.state
 # Scripts
 conup: "coovachilli-go/conup.sh"
 condown: "coovachilli-go/condown.sh"
+
+# Cluster settings
+cluster:
+  enabled: false
+  peerid: 0
+  peerkey: "your-secret-key"
+  interface: "eth1"

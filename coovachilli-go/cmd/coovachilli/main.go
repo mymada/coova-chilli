@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"coovachilli-go/pkg/auth"
+	"coovachilli-go/pkg/cluster"
 	"coovachilli-go/pkg/cmdsock"
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
@@ -50,6 +51,16 @@ func main() {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error loading configuration")
+	}
+
+	var peerManager *cluster.PeerManager
+	if cfg.Cluster.Enabled {
+		log.Info().Msg("Cluster mode enabled.")
+		peerManager, err = cluster.NewManager(cfg.Cluster, cfg.DHCPIf, cfg.UAMListen)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Error creating cluster manager")
+		}
+		go peerManager.Start()
 	}
 
 	fw, err := firewall.New(cfg, log.Logger)
@@ -102,7 +113,7 @@ func main() {
 
 	packetChan := make(chan []byte)
 	go tun.ReadPackets(ifce, packetChan, log.Logger)
-	go processPackets(ifce, packetChan, cfg, sessionManager, dnsProxy, fw, log.Logger)
+	go processPackets(ifce, packetChan, cfg, sessionManager, dnsProxy, fw, peerManager, log.Logger)
 
 	cmdChan := make(chan string)
 	cmdSockListener := cmdsock.NewListener(cfg.CmdSockPath, cmdChan, log.Logger)
@@ -236,8 +247,13 @@ func main() {
 	}
 }
 
-func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config.Config, sessionManager *core.SessionManager, dnsProxy *dns.Proxy, fw firewall.FirewallManager, logger zerolog.Logger) {
+func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config.Config, sessionManager *core.SessionManager, dnsProxy *dns.Proxy, fw firewall.FirewallManager, peerManager *cluster.PeerManager, logger zerolog.Logger) {
 	for rawPacket := range packetChan {
+		if peerManager != nil && peerManager.GetCurrentState() == cluster.PeerStateStandby {
+			logger.Debug().Msg("Node is in standby, dropping packet.")
+			continue
+		}
+
 		if len(rawPacket) == 0 {
 			continue
 		}

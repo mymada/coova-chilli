@@ -109,6 +109,17 @@ type Config struct {
 	// Management
 	CmdSockPath string `yaml:"cmdsockpath"`
 	StateFile   string `yaml:"statefile"`
+
+	// Cluster settings
+	Cluster ClusterConfig `yaml:"cluster"`
+}
+
+// ClusterConfig holds the cluster-specific settings.
+type ClusterConfig struct {
+	Enabled   bool   `yaml:"enabled"`
+	PeerID    int    `yaml:"peerid"`
+	PeerKey   string `yaml:"peerkey"`
+	Interface string `yaml:"interface"`
 }
 
 // Load loads the configuration from a YAML file.
