@@ -3,7 +3,15 @@
 # General settings
 foreground: true
 pidfile: /var/run/chilli.pid
+user: ""  # e.g., "chilli"
+group: "" # e.g., "chilli"
 interval: 3600s
+
+# Logging settings
+logging:
+  dest: "stdout" # Can be "stdout", "syslog", or a file path
+  level: "info"
+  syslog_tag: "coovachilli-go"
 
 # TUN/TAP settings
 tundev: tun0
@@ -14,7 +22,7 @@ uamlisten: 10.1.0.1
 dhcplisten: 10.1.0.1
 
 # DHCP settings
-dhcpif: chilli_lan
+dhcpif: eth0
 extif: eth0
 clientisolation: true
 dhcprelay: false

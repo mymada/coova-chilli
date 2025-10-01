@@ -24,37 +24,109 @@ import (
 	"coovachilli-go/pkg/radius"
 	"coovachilli-go/pkg/script"
 	"coovachilli-go/pkg/tun"
+	"io"
 	stdhttp "net/http"
+	"log/syslog"
+	"os/user"
+	"strconv"
 
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"github.com/sevlyar/go-daemon"
 	"github.com/songgao/water"
 	layehradius "layeh.com/radius"
 	"layeh.com/radius/rfc2865"
 	"layeh.com/radius/rfc2866"
 )
 
-func main() {
-	zerolog.SetGlobalLevel(zerolog.InfoLevel)
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+var (
+	stop = flag.Bool("stop", false, "send stop signal to the daemon")
+)
 
+func main() {
 	configPath := flag.String("config", "config.yaml", "Path to the configuration file")
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	flag.Parse()
 
-	if *debug {
-		zerolog.SetGlobalLevel(zerolog.DebugLevel)
-	}
-
-	log.Info().Msg("Starting CoovaChilli-Go...")
+	// The daemon library takes over signal handling, so we need to register our commands.
+	daemon.AddCommand(daemon.BoolFlag(stop), syscall.SIGTERM, termHandler)
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error loading configuration")
 	}
 
+	// Setup logger
+	var logWriter io.Writer = os.Stderr
+	if !cfg.Foreground {
+		switch cfg.Logging.Destination {
+		case "syslog":
+			writer, err := syslog.New(syslog.LOG_NOTICE, cfg.Logging.SyslogTag)
+			if err != nil {
+				log.Fatal().Err(err).Msg("Unable to set up syslog")
+			}
+			logWriter = writer
+		case "stdout":
+			logWriter = os.Stdout
+		default: // File
+			logWriter, err = os.OpenFile(cfg.Logging.Destination, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				log.Fatal().Err(err).Msg("Failed to open log file")
+			}
+		}
+		log.Logger = log.Output(logWriter)
+	} else {
+		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	}
+
+	if *debug || cfg.Logging.Level == "debug" {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	} else {
+		zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	}
+
+	// Daemonize if not in foreground
+	if !cfg.Foreground {
+		cntxt := &daemon.Context{
+			PidFileName: cfg.PIDFile,
+			PidFilePerm: 0644,
+		}
+
+		if len(daemon.ActiveFlags()) > 0 {
+			d, err := cntxt.Search()
+			if err != nil {
+				log.Fatal().Err(err).Msg("Unable to find daemon process")
+			}
+			if err := daemon.SendCommands(d); err != nil {
+				log.Error().Err(err).Msg("Failed to send command to daemon")
+			}
+			return
+		}
+
+		d, err := cntxt.Reborn()
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to daemonize")
+		}
+		if d != nil { // This is the parent process, exit
+			return
+		}
+		defer cntxt.Release() // This is the daemon process
+	}
+
+	log.Info().Msg("Starting CoovaChilli-Go...")
+	runApp(cfg)
+	log.Info().Msg("CoovaChilli-Go has shut down.")
+}
+
+// termHandler is the signal handler for the daemon.
+func termHandler(sig os.Signal) error {
+	log.Info().Msg("Termination signal received. Shutting down.")
+	return daemon.ErrStop
+}
+
+func runApp(cfg *config.Config) {
 	// Initialize metrics recorder
 	var metricsRecorder metrics.Recorder
 	if cfg.Metrics.Enabled {
@@ -84,6 +156,7 @@ func main() {
 	}
 
 	var peerManager *cluster.PeerManager
+	var err error
 	if cfg.Cluster.Enabled {
 		log.Info().Msg("Cluster mode enabled.")
 		peerManager, err = cluster.NewManager(cfg.Cluster, cfg.DHCPIf, cfg.UAMListen)
@@ -101,6 +174,37 @@ func main() {
 		log.Fatal().Err(err).Msg("Error initializing firewall")
 	}
 	defer fw.Cleanup()
+
+	ifce, err := tun.New(cfg, log.Logger)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Error creating TUN interface")
+	}
+
+	// Drop privileges if configured
+	if cfg.User != "" {
+		u, err := user.Lookup(cfg.User)
+		if err != nil {
+			log.Fatal().Err(err).Str("user", cfg.User).Msg("Failed to look up user")
+		}
+		uid, _ := strconv.Atoi(u.Uid)
+		gid, _ := strconv.Atoi(u.Gid)
+
+		if cfg.Group != "" {
+			g, err := user.LookupGroup(cfg.Group)
+			if err != nil {
+				log.Fatal().Err(err).Str("group", cfg.Group).Msg("Failed to look up group")
+			}
+			gid, _ = strconv.Atoi(g.Gid)
+		}
+
+		log.Info().Int("uid", uid).Int("gid", gid).Msg("Dropping privileges")
+		if err := syscall.Setgid(gid); err != nil {
+			log.Fatal().Err(err).Msg("Failed to set GID")
+		}
+		if err := syscall.Setuid(uid); err != nil {
+			log.Fatal().Err(err).Msg("Failed to set UID")
+		}
+	}
 
 	scriptRunner := script.NewRunner(log.Logger, cfg)
 	sessionManager := core.NewSessionManager(metricsRecorder)
@@ -135,11 +239,6 @@ func main() {
 
 	httpServer := http.NewServer(cfg, sessionManager, radiusReqChan, disconnectManager, log.Logger, metricsRecorder)
 	go httpServer.Start()
-
-	ifce, err := tun.New(cfg, log.Logger)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Error creating TUN interface")
-	}
 
 	packetChan := make(chan []byte)
 	go tun.ReadPackets(ifce, packetChan, log.Logger)

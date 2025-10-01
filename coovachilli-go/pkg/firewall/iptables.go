@@ -60,27 +60,39 @@ var newIPTablesFirewall = func(cfg *config.Config, logger zerolog.Logger) (*IPTa
 }
 
 func (f *IPTablesFirewall) setupChains(handler IPTables, protocol string) error {
-	for _, chain := range []string{chainChilli, chainWalledGarden} {
-		for _, table := range []string{"nat", "filter"} {
-			if protocol == "IPv6" && table == "nat" {
-				if _, err := handler.ListChains(table); err != nil {
-					if strings.Contains(err.Error(), "No such file or directory") || strings.Contains(err.Error(), "table nat does not exist") {
-						f.logger.Warn().Err(err).Msg("IPv6 NAT table not supported, disabling IPv6 firewall.")
-						f.ip6t = nil
-						return nil
-					}
+	for _, table := range []string{"nat", "filter"} {
+		// Special handling for IPv6 NAT which may not be supported
+		if protocol == "IPv6" && table == "nat" {
+			if _, err := handler.ListChains(table); err != nil {
+				if strings.Contains(err.Error(), "No such file or directory") || strings.Contains(err.Error(), "table nat does not exist") {
+					f.logger.Warn().Err(err).Msg("IPv6 NAT table not supported, skipping NAT rules for IPv6.")
+					continue // Skip to the next table
 				}
 			}
+		}
 
-			exists, _ := handler.Exists(table, chain)
-			if exists {
-				if err := handler.ClearChain(table, chain); err != nil {
-					return fmt.Errorf("failed to clear %s chain %s in %s table: %w", protocol, chain, table, err)
+		// Get all existing chains for the current table
+		existingChains, err := handler.ListChains(table)
+		if err != nil {
+			return fmt.Errorf("failed to list chains in %s table for %s: %w", table, protocol, err)
+		}
+		chainMap := make(map[string]bool)
+		for _, ch := range existingChains {
+			chainMap[ch] = true
+		}
+
+		// For each of our custom chains, create if not exists, or clear if it does
+		for _, chainToSetup := range []string{chainChilli, chainWalledGarden} {
+			if chainMap[chainToSetup] {
+				if err := handler.ClearChain(table, chainToSetup); err != nil {
+					return fmt.Errorf("failed to clear %s chain %s in %s table: %w", protocol, chainToSetup, table, err)
 				}
+				f.logger.Debug().Str("table", table).Str("chain", chainToSetup).Msg("Cleared existing chain")
 			} else {
-				if err := handler.NewChain(table, chain); err != nil {
-					return fmt.Errorf("failed to create %s chain %s in %s table: %w", protocol, chain, table, err)
+				if err := handler.NewChain(table, chainToSetup); err != nil {
+					return fmt.Errorf("failed to create %s chain %s in %s table: %w", protocol, chainToSetup, table, err)
 				}
+				f.logger.Debug().Str("table", table).Str("chain", chainToSetup).Msg("Created new chain")
 			}
 		}
 	}

@@ -9,12 +9,22 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+// LoggingConfig holds the configuration for the logging system.
+type LoggingConfig struct {
+	Destination string `yaml:"dest"`      // "stdout", "syslog", or a file path
+	Level       string `yaml:"level"`       // "debug", "info", "warn", "error"
+	SyslogTag   string `yaml:"syslog_tag"`  // Tag for syslog messages
+}
+
 // Config holds the application configuration.
 type Config struct {
 	// General settings
 	Foreground bool   `yaml:"foreground"`
 	PIDFile    string `yaml:"pidfile"`
+	User       string `yaml:"user"`
+	Group      string `yaml:"group"`
 	Interval   time.Duration `yaml:"interval"`
+	Logging    LoggingConfig `yaml:"logging"`
 
 	// TUN/TAP settings
 	TUNDev  string `yaml:"tundev"`
