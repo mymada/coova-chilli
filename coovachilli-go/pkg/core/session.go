@@ -47,6 +47,13 @@ type Session struct {
 	InputPackets  uint64
 	OutputPackets uint64
 
+	// Leaky Bucket for Bandwidth Shaping
+	BucketUp       uint64
+	BucketDown     uint64
+	BucketUpSize   uint64
+	BucketDownSize uint64
+	LastBWTime     time.Time
+
 	// UAM/Redir state
 	Redir RedirState
 
@@ -141,6 +148,30 @@ func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID 
 	sm.sessionsByMAC[mac.String()] = session
 
 	return session
+}
+
+// GetSessionByIPs determines if an IP pair belongs to a session, returning the session and whether it's uplink.
+func (sm *SessionManager) GetSessionByIPs(srcIP, dstIP net.IP) (*Session, bool) {
+	sm.RLock()
+	defer sm.RUnlock()
+
+	if srcIP.To4() != nil {
+		if session, ok := sm.sessionsByIPv4[srcIP.String()]; ok {
+			return session, true // Uplink
+		}
+		if session, ok := sm.sessionsByIPv4[dstIP.String()]; ok {
+			return session, false // Downlink
+		}
+	} else {
+		if session, ok := sm.sessionsByIPv6[srcIP.String()]; ok {
+			return session, true // Uplink
+		}
+		if session, ok := sm.sessionsByIPv6[dstIP.String()]; ok {
+			return session, false // Downlink
+		}
+	}
+
+	return nil, false
 }
 
 // GetSessionByIP returns a session by IP address.

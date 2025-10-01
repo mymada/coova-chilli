@@ -3,12 +3,14 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 
 	"coovachilli-go/pkg/auth"
+	"coovachilli-go/pkg/cluster"
 	"coovachilli-go/pkg/cmdsock"
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
@@ -51,7 +53,17 @@ func main() {
 		log.Fatal().Err(err).Msg("Error loading configuration")
 	}
 
-	fw, err := firewall.NewFirewall(cfg, log.Logger)
+	var peerManager *cluster.PeerManager
+	if cfg.Cluster.Enabled {
+		log.Info().Msg("Cluster mode enabled.")
+		peerManager, err = cluster.NewManager(cfg.Cluster, cfg.DHCPIf, cfg.UAMListen)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Error creating cluster manager")
+		}
+		go peerManager.Start()
+	}
+
+	fw, err := firewall.New(cfg, log.Logger)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error creating firewall manager")
 	}
@@ -101,7 +113,7 @@ func main() {
 
 	packetChan := make(chan []byte)
 	go tun.ReadPackets(ifce, packetChan, log.Logger)
-	go processPackets(ifce, packetChan, cfg, sessionManager, dnsProxy, fw, log.Logger)
+	go processPackets(ifce, packetChan, cfg, sessionManager, dnsProxy, fw, peerManager, log.Logger)
 
 	cmdChan := make(chan string)
 	cmdSockListener := cmdsock.NewListener(cfg.CmdSockPath, cmdChan, log.Logger)
@@ -116,6 +128,11 @@ func main() {
 
 	coaReqChan := make(chan radius.CoAIncomingRequest)
 	go radiusClient.StartCoAListener(coaReqChan)
+
+	if cfg.ProxyEnable {
+		proxyServer := radius.NewProxyServer(cfg, sessionManager, radiusClient, log.Logger)
+		go proxyServer.Start()
+	}
 
 	go func() {
 		for req := range coaReqChan {
@@ -180,6 +197,7 @@ func main() {
 						s.Authenticated = true
 						s.SessionParams.SessionTimeout = cfg.DefSessionTimeout
 						s.SessionParams.IdleTimeout = cfg.DefIdleTimeout
+						s.InitializeShaper(cfg)
 						if err := fw.AddAuthenticatedUser(s.HisIP); err != nil {
 							log.Error().Err(err).Str("user", s.Redir.Username).Msg("Error adding firewall/TC rules for local user")
 						}
@@ -198,6 +216,7 @@ func main() {
 				defer s.Unlock()
 				if resp.Code == layehradius.CodeAccessAccept {
 					s.Authenticated = true
+					s.InitializeShaper(cfg)
 					if err := fw.AddAuthenticatedUser(s.HisIP); err != nil {
 						log.Error().Err(err).Str("user", s.Redir.Username).Msg("Error adding firewall/TC rules")
 						s.AuthResult <- false
@@ -228,38 +247,64 @@ func main() {
 	}
 }
 
-func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config.Config, sessionManager *core.SessionManager, dnsProxy *dns.Proxy, fw firewall.UserRuleRemover, logger zerolog.Logger) {
+func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config.Config, sessionManager *core.SessionManager, dnsProxy *dns.Proxy, fw firewall.FirewallManager, peerManager *cluster.PeerManager, logger zerolog.Logger) {
 	for rawPacket := range packetChan {
+		if peerManager != nil && peerManager.GetCurrentState() == cluster.PeerStateStandby {
+			logger.Debug().Msg("Node is in standby, dropping packet.")
+			continue
+		}
+
 		if len(rawPacket) == 0 {
 			continue
 		}
 		packet := gopacket.NewPacket(rawPacket, layers.LayerTypeEthernet, gopacket.Default)
 		if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
 			ipv4, _ := ipv4Layer.(*layers.IPv4)
-			session, ok := sessionManager.GetSessionByIP(ipv4.SrcIP)
-			if !ok {
-				continue
+			packetSize := uint64(len(ipv4.Payload))
+
+			// Determine if the packet is uplink or downlink and find the session
+			session, isUplink := sessionManager.GetSessionByIPs(ipv4.SrcIP, ipv4.DstIP)
+			if session == nil {
+				continue // No session found for either IP, drop packet
 			}
+
 			session.RLock()
 			isAuthenticated := session.Authenticated
 			session.RUnlock()
-			if !isAuthenticated {
-				if dnsLayer := packet.Layer(layers.LayerTypeDNS); dnsLayer != nil {
-					dnsQuery, _ := dnsLayer.(*layers.DNS)
-					if !dnsQuery.QR {
-						upstreamAddr := fmt.Sprintf("%s:%d", cfg.DNS1.String(), 53)
-						responseBytes, _, err := dnsProxy.HandleQuery(dnsQuery, upstreamAddr)
-						if err == nil && responseBytes != nil {
-							sendDNSResponse(ifce, packet, responseBytes)
+
+			if isAuthenticated {
+				// Apply bandwidth shaping for authenticated users
+				if session.ShouldDropPacket(packetSize, isUplink) {
+					logger.Debug().Str("user", session.Redir.Username).Bool("isUplink", isUplink).Msg("Dropping packet due to bandwidth limit")
+					continue
+				}
+
+				// Update accounting stats
+				session.Lock()
+				if isUplink {
+					session.OutputOctets += packetSize
+					session.OutputPackets++
+				} else {
+					session.InputOctets += packetSize
+					session.InputPackets++
+				}
+				session.Unlock()
+			} else {
+				// Handle unauthenticated traffic (DNS only)
+				if isUplink {
+					if dnsLayer := packet.Layer(layers.LayerTypeDNS); dnsLayer != nil {
+						dnsQuery, _ := dnsLayer.(*layers.DNS)
+						if !dnsQuery.QR {
+							upstreamAddr := fmt.Sprintf("%s:%d", cfg.DNS1.String(), 53)
+							responseBytes, _, err := dnsProxy.HandleQuery(dnsQuery, upstreamAddr)
+							if err == nil && responseBytes != nil {
+								sendDNSResponse(ifce, packet, responseBytes)
+							}
 						}
-						continue
 					}
 				}
+				// Other unauthenticated traffic is dropped implicitly
 			}
-			session.Lock()
-			session.OutputOctets += uint64(len(ipv4.Payload))
-			session.OutputPackets++
-			session.Unlock()
 		}
 	}
 }
@@ -289,6 +334,32 @@ func processCommand(command string, logger zerolog.Logger, sm *core.SessionManag
 			b.WriteString(fmt.Sprintf("ip=%s mac=%s user=%s\n", s.HisIP, s.HisMAC, s.Redir.Username))
 		}
 		return b.String()
+	case "logout":
+		if len(parts) < 2 {
+			return "ERROR: Missing IP or MAC address for logout command"
+		}
+		identifier := parts[1]
+		var session *core.Session
+
+		ip := net.ParseIP(identifier)
+		if ip != nil {
+			if s, ok := sm.GetSessionByIP(ip); ok {
+				session = s
+			}
+		} else {
+			if mac, err := net.ParseMAC(identifier); err == nil {
+				if s, ok := sm.GetSessionByMAC(mac); ok {
+					session = s
+				}
+			}
+		}
+
+		if session == nil {
+			return fmt.Sprintf("ERROR: Session not found for identifier %s", identifier)
+		}
+
+		dm.Disconnect(session, "Admin-Reset")
+		return fmt.Sprintf("OK: Disconnected session for %s", identifier)
 	}
 	return "ERROR: Unknown command"
 }

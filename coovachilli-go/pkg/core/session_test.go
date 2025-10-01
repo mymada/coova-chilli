@@ -14,7 +14,7 @@ func TestSessionManager(t *testing.T) {
 	ip := net.ParseIP("10.1.0.100")
 
 	// Test CreateSession
-	session := sm.CreateSession(ip, mac, &config.Config{})
+	session := sm.CreateSession(ip, mac, 0, &config.Config{})
 	if session == nil {
 		t.Fatal("CreateSession should not return nil")
 	}
@@ -61,7 +61,7 @@ func TestCreateSession_Defaults(t *testing.T) {
 		DefBandwidthMaxUp:   500000,
 	}
 
-	session := sm.CreateSession(ip, mac, cfg)
+	session := sm.CreateSession(ip, mac, 0, cfg)
 	if session == nil {
 		t.Fatal("CreateSession should not return nil")
 	}

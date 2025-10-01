@@ -35,6 +35,15 @@ radiusacctport: 1813
 radiussecret: "secret"
 radiusnasid: "coovachilli-go"
 coaport: 3799
+radsecenable: false
+radsecport: 2083
+radseccertfile: "/path/to/client.crt"
+radseckeyfile: "/path/to/client.key"
+radseccafile: "/path/to/ca.crt"
+proxyenable: false
+proxylisten: "0.0.0.0"
+proxyport: 1812
+proxysecret: "proxysecret"
 
 # UAM/Captive Portal settings
 uamport: 8080
@@ -49,6 +58,13 @@ defsessiontimeout: 86400 # 24 hours
 defidletimeout: 600     # 10 minutes
 defbandwidthmaxdown: 1000000 # 1 Mbps
 defbandwidthmaxup: 256000    # 256 Kbps
+bwbucketupsize: 0
+bwbucketdnsize: 0
+bwbucketminsize: 0
+
+# Firewall settings
+# Backend can be 'auto', 'iptables', or 'ufw'
+firewallbackend: "auto"
 
 # Management
 cmdsockpath: /var/run/chilli.sock
@@ -57,3 +73,10 @@ statefile: /tmp/chilli.state
 # Scripts
 conup: "coovachilli-go/conup.sh"
 condown: "coovachilli-go/condown.sh"
+
+# Cluster settings
+cluster:
+  enabled: false
+  peerid: 0
+  peerkey: "your-secret-key"
+  interface: "eth1"

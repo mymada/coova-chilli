@@ -57,6 +57,15 @@ type Config struct {
 	RadiusSecret       string `yaml:"radiussecret"`
 	RadiusNASID        string `yaml:"radiusnasid"`
 	CoaPort            int    `yaml:"coaport"`
+	RadSecEnable       bool   `yaml:"radsecenable"`
+	RadSecPort         int    `yaml:"radsecport"`
+	RadSecCertFile     string `yaml:"radseccertfile"`
+	RadSecKeyFile      string `yaml:"radseckeyfile"`
+	RadSecCAFile       string `yaml:"radseccafile"`
+	ProxyEnable        bool   `yaml:"proxyenable"`
+	ProxyListen        string `yaml:"proxylisten"`
+	ProxyPort          int    `yaml:"proxyport"`
+	ProxySecret        string `yaml:"proxysecret"`
 
 	// UAM/Captive Portal settings
 	UAMPort             int      `yaml:"uamport"`
@@ -80,8 +89,12 @@ type Config struct {
 	DefIdleTimeout      uint32   `yaml:"defidletimeout"`
 	DefBandwidthMaxDown uint64   `yaml:"defbandwidthmaxdown"`
 	DefBandwidthMaxUp   uint64   `yaml:"defbandwidthmaxup"`
+	BwBucketUpSize      uint64   `yaml:"bwbucketupsize"`
+	BwBucketDnSize      uint64   `yaml:"bwbucketdnsize"`
+	BwBucketMinSize     uint64   `yaml:"bwbucketminsize"`
 
 	// Firewall settings
+	FirewallBackend   string   `yaml:"firewallbackend"`
 	ExtIf             string   `yaml:"extif"`
 	ClientIsolation   bool     `yaml:"clientisolation"`
 	IPTables          string   `yaml:"iptables"`
@@ -96,6 +109,17 @@ type Config struct {
 	// Management
 	CmdSockPath string `yaml:"cmdsockpath"`
 	StateFile   string `yaml:"statefile"`
+
+	// Cluster settings
+	Cluster ClusterConfig `yaml:"cluster"`
+}
+
+// ClusterConfig holds the cluster-specific settings.
+type ClusterConfig struct {
+	Enabled   bool   `yaml:"enabled"`
+	PeerID    int    `yaml:"peerid"`
+	PeerKey   string `yaml:"peerkey"`
+	Interface string `yaml:"interface"`
 }
 
 // Load loads the configuration from a YAML file.
@@ -125,6 +149,15 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("invalid 'net_v6' CIDR value: %w", err)
 		}
 		cfg.NetV6 = *ipnet
+	}
+
+	// Default RadSec port if not provided
+	if cfg.RadSecEnable && cfg.RadSecPort == 0 {
+		cfg.RadSecPort = 2083
+	}
+
+	if cfg.FirewallBackend == "" {
+		cfg.FirewallBackend = "auto"
 	}
 
 	return &cfg, nil

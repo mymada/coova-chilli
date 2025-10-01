@@ -27,6 +27,27 @@ The project is divided into several packages, each with a specific responsibilit
 *   **RADIUS Support**: Full support for RADIUS authentication, authorization, and accounting.
 *   **Captive Portal**: A built-in HTTP server for serving the captive portal page.
 *   **Firewall Management**: Manages firewall rules to control client access.
+*   **High Availability (Clustering)**: Active/Standby failover to prevent service interruptions.
+
+## High Availability (Clustering)
+
+The clustering feature allows you to run multiple CoovaChilli-Go instances in a high-availability setup. It operates in an Active/Standby model, where one node actively handles all traffic while others wait to take over in case of a failure.
+
+**How it works:**
+- **Communication**: Nodes communicate over a dedicated network interface using encrypted raw Ethernet frames with a custom EtherType (`0x888F`). The communication is encrypted using Blowfish to ensure security.
+- **Failover**: If the `ACTIVE` node goes offline (detected by a lack of heartbeats), the `STANDBY` node with the lowest `peerid` is automatically elected as the new active node.
+- **State**: When a node is in `STANDBY` state, it does not process any client traffic from the TUN interface, making it a passive listener until it becomes active.
+
+**Configuration:**
+To enable clustering, add the following section to your `config.yaml`:
+
+```yaml
+cluster:
+  enabled: true
+  peerid: 0  # A unique ID for this node (0-7)
+  peerkey: "your-secret-key" # A shared secret for encryption
+  interface: "eth1" # The dedicated interface for cluster communication
+```
 
 ## Getting Started
 
