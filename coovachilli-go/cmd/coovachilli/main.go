@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -317,6 +318,32 @@ func processCommand(command string, logger zerolog.Logger, sm *core.SessionManag
 			b.WriteString(fmt.Sprintf("ip=%s mac=%s user=%s\n", s.HisIP, s.HisMAC, s.Redir.Username))
 		}
 		return b.String()
+	case "logout":
+		if len(parts) < 2 {
+			return "ERROR: Missing IP or MAC address for logout command"
+		}
+		identifier := parts[1]
+		var session *core.Session
+
+		ip := net.ParseIP(identifier)
+		if ip != nil {
+			if s, ok := sm.GetSessionByIP(ip); ok {
+				session = s
+			}
+		} else {
+			if mac, err := net.ParseMAC(identifier); err == nil {
+				if s, ok := sm.GetSessionByMAC(mac); ok {
+					session = s
+				}
+			}
+		}
+
+		if session == nil {
+			return fmt.Sprintf("ERROR: Session not found for identifier %s", identifier)
+		}
+
+		dm.Disconnect(session, "Admin-Reset")
+		return fmt.Sprintf("OK: Disconnected session for %s", identifier)
 	}
 	return "ERROR: Unknown command"
 }
