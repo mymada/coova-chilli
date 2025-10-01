@@ -117,13 +117,21 @@ type Config struct {
 	ConDown string `yaml:"condown"`
 
 	// Management
-	CmdSockPath string `yaml:"cmdsockpath"`
 	StateFile   string `yaml:"statefile"`
 
 	// Cluster settings
 	Cluster ClusterConfig `yaml:"cluster"`
 	// Metrics settings
 	Metrics MetricsConfig `yaml:"metrics"`
+	// Admin API settings
+	AdminAPI AdminAPIConfig `yaml:"admin_api"`
+}
+
+// AdminAPIConfig holds the configuration for the admin API.
+type AdminAPIConfig struct {
+	Enabled   bool   `yaml:"enabled"`
+	Listen    string `yaml:"listen"`
+	AuthToken string `yaml:"auth_token"`
 }
 
 // MetricsConfig holds the configuration for the metrics system.

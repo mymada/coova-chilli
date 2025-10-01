@@ -13,11 +13,11 @@ import (
 	"coovachilli-go/pkg/metrics"
 )
 
-var startTime = time.Now()
+var StartTime = time.Now()
 
 // MonotonicTime returns a uint32 representing the number of seconds since the process started.
 func MonotonicTime() uint32 {
-	return uint32(time.Since(startTime).Seconds())
+	return uint32(time.Since(StartTime).Seconds())
 }
 
 // Session holds the state for a single client session.

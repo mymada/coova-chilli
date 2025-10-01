@@ -7,6 +7,7 @@ toolchain go1.24.3
 require (
 	github.com/coreos/go-iptables v0.7.0
 	github.com/gopacket/gopacket v1.4.0
+	github.com/gorilla/mux v1.8.1
 	github.com/insomniacslk/dhcp v0.0.0-20231016090811-6a2c8fbdcc1c
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.30.0

@@ -75,7 +75,6 @@ bwbucketminsize: 0
 firewallbackend: "auto"
 
 # Management
-cmdsockpath: /var/run/chilli.sock
 statefile: /tmp/chilli.state
 
 # Scripts
@@ -94,3 +93,9 @@ metrics:
   enabled: true
   backend: "prometheus"
   listen: "0.0.0.0:9090"
+
+# Admin API settings
+admin_api:
+  enabled: true
+  listen: "127.0.0.1:8081"
+  auth_token: "your-secret-admin-token"

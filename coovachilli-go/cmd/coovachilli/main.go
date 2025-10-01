@@ -10,8 +10,8 @@ import (
 	"syscall"
 
 	"coovachilli-go/pkg/auth"
+	"coovachilli-go/pkg/admin"
 	"coovachilli-go/pkg/cluster"
-	"coovachilli-go/pkg/cmdsock"
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
 	"coovachilli-go/pkg/dhcp"
@@ -264,16 +264,9 @@ func runApp(cfg *config.Config, reloader *config.Reloader) {
 	go tun.ReadPackets(ifce, packetChan, log.Logger)
 	go processPackets(ifce, packetChan, cfg, sessionManager, dnsProxy, fw, peerManager, log.Logger)
 
-	cmdChan := make(chan string)
-	cmdSockListener := cmdsock.NewListener(cfg.CmdSockPath, cmdChan, log.Logger)
-	go cmdSockListener.Start()
-
-	go func() {
-		for cmd := range cmdChan {
-			response := processCommand(cmd, log.Logger, sessionManager, disconnectManager)
-			log.Info().Str("command", cmd).Str("response", response).Msg("Processed command")
-		}
-	}()
+	// Start the admin API server
+	adminServer := admin.NewServer(cfg, sessionManager, disconnectManager, log.Logger)
+	go adminServer.Start()
 
 	coaReqChan := make(chan radius.CoAIncomingRequest)
 	go radiusClient.StartCoAListener(coaReqChan)
@@ -469,46 +462,4 @@ func sendDNSResponse(ifce *water.Interface, reqPacket gopacket.Packet, respPaylo
 	_ = gopacket.SerializeLayers(buffer, opts, ipLayer, udpLayer, gopacket.Payload(respPayload))
 	_, err := ifce.Write(buffer.Bytes())
 	return err
-}
-
-func processCommand(command string, logger zerolog.Logger, sm *core.SessionManager, dm *disconnect.Manager) string {
-	parts := strings.Fields(command)
-	if len(parts) == 0 {
-		return "ERROR: Empty command"
-	}
-	switch parts[0] {
-	case "list":
-		var b strings.Builder
-		for _, s := range sm.GetAllSessions() {
-			b.WriteString(fmt.Sprintf("ip=%s mac=%s user=%s\n", s.HisIP, s.HisMAC, s.Redir.Username))
-		}
-		return b.String()
-	case "logout":
-		if len(parts) < 2 {
-			return "ERROR: Missing IP or MAC address for logout command"
-		}
-		identifier := parts[1]
-		var session *core.Session
-
-		ip := net.ParseIP(identifier)
-		if ip != nil {
-			if s, ok := sm.GetSessionByIP(ip); ok {
-				session = s
-			}
-		} else {
-			if mac, err := net.ParseMAC(identifier); err == nil {
-				if s, ok := sm.GetSessionByMAC(mac); ok {
-					session = s
-				}
-			}
-		}
-
-		if session == nil {
-			return fmt.Sprintf("ERROR: Session not found for identifier %s", identifier)
-		}
-
-		dm.Disconnect(session, "Admin-Reset")
-		return fmt.Sprintf("OK: Disconnected session for %s", identifier)
-	}
-	return "ERROR: Unknown command"
 }
