@@ -62,6 +62,10 @@ type Config struct {
 	RadSecCertFile     string `yaml:"radseccertfile"`
 	RadSecKeyFile      string `yaml:"radseckeyfile"`
 	RadSecCAFile       string `yaml:"radseccafile"`
+	ProxyEnable        bool   `yaml:"proxyenable"`
+	ProxyListen        string `yaml:"proxylisten"`
+	ProxyPort          int    `yaml:"proxyport"`
+	ProxySecret        string `yaml:"proxysecret"`
 
 	// UAM/Captive Portal settings
 	UAMPort             int      `yaml:"uamport"`

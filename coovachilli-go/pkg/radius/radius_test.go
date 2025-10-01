@@ -1,6 +1,7 @@
 package radius
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -219,7 +220,9 @@ func TestRadSecExchange(t *testing.T) {
 			return
 		}
 
-		packet, err := radius.Parse(buf[:n], []byte("secret"))
+		// NOTE: Using a 16-byte secret to match the client configuration and avoid
+		// potential library issues with shorter secrets.
+		packet, err := radius.Parse(buf[:n], []byte("1234567890123456"))
 		if err != nil {
 			serverErrChan <- err
 			return
@@ -352,5 +355,84 @@ func TestRadiusFailover(t *testing.T) {
 		require.NoError(t, err)
 	case <-time.After(5 * time.Second): // Allow time for the first server to time out
 		t.Fatal("RADIUS server timed out")
+	}
+}
+
+func TestRadiusProxy(t *testing.T) {
+	// 1. Start mock upstream RADIUS server
+	upstreamErrChan := make(chan error, 1)
+	upstreamSecret := "upstreamsecret"
+	upstreamListener, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer upstreamListener.Close()
+
+	go func() {
+		buf := make([]byte, 4096)
+		n, addr, err := upstreamListener.ReadFrom(buf)
+		if err != nil {
+			upstreamErrChan <- err
+			return
+		}
+		packet, err := radius.Parse(buf[:n], []byte(upstreamSecret))
+		require.NoError(t, err)
+		require.Equal(t, radius.CodeAccessRequest, packet.Code)
+		response := packet.Response(radius.CodeAccessAccept)
+		encoded, err := response.Encode()
+		require.NoError(t, err)
+		_, err = upstreamListener.WriteTo(encoded, addr)
+		require.NoError(t, err)
+		upstreamErrChan <- nil
+	}()
+
+	upstreamAddr := upstreamListener.LocalAddr().(*net.UDPAddr)
+	upstreamHost, upstreamPortStr, _ := net.SplitHostPort(upstreamAddr.String())
+	var upstreamPort int
+	_, _ = fmt.Sscanf(upstreamPortStr, "%d", &upstreamPort)
+
+	// 2. Setup coovachilli-go components
+	logger := zerolog.Nop()
+	proxySecret := "proxysecret"
+	cfg := &config.Config{
+		ProxyEnable:    true,
+		ProxyListen:    "127.0.0.1",
+		ProxyPort:      0, // Use random port
+		ProxySecret:    proxySecret,
+		RadiusServer1:  upstreamHost,
+		RadiusAuthPort: upstreamPort,
+		RadiusSecret:   upstreamSecret,
+	}
+	sm := core.NewSessionManager()
+	mac, _ := net.ParseMAC("00:11:22:33:44:55")
+	_ = sm.CreateSession(net.ParseIP("10.2.0.1"), mac, 0, cfg)
+
+	radiusClient := NewClient(cfg, logger)
+	proxyServer := NewProxyServer(cfg, sm, radiusClient, logger)
+
+	// Get a random port for the proxy
+	proxyListener, err := net.ListenPacket("udp", fmt.Sprintf("%s:%d", cfg.ProxyListen, cfg.ProxyPort))
+	require.NoError(t, err)
+	proxyAddr := proxyListener.LocalAddr().(*net.UDPAddr)
+	cfg.ProxyPort = proxyAddr.Port
+	proxyListener.Close() // Close it so the proxy can bind to it
+
+	go proxyServer.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	// 3. Mock Downstream NAS
+	nasPacket := radius.New(radius.CodeAccessRequest, []byte(proxySecret))
+	rfc2865.UserName_SetString(nasPacket, "testuser")
+	rfc2865.CallingStationID_SetString(nasPacket, "00-11-22-33-44-55")
+
+	response, err := radius.Exchange(context.Background(), nasPacket, proxyAddr.String())
+	require.NoError(t, err)
+
+	// 4. Verification
+	require.Equal(t, radius.CodeAccessAccept, response.Code, "Expected Access-Accept from proxy")
+
+	select {
+	case err := <-upstreamErrChan:
+		require.NoError(t, err, "Upstream server encountered an error")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Upstream RADIUS server timed out")
 	}
 }

@@ -40,6 +40,10 @@ radsecport: 2083
 radseccertfile: "/path/to/client.crt"
 radseckeyfile: "/path/to/client.key"
 radseccafile: "/path/to/ca.crt"
+proxyenable: false
+proxylisten: "0.0.0.0"
+proxyport: 1812
+proxysecret: "proxysecret"
 
 # UAM/Captive Portal settings
 uamport: 8080

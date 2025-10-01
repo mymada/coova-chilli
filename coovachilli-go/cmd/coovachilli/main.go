@@ -117,6 +117,11 @@ func main() {
 	coaReqChan := make(chan radius.CoAIncomingRequest)
 	go radiusClient.StartCoAListener(coaReqChan)
 
+	if cfg.ProxyEnable {
+		proxyServer := radius.NewProxyServer(cfg, sessionManager, radiusClient, log.Logger)
+		go proxyServer.Start()
+	}
+
 	go func() {
 		for req := range coaReqChan {
 			userName := rfc2865.UserName_GetString(req.Packet)
