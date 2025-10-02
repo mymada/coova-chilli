@@ -16,6 +16,8 @@ import (
 	"layeh.com/radius/rfc2869"
 )
 
+var eapolMulticastMAC, _ = net.ParseMAC("01:80:c2:00:00:03")
+
 // mockEAPOLSender is a mock implementation of the EAPOLSender interface for testing.
 type mockEAPOLSender struct {
 	SentPacket []byte
@@ -59,33 +61,24 @@ func setupTestHandler(t *testing.T) (*Handler, *core.SessionManager, *mockRadius
 	return handler, sm, rc, sender
 }
 
-// createTestPacket is a helper to build a gopacket.Packet for testing.
-// NOTE (Problem Explanation): The primary challenge in testing this module lies
-// in reliably constructing and parsing EAPOL packets using gopacket.
-// The key issue discovered after multiple failures was that the Ethernet layer's
-// `EthernetType` MUST be explicitly set to `layers.EthernetTypeEAPOL`. Without this, gopacket
-// will not correctly decode the subsequent EAPOL layer, causing the handler
-// to fail silently and tests to fail. This was the root cause of previous
-// persistent test failures.
-func createTestPacket(eth *layers.Ethernet, payload gopacket.SerializableLayer) gopacket.Packet {
-	eth.EthernetType = layers.EthernetTypeEAPOL
-	if eth.DstMAC == nil {
-		eth.DstMAC = eapolMulticastMAC
-	}
-	opts := gopacket.SerializeOptions{FixLengths: true}
-	buf := gopacket.NewSerializeBuffer()
-	err := gopacket.SerializeLayers(buf, opts, eth, payload)
-	if err != nil {
-		panic(err)
-	}
-	return gopacket.NewPacket(buf.Bytes(), layers.LayerTypeEthernet, gopacket.Default)
-}
-
 func TestHandleEAPOLStart(t *testing.T) {
 	handler, _, _, sender := setupTestHandler(t)
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:01")
-	eapolStart := &layers.EAPOL{Type: layers.EAPOLTypeStart, Version: 1}
-	packet := createTestPacket(&layers.Ethernet{SrcMAC: clientMAC}, eapolStart)
+
+	// NOTE (Correction): The key to creating a valid test packet is to explicitly set the
+	// EthernetType and to build the layers from the inside out to avoid ambiguity
+	// for the gopacket decoder.
+	eth := &layers.Ethernet{
+		SrcMAC:       clientMAC,
+		DstMAC:       eapolMulticastMAC,
+		EthernetType: layers.EthernetTypeEAPOL,
+	}
+	eapol := &layers.EAPOL{Type: layers.EAPOLTypeStart, Version: 1}
+
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{}
+	gopacket.SerializeLayers(buf, opts, eth, eapol)
+	packet := gopacket.NewPacket(buf.Bytes(), layers.LayerTypeEthernet, gopacket.Default)
 
 	handler.HandlePacket(packet)
 
@@ -104,6 +97,9 @@ func TestHandleEAPResponseIdentity(t *testing.T) {
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:02")
 	session := sm.CreateSession(nil, clientMAC, 0)
 
+	// NOTE(Correction): The EAP layer must be serialized first and then passed as a
+	// generic payload to the EAPOL layer. Passing both layers directly to
+	// SerializeLayers is ambiguous and causes gopacket to fail decoding.
 	eapResp := &layers.EAP{
 		Code:     layers.EAPCodeResponse,
 		Id:       1,
@@ -111,11 +107,14 @@ func TestHandleEAPResponseIdentity(t *testing.T) {
 		TypeData: []byte("testuser"),
 	}
 	eapResp.Length = uint16(5 + len(eapResp.TypeData))
-
 	eapBuf := gopacket.NewSerializeBuffer()
 	gopacket.SerializeLayers(eapBuf, gopacket.SerializeOptions{}, eapResp)
 	eapol := &layers.EAPOL{Type: layers.EAPOLTypeEAP, Version: 1, Length: uint16(len(eapBuf.Bytes()))}
-	packet := createTestPacket(&layers.Ethernet{SrcMAC: clientMAC}, eapol, gopacket.Payload(eapBuf.Bytes()))
+	eth := &layers.Ethernet{SrcMAC: clientMAC, DstMAC: eapolMulticastMAC, EthernetType: layers.EthernetTypeEAPOL}
+
+	buf := gopacket.NewSerializeBuffer()
+	gopacket.SerializeLayers(buf, gopacket.SerializeOptions{}, eth, eapol, gopacket.Payload(eapBuf.Bytes()))
+	packet := gopacket.NewPacket(buf.Bytes(), layers.LayerTypeEthernet, gopacket.Default)
 
 	rc.Response = radius.New(radius.CodeAccessChallenge, []byte("secret"))
 	handler.HandlePacket(packet)
@@ -129,13 +128,12 @@ func TestHandleEAPResponseIdentity(t *testing.T) {
 
 func TestHandleRadiusChallenge(t *testing.T) {
 	handler, _, _, sender := setupTestHandler(t)
-	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:03")
-	session := handler.sm.CreateSession(nil, clientMAC, 0)
+	session := handler.sm.CreateSession(nil, net.HardwareAddr{0x01, 0x02, 0x03, 0x04, 0x05, 0x06}, 0)
 
-	radiusChallengeEAPBuf := gopacket.NewSerializeBuffer()
-	gopacket.SerializeLayers(radiusChallengeEAPBuf, gopacket.SerializeOptions{}, &layers.EAP{Code: layers.EAPCodeRequest, Id: 2, Type: 4, TypeData: []byte("challenge-data"), Length: 22})
+	eapBuf := gopacket.NewSerializeBuffer()
+	gopacket.SerializeLayers(eapBuf, gopacket.SerializeOptions{}, &layers.EAP{Code: layers.EAPCodeRequest, Id: 2, Type: 4, TypeData: []byte("challenge-data"), Length: 22})
 	radiusResp := radius.New(radius.CodeAccessChallenge, []byte("secret"))
-	rfc2869.EAPMessage_Set(radiusResp, radiusChallengeEAPBuf.Bytes())
+	rfc2869.EAPMessage_Set(radiusResp, eapBuf.Bytes())
 	rfc2865.State_Set(radiusResp, []byte("radius-state"))
 
 	handler.handleRadiusChallenge(session, radiusResp)
@@ -153,8 +151,7 @@ func TestHandleRadiusChallenge(t *testing.T) {
 
 func TestHandleRadiusAccept(t *testing.T) {
 	handler, _, _, sender := setupTestHandler(t)
-	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:04")
-	session := handler.sm.CreateSession(nil, clientMAC, 0)
+	session := handler.sm.CreateSession(nil, net.HardwareAddr{0x01, 0x02, 0x03, 0x04, 0x05, 0x07}, 0)
 
 	handler.handleRadiusAccept(session, radius.New(radius.CodeAccessAccept, []byte{}))
 
