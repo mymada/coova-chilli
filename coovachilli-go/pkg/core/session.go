@@ -63,6 +63,8 @@ type Session struct {
 
 	// Token is a secure token for cookie-based auto-login.
 	Token string
+	// EapID is the last EAP identifier used in a request.
+	EapID uint8
 }
 
 // SessionParams holds RADIUS-provisioned session parameters.

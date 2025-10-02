@@ -61,24 +61,26 @@ func setupTestHandler(t *testing.T) (*Handler, *core.SessionManager, *mockRadius
 	return handler, sm, rc, sender
 }
 
+// createTestPacket is a helper to build a gopacket.Packet for testing.
+func createTestPacket(eth *layers.Ethernet, payload ...gopacket.SerializableLayer) gopacket.Packet {
+	eth.EthernetType = layers.EthernetTypeEAPOL
+	if eth.DstMAC == nil {
+		eth.DstMAC = eapolMulticastMAC
+	}
+	opts := gopacket.SerializeOptions{FixLengths: true}
+	buf := gopacket.NewSerializeBuffer()
+	err := gopacket.SerializeLayers(buf, opts, append([]gopacket.SerializableLayer{eth}, payload...)...)
+	if err != nil {
+		panic(err)
+	}
+	return gopacket.NewPacket(buf.Bytes(), layers.LayerTypeEthernet, gopacket.Default)
+}
+
 func TestHandleEAPOLStart(t *testing.T) {
 	handler, _, _, sender := setupTestHandler(t)
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:01")
-
-	// NOTE (Correction): The key to creating a valid test packet is to explicitly set the
-	// EthernetType and to build the layers from the inside out to avoid ambiguity
-	// for the gopacket decoder.
-	eth := &layers.Ethernet{
-		SrcMAC:       clientMAC,
-		DstMAC:       eapolMulticastMAC,
-		EthernetType: layers.EthernetTypeEAPOL,
-	}
-	eapol := &layers.EAPOL{Type: layers.EAPOLTypeStart, Version: 1}
-
-	buf := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{}
-	gopacket.SerializeLayers(buf, opts, eth, eapol)
-	packet := gopacket.NewPacket(buf.Bytes(), layers.LayerTypeEthernet, gopacket.Default)
+	eapolStart := &layers.EAPOL{Type: layers.EAPOLTypeStart, Version: 1}
+	packet := createTestPacket(&layers.Ethernet{SrcMAC: clientMAC}, eapolStart)
 
 	handler.HandlePacket(packet)
 
@@ -97,9 +99,6 @@ func TestHandleEAPResponseIdentity(t *testing.T) {
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:02")
 	session := sm.CreateSession(nil, clientMAC, 0)
 
-	// NOTE(Correction): The EAP layer must be serialized first and then passed as a
-	// generic payload to the EAPOL layer. Passing both layers directly to
-	// SerializeLayers is ambiguous and causes gopacket to fail decoding.
 	eapResp := &layers.EAP{
 		Code:     layers.EAPCodeResponse,
 		Id:       1,
@@ -110,11 +109,7 @@ func TestHandleEAPResponseIdentity(t *testing.T) {
 	eapBuf := gopacket.NewSerializeBuffer()
 	gopacket.SerializeLayers(eapBuf, gopacket.SerializeOptions{}, eapResp)
 	eapol := &layers.EAPOL{Type: layers.EAPOLTypeEAP, Version: 1, Length: uint16(len(eapBuf.Bytes()))}
-	eth := &layers.Ethernet{SrcMAC: clientMAC, DstMAC: eapolMulticastMAC, EthernetType: layers.EthernetTypeEAPOL}
-
-	buf := gopacket.NewSerializeBuffer()
-	gopacket.SerializeLayers(buf, gopacket.SerializeOptions{}, eth, eapol, gopacket.Payload(eapBuf.Bytes()))
-	packet := gopacket.NewPacket(buf.Bytes(), layers.LayerTypeEthernet, gopacket.Default)
+	packet := createTestPacket(&layers.Ethernet{SrcMAC: clientMAC}, eapol, gopacket.Payload(eapBuf.Bytes()))
 
 	rc.Response = radius.New(radius.CodeAccessChallenge, []byte("secret"))
 	handler.HandlePacket(packet)

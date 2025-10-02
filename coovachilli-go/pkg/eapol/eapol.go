@@ -86,7 +86,11 @@ func (h *Handler) HandlePacket(packet gopacket.Packet) {
 }
 
 func (h *Handler) sendEAPRequestIdentity(session *core.Session) {
-	eapReq := &layers.EAP{Code: layers.EAPCodeRequest, Id: 1, Type: layers.EAPTypeIdentity, Length: 5}
+	session.Lock()
+	session.EapID++
+	currentID := session.EapID
+	session.Unlock()
+	eapReq := &layers.EAP{Code: layers.EAPCodeRequest, Id: currentID, Type: layers.EAPTypeIdentity, Length: 5}
 	h.sendEAP(session.HisMAC, eapReq)
 }
 
@@ -97,13 +101,14 @@ func (h *Handler) handleEAP(session *core.Session, eapPayload []byte) {
 		return
 	}
 
+	session.Lock()
+	session.EapID = eap.Id // Store the ID of the client's response
 	if eap.Type == layers.EAPTypeIdentity {
 		username := string(eap.TypeData)
-		session.Lock()
 		session.Redir.Username = username
-		session.Unlock()
 		h.logger.Info().Str("mac", session.HisMAC.String()).Str("user", username).Msg("Received EAP-Response/Identity")
 	}
+	session.Unlock()
 
 	radiusResp, err := h.radiusClient.SendEAPAccessRequest(session, eapPayload, session.SessionParams.State)
 	if err != nil {
@@ -117,13 +122,14 @@ func (h *Handler) handleEAP(session *core.Session, eapPayload []byte) {
 	case layehradius.CodeAccessAccept:
 		h.handleRadiusAccept(session, radiusResp)
 	case layehradius.CodeAccessReject:
-		h.handleRadiusReject(session)
+		h.handleRadiusReject(session, radiusResp)
 	}
 }
 
 func (h *Handler) handleRadiusChallenge(session *core.Session, radiusResp *layehradius.Packet) {
 	eapPayload := rfc2869.EAPMessage_Get(radiusResp)
 	if eapPayload == nil {
+		h.logger.Warn().Msg("RADIUS Access-Challenge missing EAP-Message")
 		return
 	}
 	state := rfc2865.State_Get(radiusResp)
@@ -132,6 +138,7 @@ func (h *Handler) handleRadiusChallenge(session *core.Session, radiusResp *layeh
 		session.SessionParams.State = state
 		session.Unlock()
 	}
+	h.logger.Debug().Str("mac", session.HisMAC.String()).Msg("Relaying RADIUS Access-Challenge to client")
 	h.sendEAPPayload(session.HisMAC, eapPayload)
 }
 
@@ -139,13 +146,28 @@ func (h *Handler) handleRadiusAccept(session *core.Session, radiusResp *layehrad
 	session.Lock()
 	session.Authenticated = true
 	session.Unlock()
-	eapSuccess := &layers.EAP{Code: layers.EAPCodeSuccess, Id: 1, Length: 4}
-	h.sendEAP(session.HisMAC, eapSuccess)
+
+	eapPayload := rfc2869.EAPMessage_Get(radiusResp)
+	if eapPayload == nil {
+		h.logger.Error().Msg("RADIUS Access-Accept missing EAP-Message, sending generic EAP-Success")
+		eapSuccess := &layers.EAP{Code: layers.EAPCodeSuccess, Id: session.EapID, Length: 4}
+		h.sendEAP(session.HisMAC, eapSuccess)
+		return
+	}
+	h.logger.Info().Str("mac", session.HisMAC.String()).Msg("EAP authentication successful, relaying EAP-Success")
+	h.sendEAPPayload(session.HisMAC, eapPayload)
 }
 
-func (h *Handler) handleRadiusReject(session *core.Session) {
-	eapFailure := &layers.EAP{Code: layers.EAPCodeFailure, Id: 1, Length: 4}
-	h.sendEAP(session.HisMAC, eapFailure)
+func (h *Handler) handleRadiusReject(session *core.Session, radiusResp *layehradius.Packet) {
+	eapPayload := rfc2869.EAPMessage_Get(radiusResp)
+	if eapPayload == nil {
+		h.logger.Error().Msg("RADIUS Access-Reject missing EAP-Message, sending generic EAP-Failure")
+		eapFailure := &layers.EAP{Code: layers.EAPCodeFailure, Id: session.EapID, Length: 4}
+		h.sendEAP(session.HisMAC, eapFailure)
+	} else {
+		h.logger.Info().Str("mac", session.HisMAC.String()).Msg("EAP authentication failed, relaying EAP-Failure")
+		h.sendEAPPayload(session.HisMAC, eapPayload)
+	}
 	h.sm.DeleteSession(session)
 }
 
@@ -162,20 +184,15 @@ func (h *Handler) sendEAPPayload(dstMAC net.HardwareAddr, eapPayload []byte) {
 	h.sender.SendEAPOL(dstMAC, buf.Bytes())
 }
 
+// parseEAP uses gopacket to robustly decode an EAP layer from a byte slice.
 func parseEAP(data []byte) (*layers.EAP, error) {
-	if len(data) < 4 {
-		return nil, fmt.Errorf("EAP packet too short")
+	packet := gopacket.NewPacket(data, layers.LayerTypeEAP, gopacket.Default)
+	if err := packet.ErrorLayer(); err != nil {
+		return nil, err.Error()
 	}
-	eap := &layers.EAP{
-		Code:   layers.EAPCode(data[0]),
-		Id:     data[1],
-		Length: uint16(data[2])<<8 | uint16(data[3]),
+	eapLayer := packet.Layer(layers.LayerTypeEAP)
+	if eapLayer == nil {
+		return nil, fmt.Errorf("packet does not contain an EAP layer")
 	}
-	if len(data) >= 5 {
-		eap.Type = layers.EAPType(data[4])
-		if len(data) > 5 {
-			eap.TypeData = data[5:]
-		}
-	}
-	return eap, nil
+	return eapLayer.(*layers.EAP), nil
 }
