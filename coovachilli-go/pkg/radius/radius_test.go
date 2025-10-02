@@ -31,7 +31,7 @@ func TestCoAListener(t *testing.T) {
 		RadiusSecret: "secret",
 	}
 	logger := zerolog.Nop()
-	client := NewClient(cfg, logger)
+	client := NewClient(cfg, logger, nil)
 	coaReqChan := make(chan CoAIncomingRequest, 1)
 
 	go client.StartCoAListener(coaReqChan)
@@ -259,7 +259,7 @@ func TestRadSecExchange(t *testing.T) {
 
 	// Create client and session
 	logger := zerolog.Nop()
-	client := NewClient(cfg, logger)
+	client := NewClient(cfg, logger, nil)
 	mac, _ := net.ParseMAC("00:01:02:03:04:05")
 	session := &core.Session{
 		HisIP:  net.ParseIP("10.0.0.1"),
@@ -338,7 +338,7 @@ func TestRadiusFailover(t *testing.T) {
 
 	// Create client and session
 	logger := zerolog.Nop()
-	client := NewClient(cfg, logger)
+	client := NewClient(cfg, logger, nil)
 	mac, _ := net.ParseMAC("00:01:02:03:04:05")
 	session := &core.Session{
 		HisIP:  net.ParseIP("10.0.0.1"),
@@ -401,11 +401,11 @@ func TestRadiusProxy(t *testing.T) {
 		RadiusAuthPort: upstreamPort,
 		RadiusSecret:   upstreamSecret,
 	}
-	sm := core.NewSessionManager()
+	sm := core.NewSessionManager(cfg, nil)
 	mac, _ := net.ParseMAC("00:11:22:33:44:55")
-	_ = sm.CreateSession(net.ParseIP("10.2.0.1"), mac, 0, cfg)
+	_ = sm.CreateSession(net.ParseIP("10.2.0.1"), mac, 0)
 
-	radiusClient := NewClient(cfg, logger)
+	radiusClient := NewClient(cfg, logger, nil)
 	proxyServer := NewProxyServer(cfg, sm, radiusClient, logger)
 
 	// Get a random port for the proxy

@@ -27,13 +27,14 @@ func (m *mockDisconnector) Disconnect(session *core.Session, reason string) {
 
 func TestHandleStatus(t *testing.T) {
 	// Setup
-	sm := core.NewSessionManager()
-	server := NewServer(&config.Config{}, sm, nil, nil, zerolog.Nop())
+	cfg := &config.Config{}
+	sm := core.NewSessionManager(cfg, nil)
+	server := NewServer(cfg, sm, nil, nil, zerolog.Nop(), nil)
 
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:02")
-	session := sm.CreateSession(clientIP, clientMAC, 0, &config.Config{})
+	session := sm.CreateSession(clientIP, clientMAC, 0)
 	session.Authenticated = true
 	session.Redir.Username = "testuser"
 
@@ -52,14 +53,15 @@ func TestHandleStatus(t *testing.T) {
 
 func TestHandleLogout(t *testing.T) {
 	// Setup
-	sm := core.NewSessionManager()
+	cfg := &config.Config{}
+	sm := core.NewSessionManager(cfg, nil)
 	mockDc := &mockDisconnector{}
-	server := NewServer(&config.Config{}, sm, nil, mockDc, zerolog.Nop())
+	server := NewServer(cfg, sm, nil, mockDc, zerolog.Nop(), nil)
 
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:02")
-	session := sm.CreateSession(clientIP, clientMAC, 0, &config.Config{})
+	session := sm.CreateSession(clientIP, clientMAC, 0)
 
 	req := httptest.NewRequest("POST", "/logout", nil)
 	rr := httptest.NewRecorder()
@@ -77,13 +79,14 @@ func TestHandleLogout(t *testing.T) {
 
 func TestHandleApiStatus(t *testing.T) {
 	// Setup
-	sm := core.NewSessionManager()
-	server := NewServer(&config.Config{}, sm, nil, nil, zerolog.Nop())
+	cfg := &config.Config{}
+	sm := core.NewSessionManager(cfg, nil)
+	server := NewServer(cfg, sm, nil, nil, zerolog.Nop(), nil)
 
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:02")
-	session := sm.CreateSession(clientIP, clientMAC, 0, &config.Config{})
+	session := sm.CreateSession(clientIP, clientMAC, 0)
 	session.Authenticated = true
 	session.Redir.Username = "testuser"
 
@@ -102,14 +105,15 @@ func TestHandleApiStatus(t *testing.T) {
 
 func TestHandleApiLogout(t *testing.T) {
 	// Setup
-	sm := core.NewSessionManager()
+	cfg := &config.Config{}
+	sm := core.NewSessionManager(cfg, nil)
 	mockDc := &mockDisconnector{}
-	server := NewServer(&config.Config{}, sm, nil, mockDc, zerolog.Nop())
+	server := NewServer(cfg, sm, nil, mockDc, zerolog.Nop(), nil)
 
 	// Create a mock session with a token
 	clientIP := net.ParseIP("10.0.0.15")
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:02")
-	session := sm.CreateSession(clientIP, clientMAC, 0, &config.Config{})
+	session := sm.CreateSession(clientIP, clientMAC, 0)
 	session.Token = "testtoken"
 	sm.AssociateToken(session)
 
@@ -129,13 +133,14 @@ func TestHandleApiLogout(t *testing.T) {
 
 func TestHandleJsonpStatus(t *testing.T) {
 	// Setup
-	sm := core.NewSessionManager()
-	server := NewServer(&config.Config{}, sm, nil, nil, zerolog.Nop())
+	cfg := &config.Config{}
+	sm := core.NewSessionManager(cfg, nil)
+	server := NewServer(cfg, sm, nil, nil, zerolog.Nop(), nil)
 
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:02")
-	session := sm.CreateSession(clientIP, clientMAC, 0, &config.Config{})
+	session := sm.CreateSession(clientIP, clientMAC, 0)
 	session.Authenticated = true
 	session.SessionParams.SessionTimeout = 3600
 	session.InputOctets = 1024

@@ -95,6 +95,15 @@ func (f *UfwFirewall) RemoveAuthenticatedUser(ip net.IP) error {
 	return nil
 }
 
+// Reconfigure updates the configuration for the UFW firewall.
+// Currently, it only updates the internal config reference.
+func (f *UfwFirewall) Reconfigure(newConfig *config.Config) error {
+	f.logger.Info().Msg("Reconfiguring UFW firewall...")
+	f.cfg = newConfig
+	f.logger.Warn().Msg("UFW dynamic reconfiguration is limited. Walled garden changes may require a restart.")
+	return nil
+}
+
 func (f *UfwFirewall) Cleanup() {
 	f.logger.Info().Msg("Cleaning up ufw firewall rules...")
 

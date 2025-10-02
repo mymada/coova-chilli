@@ -8,13 +8,14 @@ import (
 )
 
 func TestSessionManager(t *testing.T) {
-	sm := NewSessionManager()
+	cfg := &config.Config{}
+	sm := NewSessionManager(cfg, nil)
 
 	mac, _ := net.ParseMAC("00:00:5e:00:53:01")
 	ip := net.ParseIP("10.1.0.100")
 
 	// Test CreateSession
-	session := sm.CreateSession(ip, mac, 0, &config.Config{})
+	session := sm.CreateSession(ip, mac, 0)
 	if session == nil {
 		t.Fatal("CreateSession should not return nil")
 	}
@@ -50,7 +51,6 @@ func TestSessionManager(t *testing.T) {
 }
 
 func TestCreateSession_Defaults(t *testing.T) {
-	sm := NewSessionManager()
 	mac, _ := net.ParseMAC("00:00:5e:00:53:02")
 	ip := net.ParseIP("10.1.0.101")
 
@@ -60,8 +60,9 @@ func TestCreateSession_Defaults(t *testing.T) {
 		DefBandwidthMaxDown: 2000000,
 		DefBandwidthMaxUp:   500000,
 	}
+	sm := NewSessionManager(cfg, nil)
 
-	session := sm.CreateSession(ip, mac, 0, cfg)
+	session := sm.CreateSession(ip, mac, 0)
 	if session == nil {
 		t.Fatal("CreateSession should not return nil")
 	}

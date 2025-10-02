@@ -5,8 +5,12 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"net"
 
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
+	"github.com/gopacket/gopacket/pcap"
 	"golang.org/x/crypto/blowfish"
 )
 

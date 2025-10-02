@@ -10,8 +10,8 @@ import (
 	"syscall"
 
 	"coovachilli-go/pkg/auth"
+	"coovachilli-go/pkg/admin"
 	"coovachilli-go/pkg/cluster"
-	"coovachilli-go/pkg/cmdsock"
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
 	"coovachilli-go/pkg/dhcp"
@@ -20,40 +20,159 @@ import (
 	"coovachilli-go/pkg/eapol"
 	"coovachilli-go/pkg/firewall"
 	"coovachilli-go/pkg/http"
+	"coovachilli-go/pkg/metrics"
 	"coovachilli-go/pkg/radius"
 	"coovachilli-go/pkg/script"
 	"coovachilli-go/pkg/tun"
+	"io"
+	stdhttp "net/http"
+	"log/syslog"
+	"os/user"
+	"strconv"
 
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"github.com/sevlyar/go-daemon"
 	"github.com/songgao/water"
 	layehradius "layeh.com/radius"
 	"layeh.com/radius/rfc2865"
 	"layeh.com/radius/rfc2866"
 )
 
-func main() {
-	zerolog.SetGlobalLevel(zerolog.InfoLevel)
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+var (
+	stop     = flag.Bool("stop", false, "send stop signal to the daemon")
+	reloader *config.Reloader
+)
 
+func main() {
 	configPath := flag.String("config", "config.yaml", "Path to the configuration file")
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	flag.Parse()
 
-	if *debug {
-		zerolog.SetGlobalLevel(zerolog.DebugLevel)
-	}
-
-	log.Info().Msg("Starting CoovaChilli-Go...")
+	// The daemon library takes over signal handling, so we need to register our commands.
+	daemon.AddCommand(daemon.BoolFlag(stop), syscall.SIGTERM, termHandler)
+	daemon.AddCommand(daemon.BoolFlag(nil), syscall.SIGHUP, reloadHandler)
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error loading configuration")
 	}
 
+	// Setup logger
+	var logWriter io.Writer = os.Stderr
+	if !cfg.Foreground {
+		switch cfg.Logging.Destination {
+		case "syslog":
+			writer, err := syslog.New(syslog.LOG_NOTICE, cfg.Logging.SyslogTag)
+			if err != nil {
+				log.Fatal().Err(err).Msg("Unable to set up syslog")
+			}
+			logWriter = writer
+		case "stdout":
+			logWriter = os.Stdout
+		default: // File
+			logWriter, err = os.OpenFile(cfg.Logging.Destination, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				log.Fatal().Err(err).Msg("Failed to open log file")
+			}
+		}
+		log.Logger = log.Output(logWriter)
+	} else {
+		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	}
+
+	if *debug || cfg.Logging.Level == "debug" {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	} else {
+		zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	}
+
+	// Initialize the reloader
+	reloader = config.NewReloader(*configPath, log.Logger)
+
+	// Daemonize if not in foreground
+	if !cfg.Foreground {
+		cntxt := &daemon.Context{
+			PidFileName: cfg.PIDFile,
+			PidFilePerm: 0644,
+		}
+
+		if len(daemon.ActiveFlags()) > 0 {
+			d, err := cntxt.Search()
+			if err != nil {
+				log.Fatal().Err(err).Msg("Unable to find daemon process")
+			}
+			if err := daemon.SendCommands(d); err != nil {
+				log.Error().Err(err).Msg("Failed to send command to daemon")
+			}
+			return
+		}
+
+		d, err := cntxt.Reborn()
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to daemonize")
+		}
+		if d != nil { // This is the parent process, exit
+			return
+		}
+		defer cntxt.Release() // This is the daemon process
+	}
+
+	log.Info().Msg("Starting CoovaChilli-Go...")
+	runApp(cfg, reloader)
+	log.Info().Msg("CoovaChilli-Go has shut down.")
+}
+
+// termHandler is the signal handler for the daemon.
+func termHandler(sig os.Signal) error {
+	log.Info().Msg("Termination signal received. Shutting down.")
+	return daemon.ErrStop
+}
+
+// reloadHandler is the signal handler for SIGHUP.
+func reloadHandler(sig os.Signal) error {
+	log.Info().Msg("SIGHUP signal received. Triggering configuration reload.")
+	if reloader != nil {
+		reloader.PerformReload()
+	} else {
+		log.Error().Msg("Reloader not initialized, cannot reload configuration.")
+	}
+	return nil
+}
+
+func runApp(cfg *config.Config, reloader *config.Reloader) {
+	// Initialize metrics recorder
+	var metricsRecorder metrics.Recorder
+	if cfg.Metrics.Enabled {
+		switch cfg.Metrics.Backend {
+		case "prometheus":
+			log.Info().Msg("Prometheus metrics enabled")
+			metricsRecorder = metrics.NewPrometheusRecorder()
+		default:
+			log.Warn().Str("backend", cfg.Metrics.Backend).Msg("Unknown metrics backend, defaulting to no-op")
+			metricsRecorder = metrics.NewNoopRecorder()
+		}
+	} else {
+		log.Info().Msg("Metrics are disabled")
+		metricsRecorder = metrics.NewNoopRecorder()
+	}
+
+	// Start metrics server if applicable
+	if handler := metricsRecorder.Handler(); handler != nil {
+		go func() {
+			log.Info().Str("addr", cfg.Metrics.Listen).Msg("Starting metrics server")
+			mux := stdhttp.NewServeMux()
+			mux.Handle("/metrics", handler)
+			if err := stdhttp.ListenAndServe(cfg.Metrics.Listen, mux); err != nil {
+				log.Error().Err(err).Msg("Metrics server failed")
+			}
+		}()
+	}
+
 	var peerManager *cluster.PeerManager
+	var err error
 	if cfg.Cluster.Enabled {
 		log.Info().Msg("Cluster mode enabled.")
 		peerManager, err = cluster.NewManager(cfg.Cluster, cfg.DHCPIf, cfg.UAMListen)
@@ -72,10 +191,44 @@ func main() {
 	}
 	defer fw.Cleanup()
 
+	ifce, err := tun.New(cfg, log.Logger)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Error creating TUN interface")
+	}
+
+	// Drop privileges if configured
+	if cfg.User != "" {
+		u, err := user.Lookup(cfg.User)
+		if err != nil {
+			log.Fatal().Err(err).Str("user", cfg.User).Msg("Failed to look up user")
+		}
+		uid, _ := strconv.Atoi(u.Uid)
+		gid, _ := strconv.Atoi(u.Gid)
+
+		if cfg.Group != "" {
+			g, err := user.LookupGroup(cfg.Group)
+			if err != nil {
+				log.Fatal().Err(err).Str("group", cfg.Group).Msg("Failed to look up group")
+			}
+			gid, _ = strconv.Atoi(g.Gid)
+		}
+
+		log.Info().Int("uid", uid).Int("gid", gid).Msg("Dropping privileges")
+		if err := syscall.Setgid(gid); err != nil {
+			log.Fatal().Err(err).Msg("Failed to set GID")
+		}
+		if err := syscall.Setuid(uid); err != nil {
+			log.Fatal().Err(err).Msg("Failed to set UID")
+		}
+	}
+
 	scriptRunner := script.NewRunner(log.Logger, cfg)
-	sessionManager := core.NewSessionManager()
+	sessionManager := core.NewSessionManager(cfg, metricsRecorder)
 	dnsProxy := dns.NewProxy(cfg, log.Logger)
-	eapolHandler := eapol.NewHandler(cfg, sessionManager, log.Logger)
+
+	// Register reconfigurable components
+	reloader.Register(fw)
+	reloader.Register(sessionManager)
 
 	if err := sessionManager.LoadSessions(cfg.StateFile); err != nil {
 		log.Error().Err(err).Msg("Failed to load sessions from state file")
@@ -91,40 +244,48 @@ func main() {
 	}
 
 	radiusReqChan := make(chan *core.Session)
-	radiusClient := radius.NewClient(cfg, log.Logger)
+	radiusClient := radius.NewClient(cfg, log.Logger, metricsRecorder)
 	disconnectManager := disconnect.NewManager(cfg, sessionManager, fw, radiusClient, scriptRunner, log.Logger)
 	reaper := core.NewReaper(cfg, sessionManager, disconnectManager, log.Logger)
+
+	// --- Network Handle and Interface Setup ---
+	dhcpIface, err := net.InterfaceByName(cfg.DHCPIf)
+	if err != nil {
+		log.Fatal().Err(err).Msgf("Failed to get interface %s", cfg.DHCPIf)
+	}
+
+	handle, err := pcap.OpenLive(cfg.DHCPIf, 65536, true, pcap.BlockForever)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to open pcap handle")
+	}
+	defer handle.Close()
+
+	// Combined filter for DHCP and EAPOL.
+	filter := fmt.Sprintf("(udp and (port 67 or 68 or 546 or 547)) or (ether proto 0x%X)", layers.EthernetTypeEAPOL)
+	if err := handle.SetBPFFilter(filter); err != nil {
+		log.Fatal().Err(err).Msg("Failed to set BPF filter")
+	}
+
+	eapolHandler := eapol.NewHandler(cfg, sessionManager, radiusClient, handle, *dhcpIface, log.Logger)
 
 	reaper.Start()
 	defer reaper.Stop()
 
-	_, err = dhcp.NewServer(cfg, sessionManager, radiusReqChan, eapolHandler, log.Logger)
+	_, err = dhcp.NewServer(cfg, sessionManager, radiusReqChan, eapolHandler, log.Logger, metricsRecorder, handle, dhcpIface)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error creating DHCP server")
 	}
 
-	httpServer := http.NewServer(cfg, sessionManager, radiusReqChan, disconnectManager, log.Logger)
+	httpServer := http.NewServer(cfg, sessionManager, radiusReqChan, disconnectManager, log.Logger, metricsRecorder)
 	go httpServer.Start()
-
-	ifce, err := tun.New(cfg, log.Logger)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Error creating TUN interface")
-	}
 
 	packetChan := make(chan []byte)
 	go tun.ReadPackets(ifce, packetChan, log.Logger)
 	go processPackets(ifce, packetChan, cfg, sessionManager, dnsProxy, fw, peerManager, log.Logger)
 
-	cmdChan := make(chan string)
-	cmdSockListener := cmdsock.NewListener(cfg.CmdSockPath, cmdChan, log.Logger)
-	go cmdSockListener.Start()
-
-	go func() {
-		for cmd := range cmdChan {
-			response := processCommand(cmd, log.Logger, sessionManager, disconnectManager)
-			log.Info().Str("command", cmd).Str("response", response).Msg("Processed command")
-		}
-	}()
+	// Start the admin API server
+	adminServer := admin.NewServer(cfg, sessionManager, disconnectManager, log.Logger)
+	go adminServer.Start()
 
 	coaReqChan := make(chan radius.CoAIncomingRequest)
 	go radiusClient.StartCoAListener(coaReqChan)
@@ -222,7 +383,7 @@ func main() {
 						s.AuthResult <- false
 						return
 					}
-					go radiusClient.SendAccountingRequest(s, 1, "Start")
+					go radiusClient.SendAccountingRequest(s, rfc2866.AcctStatusType(1)) // 1 = Start
 					scriptRunner.RunScript(cfg.ConUp, s, 0)
 					s.AuthResult <- true
 				} else {
@@ -320,46 +481,4 @@ func sendDNSResponse(ifce *water.Interface, reqPacket gopacket.Packet, respPaylo
 	_ = gopacket.SerializeLayers(buffer, opts, ipLayer, udpLayer, gopacket.Payload(respPayload))
 	_, err := ifce.Write(buffer.Bytes())
 	return err
-}
-
-func processCommand(command string, logger zerolog.Logger, sm *core.SessionManager, dm *disconnect.Manager) string {
-	parts := strings.Fields(command)
-	if len(parts) == 0 {
-		return "ERROR: Empty command"
-	}
-	switch parts[0] {
-	case "list":
-		var b strings.Builder
-		for _, s := range sm.GetAllSessions() {
-			b.WriteString(fmt.Sprintf("ip=%s mac=%s user=%s\n", s.HisIP, s.HisMAC, s.Redir.Username))
-		}
-		return b.String()
-	case "logout":
-		if len(parts) < 2 {
-			return "ERROR: Missing IP or MAC address for logout command"
-		}
-		identifier := parts[1]
-		var session *core.Session
-
-		ip := net.ParseIP(identifier)
-		if ip != nil {
-			if s, ok := sm.GetSessionByIP(ip); ok {
-				session = s
-			}
-		} else {
-			if mac, err := net.ParseMAC(identifier); err == nil {
-				if s, ok := sm.GetSessionByMAC(mac); ok {
-					session = s
-				}
-			}
-		}
-
-		if session == nil {
-			return fmt.Sprintf("ERROR: Session not found for identifier %s", identifier)
-		}
-
-		dm.Disconnect(session, "Admin-Reset")
-		return fmt.Sprintf("OK: Disconnected session for %s", identifier)
-	}
-	return "ERROR: Unknown command"
 }

@@ -7,6 +7,7 @@ import (
 
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
+	"coovachilli-go/pkg/metrics"
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
 	"github.com/insomniacslk/dhcp/dhcpv4"
@@ -54,7 +55,7 @@ func TestHandleRequest_Renewal_AuthFailure(t *testing.T) {
 	cfg := &config.Config{
 		Lease: 1 * time.Hour,
 	}
-	sm := core.NewSessionManager()
+	sm := core.NewSessionManager(cfg, nil)
 	radiusReqChan := make(chan *core.Session, 1)
 	logger := zerolog.Nop() // Disable logging for the test
 
@@ -68,6 +69,7 @@ func TestHandleRequest_Renewal_AuthFailure(t *testing.T) {
 		leasesV4:       make(map[string]*Lease),
 		poolV4:         pool,
 		logger:         logger,
+		recorder:       metrics.NewNoopRecorder(),
 	}
 
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:01")
@@ -79,7 +81,7 @@ func TestHandleRequest_Renewal_AuthFailure(t *testing.T) {
 		MAC:     clientMAC,
 		Expires: time.Now().Add(30 * time.Minute),
 	}
-	session := sm.CreateSession(clientIP, clientMAC, cfg)
+	session := sm.CreateSession(clientIP, clientMAC, 0)
 
 	// 2. Create a DHCPREQUEST packet for renewal
 	reqPacket, err := dhcpv4.New(
@@ -90,6 +92,11 @@ func TestHandleRequest_Renewal_AuthFailure(t *testing.T) {
 	require.NoError(t, err)
 	reqBytes := reqPacket.ToBytes()
 
+	// Create a dummy gopacket.Packet for the handler
+	buf := gopacket.NewSerializeBuffer()
+	gopacket.SerializeLayers(buf, gopacket.SerializeOptions{}, &layers.Ethernet{}, &layers.IPv4{}, &layers.UDP{}, gopacket.Payload(reqBytes))
+	packet := gopacket.NewPacket(buf.Bytes(), layers.LayerTypeEthernet, gopacket.Default)
+
 	// 3. Goroutine to simulate RADIUS failure
 	go func() {
 		s := <-radiusReqChan
@@ -98,7 +105,7 @@ func TestHandleRequest_Renewal_AuthFailure(t *testing.T) {
 	}()
 
 	// 4. Call the handler
-	respBytes, _, err := server.HandleDHCPv4(reqBytes)
+	respBytes, _, err := server.HandleDHCPv4(reqBytes, packet)
 	require.NoError(t, err)
 
 	// 5. Assert the response is a NAK

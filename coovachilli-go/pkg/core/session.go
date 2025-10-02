@@ -10,13 +10,14 @@ import (
 	"time"
 
 	"coovachilli-go/pkg/config"
+	"coovachilli-go/pkg/metrics"
 )
 
-var startTime = time.Now()
+var StartTime = time.Now()
 
 // MonotonicTime returns a uint32 representing the number of seconds since the process started.
 func MonotonicTime() uint32 {
-	return uint32(time.Since(startTime).Seconds())
+	return uint32(time.Since(StartTime).Seconds())
 }
 
 // Session holds the state for a single client session.
@@ -62,6 +63,8 @@ type Session struct {
 
 	// Token is a secure token for cookie-based auto-login.
 	Token string
+	// EapID is the last EAP identifier used in a request.
+	EapID uint8
 }
 
 // SessionParams holds RADIUS-provisioned session parameters.
@@ -99,15 +102,22 @@ type SessionManager struct {
 	sessionsByIPv6  map[string]*Session
 	sessionsByMAC   map[string]*Session
 	sessionsByToken map[string]*Session
+	recorder        metrics.Recorder
+	cfg             *config.Config
 }
 
 // NewSessionManager creates a new SessionManager.
-func NewSessionManager() *SessionManager {
+func NewSessionManager(cfg *config.Config, recorder metrics.Recorder) *SessionManager {
+	if recorder == nil {
+		recorder = metrics.NewNoopRecorder()
+	}
 	return &SessionManager{
 		sessionsByIPv4:  make(map[string]*Session),
 		sessionsByIPv6:  make(map[string]*Session),
 		sessionsByMAC:   make(map[string]*Session),
 		sessionsByToken: make(map[string]*Session),
+		recorder:        recorder,
+		cfg:             cfg,
 	}
 }
 
@@ -118,7 +128,7 @@ type StateData struct {
 }
 
 // CreateSession creates a new session for a client.
-func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID uint16, cfg *config.Config) *Session {
+func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID uint16) *Session {
 	sm.Lock()
 	defer sm.Unlock()
 
@@ -133,10 +143,10 @@ func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID 
 		StartTimeSec:        now,
 		LastActivityTimeSec: now,
 		SessionParams: SessionParams{
-			SessionTimeout:   cfg.DefSessionTimeout,
-			IdleTimeout:      cfg.DefIdleTimeout,
-			BandwidthMaxDown: cfg.DefBandwidthMaxDown,
-			BandwidthMaxUp:   cfg.DefBandwidthMaxUp,
+			SessionTimeout:   sm.cfg.DefSessionTimeout,
+			IdleTimeout:      sm.cfg.DefIdleTimeout,
+			BandwidthMaxDown: sm.cfg.DefBandwidthMaxDown,
+			BandwidthMaxUp:   sm.cfg.DefBandwidthMaxUp,
 		},
 	}
 
@@ -146,6 +156,8 @@ func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID 
 		sm.sessionsByIPv6[ip.String()] = session
 	}
 	sm.sessionsByMAC[mac.String()] = session
+
+	sm.recorder.IncGauge("chilli_sessions_active_total", nil)
 
 	return session
 }
@@ -234,6 +246,15 @@ func (sm *SessionManager) DeleteSession(session *Session) {
 	if session.Token != "" {
 		delete(sm.sessionsByToken, session.Token)
 	}
+	sm.recorder.DecGauge("chilli_sessions_active_total", nil)
+}
+
+// Reconfigure updates the configuration for the SessionManager.
+func (sm *SessionManager) Reconfigure(newConfig *config.Config) error {
+	sm.Lock()
+	defer sm.Unlock()
+	sm.cfg = newConfig
+	return nil
 }
 
 // GetAllSessions returns all active sessions.

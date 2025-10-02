@@ -58,9 +58,11 @@ func TestBlowfishEncryptionDecryption(t *testing.T) {
 }
 
 func TestInvalidKey(t *testing.T) {
-	key := []byte("short") // Invalid key size
+	// The blowfish cipher returns an error for invalid key sizes (must be 1-56 bytes).
+	// A key of size 0 should trigger an error.
+	key := []byte("")
 	_, err := Encrypt([]byte("test"), key)
-	assert.Error(t, err)
+	assert.Error(t, err, "Encrypt should return an error for a zero-length key")
 }
 
 func TestInvalidPadding(t *testing.T) {
@@ -71,22 +73,25 @@ func TestInvalidPadding(t *testing.T) {
 	assert.Error(t, err, "should fail due to invalid padding")
 }
 
-// newTestManager creates a PeerManager with a dummy interface for testing.
+// newTestManager creates a PeerManager with the loopback interface for testing.
 func newTestManager(t *testing.T, peerID int, initialState PeerState) *PeerManager {
-	iface := &net.Interface{
-		Index:        1,
-		MTU:          1500,
-		Name:         "test0",
-		HardwareAddr: net.HardwareAddr{0x00, 0x01, 0x02, 0x03, 0x04, byte(peerID)},
+	iface, err := net.InterfaceByName("lo")
+	require.NoError(t, err, "failed to get loopback interface 'lo'")
+
+	// Use a slightly modified MAC for each peer to ensure they are unique
+	mac := make(net.HardwareAddr, len(iface.HardwareAddr))
+	copy(mac, iface.HardwareAddr)
+	if len(mac) > 0 {
+		mac[len(mac)-1] = byte(peerID)
 	}
 
 	m := &PeerManager{
 		peers:      make(map[int]*Peer),
 		localID:    peerID,
-		localMAC:   iface.HardwareAddr,
+		localMAC:   mac,
 		localAddr:  net.ParseIP("192.168.10.1").To4(),
 		peerKey:    []byte("test-key"),
-		iface:      iface,
+		iface:      iface, // Temporarily set for MAC address, then nilled
 		currentState: initialState,
 	}
 
@@ -97,6 +102,9 @@ func newTestManager(t *testing.T, peerID int, initialState PeerState) *PeerManag
 		State:      m.currentState,
 		LastUpdate: time.Now(),
 	}
+
+	// Nil out the interface to prevent actual network calls during unit tests
+	m.iface = nil
 	return m
 }
 

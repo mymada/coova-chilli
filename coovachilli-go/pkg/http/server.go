@@ -11,6 +11,7 @@ import (
 
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
+	"coovachilli-go/pkg/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -61,16 +62,21 @@ type Server struct {
 	radiusReqChan  chan<- *core.Session
 	disconnecter   core.Disconnector
 	logger         zerolog.Logger
+	recorder       metrics.Recorder
 }
 
 // NewServer creates a new HTTP server.
-func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<- *core.Session, disconnecter core.Disconnector, logger zerolog.Logger) *Server {
+func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<- *core.Session, disconnecter core.Disconnector, logger zerolog.Logger, recorder metrics.Recorder) *Server {
+	if recorder == nil {
+		recorder = metrics.NewNoopRecorder()
+	}
 	return &Server{
 		cfg:            cfg,
 		sessionManager: sm,
 		radiusReqChan:  radiusReqChan,
 		disconnecter:   disconnecter,
 		logger:         logger.With().Str("component", "http").Logger(),
+		recorder:       recorder,
 	}
 }
 
@@ -154,9 +160,18 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	s.radiusReqChan <- session
 
+	now := time.Now()
+	labels := metrics.Labels{"type": "uam"} // UAM login
+	s.recorder.IncCounter("chilli_http_logins_total", labels)
+
 	select {
 	case authOK := <-session.AuthResult:
+		duration := time.Since(now).Seconds()
+		s.recorder.ObserveHistogram("chilli_http_login_duration_seconds", labels, duration)
 		if authOK {
+			labels["status"] = "success"
+			s.recorder.IncCounter("chilli_http_login_outcomes_total", labels)
+
 			token, err := generateSecureToken(32)
 			if err != nil {
 				s.logger.Error().Err(err).Msg("Failed to generate session token")
@@ -179,10 +194,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 			http.Redirect(w, r, "/status", http.StatusFound)
 		} else {
+			labels["status"] = "failure"
+			s.recorder.IncCounter("chilli_http_login_outcomes_total", labels)
 			w.WriteHeader(http.StatusUnauthorized)
 			fmt.Fprint(w, "<h1>Login Failed</h1><p>Invalid username or password.</p>")
 		}
 	case <-time.After(10 * time.Second):
+		duration := time.Since(now).Seconds()
+		s.recorder.ObserveHistogram("chilli_http_login_duration_seconds", labels, duration)
+		labels["status"] = "timeout"
+		s.recorder.IncCounter("chilli_http_login_outcomes_total", labels)
 		http.Error(w, "Login request timed out.", http.StatusGatewayTimeout)
 	}
 }
@@ -329,10 +350,20 @@ func (s *Server) handleApiLogin(w http.ResponseWriter, r *http.Request) {
 
 	s.radiusReqChan <- session
 
+	now := time.Now()
+	labels := metrics.Labels{"type": "api"}
+	s.recorder.IncCounter("chilli_http_logins_total", labels)
+
 	w.Header().Set("Content-Type", "application/json")
 	select {
 	case authOK := <-session.AuthResult:
+		duration := time.Since(now).Seconds()
+		s.recorder.ObserveHistogram("chilli_http_login_duration_seconds", labels, duration)
+
 		if authOK {
+			labels["status"] = "success"
+			s.recorder.IncCounter("chilli_http_login_outcomes_total", labels)
+
 			token, err := generateSecureToken(32)
 			if err != nil {
 				s.logger.Error().Err(err).Msg("Failed to generate session token")
@@ -355,10 +386,16 @@ func (s *Server) handleApiLogin(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprint(w, "{\"status\":\"success\"}")
 		} else {
+			labels["status"] = "failure"
+			s.recorder.IncCounter("chilli_http_login_outcomes_total", labels)
 			w.WriteHeader(http.StatusUnauthorized)
 			fmt.Fprint(w, "{\"error\":\"Invalid username or password\"}")
 		}
 	case <-time.After(10 * time.Second):
+		duration := time.Since(now).Seconds()
+		s.recorder.ObserveHistogram("chilli_http_login_duration_seconds", labels, duration)
+		labels["status"] = "timeout"
+		s.recorder.IncCounter("chilli_http_login_outcomes_total", labels)
 		w.WriteHeader(http.StatusGatewayTimeout)
 		fmt.Fprint(w, "{\"error\":\"Login request timed out\"}")
 	}

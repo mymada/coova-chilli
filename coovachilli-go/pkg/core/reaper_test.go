@@ -23,9 +23,9 @@ func (m *mockDisconnector) Disconnect(session *Session, reason string) {
 
 func TestReaper(t *testing.T) {
 	// Setup
-	sm := NewSessionManager()
-	mockDc := &mockDisconnector{}
 	cfg := &config.Config{} // Empty config is fine for this test
+	sm := NewSessionManager(cfg, nil)
+	mockDc := &mockDisconnector{}
 	logger := zerolog.Nop() // Disable logging output
 
 	reaper := NewReaper(cfg, sm, mockDc, logger)
@@ -33,7 +33,7 @@ func TestReaper(t *testing.T) {
 	// --- Test Case 1: Session expired by Session-Timeout ---
 	mac1, _ := net.ParseMAC("00:00:5e:00:53:01")
 	ip1 := net.ParseIP("10.0.0.1")
-	session1 := sm.CreateSession(ip1, mac1, 0, cfg)
+	session1 := sm.CreateSession(ip1, mac1, 0)
 	session1.Authenticated = true
 	session1.SessionParams.SessionTimeout = 100 // seconds
 	session1.StartTimeSec = MonotonicTime() - 101 // Started 101 seconds ago
@@ -42,7 +42,7 @@ func TestReaper(t *testing.T) {
 	// --- Test Case 2: Session expired by Idle-Timeout ---
 	mac2, _ := net.ParseMAC("00:00:5e:00:53:02")
 	ip2 := net.ParseIP("10.0.0.2")
-	session2 := sm.CreateSession(ip2, mac2, 0, cfg)
+	session2 := sm.CreateSession(ip2, mac2, 0)
 	session2.Authenticated = true
 	session2.SessionParams.IdleTimeout = 50 // seconds
 	session2.StartTimeSec = MonotonicTime() - 1000 // Started long ago
@@ -51,7 +51,7 @@ func TestReaper(t *testing.T) {
 	// --- Test Case 3: Active session, should not be reaped ---
 	mac3, _ := net.ParseMAC("00:00:5e:00:53:03")
 	ip3 := net.ParseIP("10.0.0.3")
-	session3 := sm.CreateSession(ip3, mac3, 0, cfg)
+	session3 := sm.CreateSession(ip3, mac3, 0)
 	session3.Authenticated = true
 	session3.SessionParams.SessionTimeout = 1000
 	session3.SessionParams.IdleTimeout = 500
@@ -61,7 +61,7 @@ func TestReaper(t *testing.T) {
 	// --- Test Case 4: Unauthenticated session, should not be reaped ---
 	mac4, _ := net.ParseMAC("00:00:5e:00:53:04")
 	ip4 := net.ParseIP("10.0.0.4")
-	_ = sm.CreateSession(ip4, mac4, 0, cfg) // Not authenticated
+	_ = sm.CreateSession(ip4, mac4, 0) // Not authenticated
 
 	// Execute the reap function directly
 	reaper.reapSessions()
