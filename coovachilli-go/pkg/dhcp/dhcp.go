@@ -13,11 +13,8 @@ import (
 	"coovachilli-go/pkg/metrics"
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
-	"github.com/gopacket/gopacket/pcap"
-	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv6"
 	"github.com/insomniacslk/dhcp/iana"
-	"github.com/gopacket/gopacket/pcap"
 	"github.com/rs/zerolog"
 )
 
@@ -31,7 +28,7 @@ type Server struct {
 	recorder       metrics.Recorder
 	leasesV4       map[string]*Lease
 	poolV4         *Pool
-	leasesV6       map[string]*Lease // Using the same Lease struct for v6 for now
+	leasesV6       map[string]*Lease
 	poolV6         *Pool
 	handle         *pcap.Handle
 	ifaceMAC       net.HardwareAddr
