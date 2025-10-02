@@ -17,12 +17,18 @@ import (
 	"layeh.com/radius"
 	"layeh.com/radius/rfc2865"
 	"layeh.com/radius/rfc2866"
+	"layeh.com/radius/rfc2869"
 	"layeh.com/radius/rfc3162"
 )
 
 // AccountingSender defines the interface for sending RADIUS accounting packets.
 type AccountingSender interface {
 	SendAccountingRequest(session *core.Session, statusType rfc2866.AcctStatusType) (*radius.Packet, error)
+}
+
+// EAPOLAuthenticator defines the interface for handling EAP authentication via RADIUS.
+type EAPOLAuthenticator interface {
+	SendEAPAccessRequest(session *core.Session, eapPayload []byte, state []byte) (*radius.Packet, error)
 }
 
 // CoAIncomingRequest holds a parsed CoA/Disconnect packet and the sender's address.
@@ -271,6 +277,32 @@ func (c *Client) SendAccountingRequest(session *core.Session, statusType rfc2866
 	}
 
 	c.logger.Debug().Str("code", response.Code.String()).Str("user", session.Redir.Username).Msg("Received RADIUS accounting response")
+	return response, nil
+}
+
+// SendEAPAccessRequest sends a RADIUS Access-Request with an EAP payload.
+func (c *Client) SendEAPAccessRequest(session *core.Session, eapPayload []byte, state []byte) (*radius.Packet, error) {
+	packet := radius.New(radius.CodeAccessRequest, []byte(c.cfg.RadiusSecret))
+
+	// Add standard attributes
+	rfc2865.UserName_SetString(packet, session.Redir.Username)
+	rfc2865.NASIdentifier_SetString(packet, c.cfg.RadiusNASID)
+	rfc2865.NASIPAddress_Set(packet, c.cfg.RadiusListen)
+	rfc2865.CallingStationID_SetString(packet, session.HisMAC.String())
+
+	// Add EAP and State attributes
+	rfc2869.EAPMessage_Set(packet, eapPayload)
+	if len(state) > 0 {
+		rfc2865.State_Set(packet, state)
+	}
+
+	// Send the packet
+	response, err := c.exchangeWithFailover(packet, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send RADIUS EAP Access-Request: %w", err)
+	}
+
+	c.logger.Debug().Str("code", response.Code.String()).Str("user", session.Redir.Username).Msg("Received RADIUS EAP response")
 	return response, nil
 }
 

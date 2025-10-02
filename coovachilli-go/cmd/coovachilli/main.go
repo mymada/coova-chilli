@@ -225,7 +225,6 @@ func runApp(cfg *config.Config, reloader *config.Reloader) {
 	scriptRunner := script.NewRunner(log.Logger, cfg)
 	sessionManager := core.NewSessionManager(cfg, metricsRecorder)
 	dnsProxy := dns.NewProxy(cfg, log.Logger)
-	eapolHandler := eapol.NewHandler(cfg, sessionManager, log.Logger)
 
 	// Register reconfigurable components
 	reloader.Register(fw)
@@ -249,10 +248,30 @@ func runApp(cfg *config.Config, reloader *config.Reloader) {
 	disconnectManager := disconnect.NewManager(cfg, sessionManager, fw, radiusClient, scriptRunner, log.Logger)
 	reaper := core.NewReaper(cfg, sessionManager, disconnectManager, log.Logger)
 
+	// --- Network Handle and Interface Setup ---
+	dhcpIface, err := net.InterfaceByName(cfg.DHCPIf)
+	if err != nil {
+		log.Fatal().Err(err).Msgf("Failed to get interface %s", cfg.DHCPIf)
+	}
+
+	handle, err := pcap.OpenLive(cfg.DHCPIf, 65536, true, pcap.BlockForever)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to open pcap handle")
+	}
+	defer handle.Close()
+
+	// Combined filter for DHCP and EAPOL.
+	filter := fmt.Sprintf("(udp and (port 67 or 68 or 546 or 547)) or (ether proto 0x%X)", layers.EthernetTypeEAPOL)
+	if err := handle.SetBPFFilter(filter); err != nil {
+		log.Fatal().Err(err).Msg("Failed to set BPF filter")
+	}
+
+	eapolHandler := eapol.NewHandler(cfg, sessionManager, radiusClient, handle, *dhcpIface, log.Logger)
+
 	reaper.Start()
 	defer reaper.Stop()
 
-	_, err = dhcp.NewServer(cfg, sessionManager, radiusReqChan, eapolHandler, log.Logger, metricsRecorder)
+	_, err = dhcp.NewServer(cfg, sessionManager, radiusReqChan, eapolHandler, log.Logger, metricsRecorder, handle, dhcpIface)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error creating DHCP server")
 	}

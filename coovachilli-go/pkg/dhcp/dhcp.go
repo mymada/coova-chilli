@@ -17,6 +17,7 @@ import (
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv6"
 	"github.com/insomniacslk/dhcp/iana"
+	"github.com/gopacket/gopacket/pcap"
 	"github.com/rs/zerolog"
 )
 
@@ -54,7 +55,7 @@ type Pool struct {
 }
 
 // NewServer creates a new DHCP server and starts listening for packets.
-func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<- *core.Session, eapolHandler *eapol.Handler, logger zerolog.Logger, recorder metrics.Recorder) (*Server, error) {
+func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<- *core.Session, eapolHandler *eapol.Handler, logger zerolog.Logger, recorder metrics.Recorder, handle *pcap.Handle, iface *net.Interface) (*Server, error) {
 	var poolV4 *Pool
 	var poolV6 *Pool
 	var err error
@@ -73,11 +74,6 @@ func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<-
 		}
 	}
 
-	iface, err := net.InterfaceByName(cfg.DHCPIf)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get interface %s: %w", cfg.DHCPIf, err)
-	}
-
 	addrs, err := iface.Addrs()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get addresses for interface %s: %w", cfg.DHCPIf, err)
@@ -91,16 +87,6 @@ func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<-
 	}
 	if ifaceIPv6 == nil {
 		logger.Warn().Str("interface", cfg.DHCPIf).Msg("Could not find link-local IPv6 address, DHCPv6 will be disabled.")
-	}
-
-	handle, err := pcap.OpenLive(cfg.DHCPIf, 65536, true, pcap.BlockForever)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open pcap handle: %w", err)
-	}
-
-	filter := "udp and (port 67 or 68 or 546 or 547)"
-	if err := handle.SetBPFFilter(filter); err != nil {
-		return nil, fmt.Errorf("failed to set BPF filter: %w", err)
 	}
 
 	if recorder == nil {
