@@ -1,9 +1,11 @@
 package eapol
 
 import (
+	"bytes"
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
 	"coovachilli-go/pkg/radius"
+	"crypto/rand"
 	"fmt"
 	"net"
 
@@ -16,6 +18,8 @@ import (
 	"layeh.com/radius/rfc2869"
 )
 
+const EAPOLTypeKey layers.EAPOLType = 3
+
 type EAPOLSender interface {
 	SendEAPOL(dstMAC net.HardwareAddr, eapolPayload []byte) error
 }
@@ -26,6 +30,7 @@ type Handler struct {
 	radiusClient radius.EAPOLAuthenticator
 	sender       EAPOLSender
 	logger       zerolog.Logger
+	ifaceMAC     net.HardwareAddr
 }
 
 type pcapSender struct {
@@ -40,7 +45,7 @@ func (s *pcapSender) SendEAPOL(dstMAC net.HardwareAddr, eapolPayload []byte) err
 		EthernetType: layers.EthernetTypeEAPOL,
 	}
 	buf := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{}
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
 	if err := gopacket.SerializeLayers(buf, opts, ethLayer, gopacket.Payload(eapolPayload)); err != nil {
 		return fmt.Errorf("failed to serialize EAPOL response: %w", err)
 	}
@@ -55,6 +60,7 @@ func NewHandler(cfg *config.Config, sm *core.SessionManager, rc radius.EAPOLAuth
 		radiusClient: rc,
 		sender:       sender,
 		logger:       logger.With().Str("component", "eapol").Logger(),
+		ifaceMAC:     iface.HardwareAddr,
 	}
 }
 
@@ -78,41 +84,45 @@ func (h *Handler) HandlePacket(packet gopacket.Packet) {
 
 	switch eapol.Type {
 	case layers.EAPOLTypeStart:
-		h.logger.Info().Str("mac", eth.SrcMAC.String()).Msg("Received EAPOL-Start, sending EAP-Request/Identity")
+		h.logger.Debug().Str("mac", eth.SrcMAC.String()).Msg("Received EAPOL-Start")
 		h.sendEAPRequestIdentity(session)
 	case layers.EAPOLTypeEAP:
-		h.handleEAP(session, eapol.LayerPayload())
+		h.handleEAP(session, packet)
+	case EAPOLTypeKey:
+		h.logger.Debug().Str("mac", eth.SrcMAC.String()).Msg("Received EAPOL-Key")
+		h.handleEAPOLKey(session, eth.SrcMAC, eapolLayer.LayerContents())
 	}
 }
 
 func (h *Handler) sendEAPRequestIdentity(session *core.Session) {
 	session.Lock()
-	session.EapID++
-	currentID := session.EapID
+	session.EAPOL.EapID++
+	currentID := session.EAPOL.EapID
 	session.Unlock()
-	eapReq := &layers.EAP{Code: layers.EAPCodeRequest, Id: currentID, Type: layers.EAPTypeIdentity, Length: 5}
+
+	eapReq := &layers.EAP{Code: layers.EAPCodeRequest, Id: currentID, Type: layers.EAPTypeIdentity}
 	h.sendEAP(session.HisMAC, eapReq)
 }
 
-func (h *Handler) handleEAP(session *core.Session, eapPayload []byte) {
-	eap, err := parseEAP(eapPayload)
-	if err != nil {
-		h.logger.Error().Err(err).Msg("Failed to parse EAP payload")
+func (h *Handler) handleEAP(session *core.Session, packet gopacket.Packet) {
+	eapLayer := packet.Layer(layers.LayerTypeEAP)
+	if eapLayer == nil {
 		return
 	}
+	eap, _ := eapLayer.(*layers.EAP)
+	eapPayload := eapLayer.LayerContents()
 
 	session.Lock()
-	session.EapID = eap.Id // Store the ID of the client's response
+	session.EAPOL.EapID = eap.Id
 	if eap.Type == layers.EAPTypeIdentity {
-		username := string(eap.TypeData)
+		username := string(bytes.TrimRight(eap.TypeData, "\x00"))
 		session.Redir.Username = username
-		h.logger.Info().Str("mac", session.HisMAC.String()).Str("user", username).Msg("Received EAP-Response/Identity")
 	}
 	session.Unlock()
 
-	radiusResp, err := h.radiusClient.SendEAPAccessRequest(session, eapPayload, session.SessionParams.State)
+	radiusResp, requestAuthenticator, err := h.radiusClient.SendEAPAccessRequest(session, eapPayload, session.SessionParams.State)
 	if err != nil {
-		h.logger.Error().Err(err).Msg("Failed to send EAP Access-Request to RADIUS server")
+		h.logger.Error().Err(err).Msg("Failed to send EAP Access-Request")
 		return
 	}
 
@@ -120,7 +130,7 @@ func (h *Handler) handleEAP(session *core.Session, eapPayload []byte) {
 	case layehradius.CodeAccessChallenge:
 		h.handleRadiusChallenge(session, radiusResp)
 	case layehradius.CodeAccessAccept:
-		h.handleRadiusAccept(session, radiusResp)
+		h.handleRadiusAccept(session, radiusResp, requestAuthenticator)
 	case layehradius.CodeAccessReject:
 		h.handleRadiusReject(session, radiusResp)
 	}
@@ -129,70 +139,205 @@ func (h *Handler) handleEAP(session *core.Session, eapPayload []byte) {
 func (h *Handler) handleRadiusChallenge(session *core.Session, radiusResp *layehradius.Packet) {
 	eapPayload := rfc2869.EAPMessage_Get(radiusResp)
 	if eapPayload == nil {
-		h.logger.Warn().Msg("RADIUS Access-Challenge missing EAP-Message")
 		return
 	}
-	state := rfc2865.State_Get(radiusResp)
-	if state != nil {
+	if state := rfc2865.State_Get(radiusResp); state != nil {
 		session.Lock()
 		session.SessionParams.State = state
 		session.Unlock()
 	}
-	h.logger.Debug().Str("mac", session.HisMAC.String()).Msg("Relaying RADIUS Access-Challenge to client")
 	h.sendEAPPayload(session.HisMAC, eapPayload)
 }
 
-func (h *Handler) handleRadiusAccept(session *core.Session, radiusResp *layehradius.Packet) {
+func (h *Handler) handleRadiusAccept(session *core.Session, radiusResp *layehradius.Packet, requestAuthenticator []byte) {
 	session.Lock()
 	session.Authenticated = true
+
+	var pmk []byte
+	if encryptedKey := radius.GetMSMPPERecvKey(radiusResp); encryptedKey != nil {
+		decryptedKey, err := decryptMSMPPEKey([]byte(h.cfg.RadiusSecret), requestAuthenticator, encryptedKey)
+		if err == nil {
+			pmk = decryptedKey
+		} else {
+			h.logger.Error().Err(err).Msg("Failed to decrypt MS-MPPE-Recv-Key")
+		}
+	}
+	if pmk != nil {
+		session.EAPOL.PMK = pmk
+	}
 	session.Unlock()
 
-	eapPayload := rfc2869.EAPMessage_Get(radiusResp)
-	if eapPayload == nil {
-		h.logger.Error().Msg("RADIUS Access-Accept missing EAP-Message, sending generic EAP-Success")
-		eapSuccess := &layers.EAP{Code: layers.EAPCodeSuccess, Id: session.EapID, Length: 4}
-		h.sendEAP(session.HisMAC, eapSuccess)
-		return
+	if eapPayload := rfc2869.EAPMessage_Get(radiusResp); eapPayload != nil {
+		h.sendEAPPayload(session.HisMAC, eapPayload)
+	} else {
+		h.sendEAP(session.HisMAC, &layers.EAP{Code: layers.EAPCodeSuccess, Id: session.EAPOL.EapID})
 	}
-	h.logger.Info().Str("mac", session.HisMAC.String()).Msg("EAP authentication successful, relaying EAP-Success")
-	h.sendEAPPayload(session.HisMAC, eapPayload)
+
+	if pmk != nil {
+		h.startHandshake(session)
+	}
 }
 
 func (h *Handler) handleRadiusReject(session *core.Session, radiusResp *layehradius.Packet) {
-	eapPayload := rfc2869.EAPMessage_Get(radiusResp)
-	if eapPayload == nil {
-		h.logger.Error().Msg("RADIUS Access-Reject missing EAP-Message, sending generic EAP-Failure")
-		eapFailure := &layers.EAP{Code: layers.EAPCodeFailure, Id: session.EapID, Length: 4}
-		h.sendEAP(session.HisMAC, eapFailure)
-	} else {
-		h.logger.Info().Str("mac", session.HisMAC.String()).Msg("EAP authentication failed, relaying EAP-Failure")
+	if eapPayload := rfc2869.EAPMessage_Get(radiusResp); eapPayload != nil {
 		h.sendEAPPayload(session.HisMAC, eapPayload)
+	} else {
+		h.sendEAP(session.HisMAC, &layers.EAP{Code: layers.EAPCodeFailure, Id: session.EAPOL.EapID})
 	}
 	h.sm.DeleteSession(session)
 }
 
-func (h *Handler) sendEAP(dstMAC net.HardwareAddr, eap gopacket.SerializableLayer) {
+func (h *Handler) startHandshake(session *core.Session) {
+	session.Lock()
+	defer session.Unlock()
+
+	aNonce := make([]byte, 32)
+	rand.Read(aNonce)
+	session.EAPOL.ANonce = aNonce
+	session.EAPOL.ReplayCounter++
+
+	key := &layers.EAPOLKey{
+		KeyDescriptorType:    layers.EAPOLKeyDescriptorTypeWPA,
+		KeyDescriptorVersion: layers.EAPOLKeyDescriptorVersionAESHMACSHA1,
+		KeyType:              layers.EAPOLKeyTypePairwise,
+		Nonce:                aNonce,
+		ReplayCounter:        session.EAPOL.ReplayCounter,
+	}
+	h.sendEAPOLKey(session.HisMAC, key)
+	session.EAPOL.HandshakeState = HandshakeStateSentMsg1
+}
+
+const (
+	HandshakeStateNone     = ""
+	HandshakeStateSentMsg1 = "SENT_MSG1"
+	HandshakeStateSentMsg3 = "SENT_MSG3"
+	HandshakeStateComplete = "COMPLETE"
+)
+
+func (h *Handler) handleEAPOLKey(session *core.Session, clientMAC net.HardwareAddr, eapolFrame []byte) {
+	key, err := parseEAPOLKey(eapolFrame[4:])
+	if err != nil {
+		h.logger.Warn().Err(err).Msg("Failed to parse EAPOL-Key frame")
+		return
+	}
+
+	session.Lock()
+	defer session.Unlock()
+
+	if key.ReplayCounter < session.EAPOL.ReplayCounter {
+		h.logger.Warn().Msg("Replay counter check failed")
+		return
+	}
+
+	switch session.EAPOL.HandshakeState {
+	case HandshakeStateSentMsg1: // Received Message 2
+		session.EAPOL.SNonce = key.Nonce
+		ptk := ptkDerivation(session.EAPOL.PMK, session.EAPOL.ANonce, session.EAPOL.SNonce, h.ifaceMAC, clientMAC)
+		kck := ptk[0:16]
+
+		if valid, _ := verifyMIC(kck, eapolFrame); !valid {
+			h.logger.Warn().Str("mac", clientMAC.String()).Msg("Handshake Message 2 MIC verification failed")
+			return
+		}
+
+		session.EAPOL.PTK = ptk
+		session.EAPOL.ReplayCounter = key.ReplayCounter
+
+		msg3 := &layers.EAPOLKey{
+			KeyDescriptorType:    layers.EAPOLKeyDescriptorTypeWPA,
+			KeyDescriptorVersion: layers.EAPOLKeyDescriptorVersionAESHMACSHA1,
+			KeyType:              layers.EAPOLKeyTypePairwise,
+			KeyMIC:               true,
+			Secure:               true,
+			Install:              true,
+			Nonce:                session.EAPOL.ANonce,
+			ReplayCounter:        session.EAPOL.ReplayCounter,
+		}
+
+		mic, err := h.calculateEAPOLKeyMIC(kck, msg3)
+		if err != nil {
+			h.logger.Error().Err(err).Msg("Failed to calculate MIC for Message 3")
+			return
+		}
+		msg3.MIC = mic
+
+		h.sendEAPOLKey(clientMAC, msg3)
+		session.EAPOL.HandshakeState = HandshakeStateSentMsg3
+
+	case HandshakeStateSentMsg3: // Received Message 4
+		kck := session.EAPOL.PTK[0:16]
+		if valid, _ := verifyMIC(kck, eapolFrame); !valid {
+			h.logger.Warn().Str("mac", clientMAC.String()).Msg("Handshake Message 4 MIC verification failed")
+			return
+		}
+		h.logger.Info().Str("mac", clientMAC.String()).Msg("4-way handshake complete")
+		session.EAPOL.HandshakeState = HandshakeStateComplete
+	}
+}
+
+func (h *Handler) calculateEAPOLKeyMIC(kck []byte, key *layers.EAPOLKey) ([]byte, error) {
+	tempKey := *key
+	tempKey.MIC = make([]byte, 16)
+
+	eapol := &layers.EAPOL{Version: 1, Type: EAPOLTypeKey}
 	buf := gopacket.NewSerializeBuffer()
-	gopacket.SerializeLayers(buf, gopacket.SerializeOptions{}, eap)
-	h.sendEAPPayload(dstMAC, buf.Bytes())
+	opts := gopacket.SerializeOptions{FixLengths: true}
+	err := gopacket.SerializeLayers(buf, opts, eapol, &tempKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize EAPOL-Key for MIC calc: %w", err)
+	}
+	return calculateMIC(kck, buf.Bytes()), nil
+}
+
+func (h *Handler) sendEAPOLKey(dstMAC net.HardwareAddr, key *layers.EAPOLKey) {
+	eapol := &layers.EAPOL{Version: 1, Type: EAPOLTypeKey}
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	err := gopacket.SerializeLayers(buf, opts, eapol, key)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("Failed to serialize EAPOL-Key")
+		return
+	}
+	if err := h.sender.SendEAPOL(dstMAC, buf.Bytes()); err != nil {
+		h.logger.Error().Err(err).Msg("Failed to send EAPOL-Key")
+	}
+}
+
+func (h *Handler) sendEAP(dstMAC net.HardwareAddr, eap *layers.EAP) {
+	eapol := &layers.EAPOL{Version: 1, Type: layers.EAPOLTypeEAP}
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	err := gopacket.SerializeLayers(buf, opts, eapol, eap)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("Failed to serialize EAP")
+		return
+	}
+	if err := h.sender.SendEAPOL(dstMAC, buf.Bytes()); err != nil {
+		h.logger.Error().Err(err).Msg("Failed to send EAP")
+	}
 }
 
 func (h *Handler) sendEAPPayload(dstMAC net.HardwareAddr, eapPayload []byte) {
-	eapol := &layers.EAPOL{Version: 2, Type: layers.EAPOLTypeEAP, Length: uint16(len(eapPayload))}
+	eapol := &layers.EAPOL{Version: 1, Type: layers.EAPOLTypeEAP}
 	buf := gopacket.NewSerializeBuffer()
-	gopacket.SerializeLayers(buf, gopacket.SerializeOptions{}, eapol, gopacket.Payload(eapPayload))
-	h.sender.SendEAPOL(dstMAC, buf.Bytes())
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	err := gopacket.SerializeLayers(buf, opts, eapol, gopacket.Payload(eapPayload))
+	if err != nil {
+		h.logger.Error().Err(err).Msg("Failed to serialize EAP payload")
+		return
+	}
+	if err := h.sender.SendEAPOL(dstMAC, buf.Bytes()); err != nil {
+		h.logger.Error().Err(err).Msg("Failed to send EAP payload")
+	}
 }
 
-// parseEAP uses gopacket to robustly decode an EAP layer from a byte slice.
-func parseEAP(data []byte) (*layers.EAP, error) {
-	packet := gopacket.NewPacket(data, layers.LayerTypeEAP, gopacket.Default)
-	if err := packet.ErrorLayer(); err != nil {
+func parseEAPOLKey(data []byte) (*layers.EAPOLKey, error) {
+	p := gopacket.NewPacket(data, layers.LayerTypeEAPOLKey, gopacket.Default)
+	if err := p.ErrorLayer(); err != nil {
 		return nil, err.Error()
 	}
-	eapLayer := packet.Layer(layers.LayerTypeEAP)
-	if eapLayer == nil {
-		return nil, fmt.Errorf("packet does not contain an EAP layer")
+	if keyLayer := p.Layer(layers.LayerTypeEAPOLKey); keyLayer != nil {
+		return keyLayer.(*layers.EAPOLKey), nil
 	}
-	return eapLayer.(*layers.EAP), nil
+	return nil, fmt.Errorf("packet does not contain an EAPOL-Key layer")
 }

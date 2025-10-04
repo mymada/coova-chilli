@@ -20,6 +20,17 @@ func MonotonicTime() uint32 {
 	return uint32(time.Since(StartTime).Seconds())
 }
 
+// EAPOLState holds state related to the 802.1X/EAPOL process.
+type EAPOLState struct {
+	HandshakeState string `json:"-"` // Not for persistence
+	PMK            []byte `json:"-"` // Pairwise Master Key, not for persistence
+	PTK            []byte `json:"-"` // Pairwise Transient Key, not for persistence
+	ANonce         []byte `json:"-"` // Authenticator Nonce, not for persistence
+	SNonce         []byte `json:"-"` // Supplicant Nonce, not for persistence
+	EapID          uint8  `json:"-"` // Last EAP identifier used
+	ReplayCounter  uint64 `json:"-"` // EAPOL-Key Replay Counter
+}
+
 // Session holds the state for a single client session.
 type Session struct {
 	sync.RWMutex
@@ -63,8 +74,9 @@ type Session struct {
 
 	// Token is a secure token for cookie-based auto-login.
 	Token string
-	// EapID is the last EAP identifier used in a request.
-	EapID uint8
+
+	// EAPOL state
+	EAPOL EAPOLState
 }
 
 // SessionParams holds RADIUS-provisioned session parameters.

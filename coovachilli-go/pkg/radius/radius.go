@@ -28,7 +28,7 @@ type AccountingSender interface {
 
 // EAPOLAuthenticator defines the interface for handling EAP authentication via RADIUS.
 type EAPOLAuthenticator interface {
-	SendEAPAccessRequest(session *core.Session, eapPayload []byte, state []byte) (*radius.Packet, error)
+	SendEAPAccessRequest(session *core.Session, eapPayload []byte, state []byte) (*radius.Packet, []byte, error)
 }
 
 // CoAIncomingRequest holds a parsed CoA/Disconnect packet and the sender's address.
@@ -281,7 +281,8 @@ func (c *Client) SendAccountingRequest(session *core.Session, statusType rfc2866
 }
 
 // SendEAPAccessRequest sends a RADIUS Access-Request with an EAP payload.
-func (c *Client) SendEAPAccessRequest(session *core.Session, eapPayload []byte, state []byte) (*radius.Packet, error) {
+// It returns the response packet, the original request's authenticator, and any error.
+func (c *Client) SendEAPAccessRequest(session *core.Session, eapPayload []byte, state []byte) (*radius.Packet, []byte, error) {
 	packet := radius.New(radius.CodeAccessRequest, []byte(c.cfg.RadiusSecret))
 
 	// Add standard attributes
@@ -296,14 +297,75 @@ func (c *Client) SendEAPAccessRequest(session *core.Session, eapPayload []byte, 
 		rfc2865.State_Set(packet, state)
 	}
 
+	// Store the authenticator before sending, as it's needed for key decryption
+	requestAuthenticator := make([]byte, 16)
+	copy(requestAuthenticator, packet.Authenticator[:])
+
 	// Send the packet
 	response, err := c.exchangeWithFailover(packet, true)
 	if err != nil {
-		return nil, fmt.Errorf("failed to send RADIUS EAP Access-Request: %w", err)
+		return nil, nil, fmt.Errorf("failed to send RADIUS EAP Access-Request: %w", err)
 	}
 
 	c.logger.Debug().Str("code", response.Code.String()).Str("user", session.Redir.Username).Msg("Received RADIUS EAP response")
-	return response, nil
+	return response, requestAuthenticator, nil
+}
+
+// Vendor-specific attribute constants for Microsoft
+const (
+	msVendorID      = 311
+	msMPPERecvKeyID = 17
+)
+
+// GetMSMPPERecvKey extracts the MS-MPPE-Recv-Key from a RADIUS packet.
+// This key is often used to carry the Pairwise Master Key (PMK) in 802.1X authentications.
+func GetMSMPPERecvKey(p *radius.Packet) []byte {
+	for _, avp := range p.Attributes {
+		if avp.Type != rfc2865.VendorSpecific_Type {
+			continue
+		}
+
+		vendorID, value, err := radius.VendorSpecific(avp.Attribute)
+		if err != nil || vendorID != msVendorID {
+			continue
+		}
+
+		// The 'value' is the payload of the VSA, which contains sub-attributes.
+		subAttrs := radius.Bytes(value)
+		for len(subAttrs) >= 2 {
+			subAttrType := subAttrs[0]
+			subAttrLen := int(subAttrs[1])
+			if subAttrLen < 2 || subAttrLen > len(subAttrs) {
+				break // Malformed sub-attribute
+			}
+			if subAttrType == msMPPERecvKeyID {
+				// The key is the value part of the sub-attribute.
+				return subAttrs[2:subAttrLen]
+			}
+			subAttrs = subAttrs[subAttrLen:]
+		}
+	}
+	return nil
+}
+
+// SetMSMPPERecvKey adds the MS-MPPE-Recv-Key to a RADIUS packet.
+// This is primarily used for testing.
+func SetMSMPPERecvKey(p *radius.Packet, key []byte) {
+	// Sub-attribute format: Type (1) + Length (1) + Value
+	subAttrPayload := make([]byte, 2+len(key))
+	subAttrPayload[0] = msMPPERecvKeyID
+	subAttrPayload[1] = byte(len(subAttrPayload))
+	copy(subAttrPayload[2:], key)
+
+	// NewVendorSpecific wraps the payload with the Vendor ID.
+	vsa, err := radius.NewVendorSpecific(msVendorID, radius.Attribute(subAttrPayload))
+	if err != nil {
+		// For a test helper, panicking is acceptable if something goes wrong.
+		panic(err)
+	}
+
+	// Add the VSA to the packet's attributes.
+	p.Add(rfc2865.VendorSpecific_Type, vsa)
 }
 
 // StartCoAListener starts listeners for incoming CoA and Disconnect requests.

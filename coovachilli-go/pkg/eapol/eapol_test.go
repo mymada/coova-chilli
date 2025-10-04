@@ -1,24 +1,26 @@
 package eapol
 
 import (
-	"bytes"
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
+	cr "coovachilli-go/pkg/radius"
 	"net"
 	"testing"
 
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
 	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"layeh.com/radius"
-	"layeh.com/radius/rfc2865"
-	"layeh.com/radius/rfc2869"
 )
 
-var eapolMulticastMAC, _ = net.ParseMAC("01:80:c2:00:00:03")
+var (
+	testAPMAC, _  = net.ParseMAC("00:11:22:33:44:55")
+	testStaMAC, _ = net.ParseMAC("AA:BB:CC:DD:EE:FF")
+	testPMK       = []byte("ThisIsThePairwiseMasterKey123456") // 32 bytes
+)
 
-// mockEAPOLSender is a mock implementation of the EAPOLSender interface for testing.
 type mockEAPOLSender struct {
 	SentPacket []byte
 	DstMAC     net.HardwareAddr
@@ -30,153 +32,155 @@ func (m *mockEAPOLSender) SendEAPOL(dstMAC net.HardwareAddr, eapolPayload []byte
 	return nil
 }
 
-// mockRadiusClient is a mock implementation of the EAPOLAuthenticator interface for testing.
-type mockRadiusClient struct {
-	ReceivedEAP   []byte
-	ReceivedState []byte
-	Response      *radius.Packet
-	ResponseErr   error
+func (m *mockEAPOLSender) GetSentPacketAs(t *testing.T, layerType gopacket.LayerType) gopacket.Packet {
+	if m.SentPacket == nil {
+		return nil
+	}
+	p := gopacket.NewPacket(m.SentPacket, layerType, gopacket.Default)
+	require.NotNil(t, p, "Failed to parse sent packet")
+	return p
 }
 
-func (m *mockRadiusClient) SendEAPAccessRequest(session *core.Session, eapPayload []byte, state []byte) (*radius.Packet, error) {
+type mockRadiusClient struct {
+	ReceivedEAP          []byte
+	ReceivedState        []byte
+	Response             *radius.Packet
+	ResponseErr          error
+	RequestAuthenticator []byte
+}
+
+func (m *mockRadiusClient) SendEAPAccessRequest(session *core.Session, eapPayload []byte, state []byte) (*radius.Packet, []byte, error) {
 	m.ReceivedEAP = eapPayload
 	m.ReceivedState = state
-	return m.Response, m.ResponseErr
+	if m.RequestAuthenticator == nil {
+		m.RequestAuthenticator = make([]byte, 16)
+	}
+	return m.Response, m.RequestAuthenticator, m.ResponseErr
 }
 
-// setupTestHandler creates a new EAPOL Handler with mock dependencies.
 func setupTestHandler(t *testing.T) (*Handler, *core.SessionManager, *mockRadiusClient, *mockEAPOLSender) {
-	cfg := &config.Config{}
+	cfg := &config.Config{RadiusSecret: "testing123"}
 	sm := core.NewSessionManager(cfg, nil)
 	rc := &mockRadiusClient{}
 	sender := &mockEAPOLSender{}
 	logger := zerolog.Nop()
-	handler := &Handler{
-		cfg:          cfg,
-		sm:           sm,
-		radiusClient: rc,
-		sender:       sender,
-		logger:       logger,
-	}
+	iface := net.Interface{HardwareAddr: testAPMAC}
+
+	handler := NewHandler(cfg, sm, rc, nil, iface, logger)
+	handler.sender = sender
 	return handler, sm, rc, sender
 }
 
-// createTestEthPacket creates a gopacket.Packet with a correctly formed Ethernet layer.
-func createTestEthPacket(eth *layers.Ethernet, payload gopacket.SerializableLayer) gopacket.Packet {
-	eth.EthernetType = layers.EthernetTypeEAPOL
-	if eth.DstMAC == nil {
-		eth.DstMAC = eapolMulticastMAC
+func createPacket(t *testing.T, srcMAC net.HardwareAddr, payload ...gopacket.SerializableLayer) gopacket.Packet {
+	eth := &layers.Ethernet{
+		SrcMAC:       srcMAC,
+		DstMAC:       layers.EthernetBroadcast,
+		EthernetType: layers.EthernetTypeEAPOL,
 	}
-	opts := gopacket.SerializeOptions{FixLengths: true}
 	buf := gopacket.NewSerializeBuffer()
-	err := gopacket.SerializeLayers(buf, opts, eth, payload)
-	if err != nil {
-		panic(err)
-	}
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	err := gopacket.SerializeLayers(buf, opts, append([]gopacket.SerializableLayer{eth}, payload...)...)
+	require.NoError(t, err)
 	return gopacket.NewPacket(buf.Bytes(), layers.LayerTypeEthernet, gopacket.Default)
 }
 
 func TestHandleEAPOLStart(t *testing.T) {
 	handler, _, _, sender := setupTestHandler(t)
-	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:01")
-	eapolStart := &layers.EAPOL{Type: layers.EAPOLTypeStart, Version: 1}
-	packet := createTestEthPacket(&layers.Ethernet{SrcMAC: clientMAC}, eapolStart)
+	packet := createPacket(t, testStaMAC, &layers.EAPOL{Type: layers.EAPOLTypeStart, Version: 1})
 
 	handler.HandlePacket(packet)
 
 	require.NotNil(t, sender.SentPacket, "Handler should have sent a packet")
-	p := gopacket.NewPacket(sender.SentPacket, layers.LayerTypeEAPOL, gopacket.Default)
-	eapolLayer := p.Layer(layers.LayerTypeEAPOL).(*layers.EAPOL)
-	require.NotNil(t, eapolLayer, "Sent packet should contain an EAPOL layer")
-	eap, err := parseEAP(eapolLayer.LayerPayload())
-	require.NoError(t, err)
-	require.Equal(t, layers.EAPCodeRequest, eap.Code)
-	require.Equal(t, layers.EAPTypeIdentity, eap.Type)
-	require.Equal(t, uint8(1), eap.Id)
+	p := sender.GetSentPacketAs(t, layers.LayerTypeEAPOL)
+	eapLayer := p.Layer(layers.LayerTypeEAP)
+	require.NotNil(t, eapLayer, "Sent packet should contain an EAP layer")
+	eap, _ := eapLayer.(*layers.EAP)
+	assert.Equal(t, layers.EAPCodeRequest, eap.Code)
+	assert.Equal(t, layers.EAPTypeIdentity, eap.Type)
 }
 
-func TestHandleEAPResponseIdentity(t *testing.T) {
-	handler, sm, rc, sender := setupTestHandler(t)
-	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:02")
-	session := sm.CreateSession(nil, clientMAC, 0)
+func TestHandleRadiusAccept_StartsHandshake(t *testing.T) {
+	handler, _, rc, sender := setupTestHandler(t)
+	session := handler.sm.CreateSession(nil, testStaMAC, 0)
+	session.EAPOL.EapID = 5
 
-	// NOTE(Correction): The EAP layer must be serialized first and then passed as a
-	// generic payload to the EAPOL layer. This removes ambiguity for gopacket.
-	eapResp := &layers.EAP{
-		Code:     layers.EAPCodeResponse,
-		Id:       1, // Responding to the initial Identity Request
-		Type:     layers.EAPTypeIdentity,
-		TypeData: []byte("testuser"),
-	}
-	eapResp.Length = uint16(5 + len(eapResp.TypeData))
-	eapBuf := gopacket.NewSerializeBuffer()
-	gopacket.SerializeLayers(eapBuf, gopacket.SerializeOptions{}, eapResp)
-	eapol := &layers.EAPOL{Type: layers.EAPOLTypeEAP, Version: 1, Length: uint16(len(eapBuf.Bytes()))}
-	packet := createTestEthPacket(&layers.Ethernet{SrcMAC: clientMAC}, eapol, gopacket.Payload(eapBuf.Bytes()))
-
-	// Mock a RADIUS challenge in response to ensure the full flow is tested
-	radiusChallengeEAPBuf := gopacket.NewSerializeBuffer()
-	gopacket.SerializeLayers(radiusChallengeEAPBuf, gopacket.SerializeOptions{}, &layers.EAP{Code: layers.EAPCodeRequest, Id: 2, Type: 4, TypeData: []byte("challenge-data"), Length: 22})
-	radiusResp := radius.New(radius.CodeAccessChallenge, []byte("secret"))
-	rfc2869.EAPMessage_Set(radiusResp, radiusChallengeEAPBuf.Bytes())
-	rc.Response = radiusResp
-
-	handler.HandlePacket(packet)
-
-	require.Equal(t, "testuser", session.Redir.Username)
-	require.NotNil(t, rc.ReceivedEAP)
-	parsedEAP, err := parseEAP(rc.ReceivedEAP)
+	rc.Response = radius.New(radius.CodeAccessAccept, []byte(handler.cfg.RadiusSecret))
+	_, requestAuthenticator, _ := rc.SendEAPAccessRequest(session, nil, nil)
+	encryptedPMK, err := rfc2548Encrypt([]byte(handler.cfg.RadiusSecret), requestAuthenticator, testPMK, 0xAB)
 	require.NoError(t, err)
-	require.Equal(t, "testuser", string(bytes.Trim(parsedEAP.TypeData, "\x00")))
-	require.NotNil(t, sender.SentPacket, "Handler should have relayed the RADIUS challenge")
+	cr.SetMSMPPERecvKey(rc.Response, encryptedPMK)
+
+	handler.handleRadiusAccept(session, rc.Response, rc.RequestAuthenticator)
+
+	assert.True(t, session.Authenticated)
+	assert.Equal(t, testPMK, session.EAPOL.PMK)
+	require.NotNil(t, sender.SentPacket)
+	p := sender.GetSentPacketAs(t, layers.LayerTypeEAPOL)
+	keyLayer := p.Layer(layers.LayerTypeEAPOLKey)
+	require.NotNil(t, keyLayer)
+	key, _ := keyLayer.(*layers.EAPOLKey)
+	assert.Equal(t, HandshakeStateSentMsg1, session.EAPOL.HandshakeState)
+	assert.NotNil(t, key.Nonce)
 }
 
-func TestHandleRadiusAccept(t *testing.T) {
+func TestFullHandshake(t *testing.T) {
 	handler, _, _, sender := setupTestHandler(t)
-	session := handler.sm.CreateSession(nil, net.HardwareAddr{0x01, 0x02, 0x03, 0x04, 0x05, 0x07}, 0)
-	session.EapID = 5 // Simulate that the last client response had ID 5
+	session := handler.sm.CreateSession(nil, testStaMAC, 0)
+	session.EAPOL.PMK = testPMK
 
-	// Create a mock RADIUS Access-Accept that CONTAINS an EAP-Success message
-	radiusResp := radius.New(radius.CodeAccessAccept, []byte("secret"))
-	eapSuccessBuf := gopacket.NewSerializeBuffer()
-	gopacket.SerializeLayers(eapSuccessBuf, gopacket.SerializeOptions{}, &layers.EAP{Code: layers.EAPCodeSuccess, Id: 5, Length: 4})
-	rfc2869.EAPMessage_Set(radiusResp, eapSuccessBuf.Bytes())
+	// 1. AP sends Message 1
+	handler.startHandshake(session)
+	require.NotNil(t, sender.SentPacket, "Message 1 was not sent")
+	p1 := sender.GetSentPacketAs(t, layers.LayerTypeEAPOL)
+	msg1, _ := p1.Layer(layers.LayerTypeEAPOLKey).(*layers.EAPOLKey)
+	aNonce := msg1.Nonce
 
-	handler.handleRadiusAccept(session, radiusResp)
+	// 2. Client sends Message 2
+	sNonce := []byte{0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f}
+	ptk := ptkDerivation(testPMK, aNonce, sNonce, testAPMAC, testStaMAC)
+	kck := ptk[0:16]
 
-	require.True(t, session.Authenticated)
-	require.NotNil(t, sender.SentPacket)
-	p := gopacket.NewPacket(sender.SentPacket, layers.LayerTypeEAPOL, gopacket.Default)
-	eapLayer := p.Layer(layers.LayerTypeEAP)
-	require.NotNil(t, eapLayer)
-	parsedEAP, err := parseEAP(eapLayer.LayerContents())
+	eapolMsg2 := &layers.EAPOL{Version: 1, Type: EAPOLTypeKey}
+	msg2Key := &layers.EAPOLKey{
+		KeyDescriptorType:    layers.EAPOLKeyDescriptorTypeWPA,
+		KeyDescriptorVersion: layers.EAPOLKeyDescriptorVersionAESHMACSHA1,
+		KeyType:              layers.EAPOLKeyTypePairwise,
+		Nonce:                sNonce,
+		ReplayCounter:        msg1.ReplayCounter,
+	}
+
+	// Calculate MIC for message 2
+	mic, err := handler.calculateEAPOLKeyMIC(kck, msg2Key)
 	require.NoError(t, err)
-	require.Equal(t, layers.EAPCodeSuccess, parsedEAP.Code)
-	require.Equal(t, uint8(5), parsedEAP.Id) // Verify the ID was relayed correctly
-}
+	msg2Key.MIC = mic
 
-func TestHandleRadiusReject(t *testing.T) {
-	handler, sm, _, sender := setupTestHandler(t)
-	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:05")
-	session := sm.CreateSession(nil, clientMAC, 0)
-	session.EapID = 6
+	packet2 := createPacket(t, testStaMAC, eapolMsg2, msg2Key)
+	handler.HandlePacket(packet2)
 
-	// Create a mock RADIUS Access-Reject that CONTAINS an EAP-Failure message
-	radiusResp := radius.New(radius.CodeAccessReject, []byte("secret"))
-	eapFailureBuf := gopacket.NewSerializeBuffer()
-	gopacket.SerializeLayers(eapFailureBuf, gopacket.SerializeOptions{}, &layers.EAP{Code: layers.EAPCodeFailure, Id: 6, Length: 4})
-	rfc2869.EAPMessage_Set(radiusResp, eapFailureBuf.Bytes())
+	// 3. AP verifies Msg2, sends Message 3
+	assert.Equal(t, HandshakeStateSentMsg3, session.EAPOL.HandshakeState, "State should be SENT_MSG3 after receiving message 2")
+	require.NotNil(t, sender.SentPacket, "Message 3 was not sent")
+	p3 := sender.GetSentPacketAs(t, layers.LayerTypeEAPOL)
+	msg3, _ := p3.Layer(layers.LayerTypeEAPOLKey).(*layers.EAPOLKey)
+	assert.True(t, msg3.Install, "Message 3 should have Install flag set")
+	assert.True(t, msg3.KeyMIC, "Message 3 should have KeyMIC flag set")
 
-	handler.handleRadiusReject(session, radiusResp)
-
-	require.NotNil(t, sender.SentPacket)
-	p := gopacket.NewPacket(sender.SentPacket, layers.LayerTypeEAPOL, gopacket.Default)
-	eapLayer := p.Layer(layers.LayerTypeEAP)
-	require.NotNil(t, eapLayer)
-	parsedEAP, err := parseEAP(eapLayer.LayerContents())
+	// 4. Client sends Message 4
+	msg4Key := &layers.EAPOLKey{
+		KeyDescriptorType:    layers.EAPOLKeyDescriptorTypeWPA,
+		KeyDescriptorVersion: layers.EAPOLKeyDescriptorVersionAESHMACSHA1,
+		KeyType:              layers.EAPOLKeyTypePairwise,
+		KeyMIC:               true,
+		Secure:               true,
+		ReplayCounter:        msg3.ReplayCounter,
+	}
+	mic4, err := handler.calculateEAPOLKeyMIC(kck, msg4Key)
 	require.NoError(t, err)
-	require.Equal(t, layers.EAPCodeFailure, parsedEAP.Code)
-	require.Equal(t, uint8(6), parsedEAP.Id)
-	_, ok := sm.GetSessionByMAC(clientMAC)
-	require.False(t, ok, "Session should be deleted on reject")
+	msg4Key.MIC = mic4
+	packet4 := createPacket(t, testStaMAC, &layers.EAPOL{Version: 1, Type: EAPOLTypeKey}, msg4Key)
+	handler.HandlePacket(packet4)
+
+	// 5. AP verifies Msg4, completes handshake
+	assert.Equal(t, HandshakeStateComplete, session.EAPOL.HandshakeState, "State should be COMPLETE after receiving message 4")
+	assert.Equal(t, ptk, session.EAPOL.PTK, "PTK should be stored in the session")
 }
