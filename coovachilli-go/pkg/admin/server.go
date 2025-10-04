@@ -3,6 +3,7 @@ package admin
 import (
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
+	chillihttp "coovachilli-go/pkg/http"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -44,10 +45,33 @@ func (s *Server) Start() {
 	}
 
 	listenAddr := s.cfg.AdminAPI.Listen
-	s.logger.Info().Str("addr", listenAddr).Msg("Starting admin API server")
+	rateLimiter := chillihttp.NewRateLimiter(
+		s.logger,
+		s.cfg.AdminAPI.RateLimitEnabled,
+		s.cfg.AdminAPI.RateLimit,
+		s.cfg.AdminAPI.RateLimitBurst,
+	)
 
-	if err := http.ListenAndServe(listenAddr, s.router); err != nil {
-		s.logger.Error().Err(err).Msg("Admin API server failed to start")
+	server := &http.Server{
+		Addr:         listenAddr,
+		Handler:      rateLimiter.Middleware(s.router),
+		ReadTimeout:  s.cfg.AdminAPI.ReadTimeout,
+		WriteTimeout: s.cfg.AdminAPI.WriteTimeout,
+		IdleTimeout:  s.cfg.AdminAPI.IdleTimeout,
+	}
+
+	s.logger.Info().
+		Str("addr", listenAddr).
+		Dur("read_timeout", server.ReadTimeout).
+		Dur("write_timeout", server.WriteTimeout).
+		Dur("idle_timeout", server.IdleTimeout).
+		Bool("rate_limit_enabled", s.cfg.AdminAPI.RateLimitEnabled).
+		Float64("rate_limit_r", s.cfg.AdminAPI.RateLimit).
+		Int("rate_limit_b", s.cfg.AdminAPI.RateLimitBurst).
+		Msg("Starting admin API server")
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		s.logger.Error().Err(err).Msg("Admin API server failed")
 	}
 }
 
@@ -195,7 +219,7 @@ func (s *Server) writeError(w http.ResponseWriter, code int, message string) {
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Don't authenticate if no token is configured, for easier development
-		if s.cfg.AdminAPI.AuthToken == "" {
+		if s.cfg.AdminAPI.AuthToken == nil {
 			s.logger.Warn().Msg("Admin API authentication is disabled because no auth_token is configured.")
 			next.ServeHTTP(w, r)
 			return
@@ -216,7 +240,20 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		}
 
 		token := parts[1]
-		if token != s.cfg.AdminAPI.AuthToken {
+		var match bool
+		err := s.cfg.AdminAPI.AuthToken.Access(func(secret []byte) {
+			if string(secret) == token {
+				match = true
+			}
+		})
+
+		if err != nil {
+			s.logger.Error().Err(err).Msg("Failed to access secure auth token")
+			s.writeError(w, http.StatusInternalServerError, "Internal server error")
+			return
+		}
+
+		if !match {
 			s.logger.Warn().Msg("Admin API request with invalid token")
 			s.writeError(w, http.StatusUnauthorized, "Invalid authentication token")
 			return

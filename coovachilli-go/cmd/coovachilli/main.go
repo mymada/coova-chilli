@@ -130,8 +130,43 @@ func main() {
 	}
 
 	log.Info().Msg("Starting CoovaChilli-Go...")
-	runApp(cfg, reloader)
+	app, err := buildApplication(cfg, reloader)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to build application")
+	}
+	runApp(app)
 	log.Info().Msg("CoovaChilli-Go has shut down.")
+}
+
+// application holds all the dependencies for the coovachilli application.
+type application struct {
+	cfg               *config.Config
+	logger            zerolog.Logger
+	reloader          *config.Reloader
+	metricsRecorder   core.MetricsRecorder
+	peerManager       core.PeerManager
+	firewall          core.FirewallManager
+	sessionManager    *core.SessionManager
+	scriptRunner      core.ScriptRunner
+	radiusClient      core.RadiusClient
+	disconnectManager core.Disconnector
+	reaper            core.Reaper
+	httpServer        core.HttpServer
+	adminServer       core.AdminServer
+	dnsProxy          *dns.Proxy
+	tunDevice         *water.Interface
+	pcapHandle        *pcap.Handle
+	parser            *gopacket.DecodingLayerParser
+	ethLayer          layers.Ethernet
+	ip4Layer          layers.IPv4
+	udpLayer          layers.UDP
+	dnsLayer          layers.DNS
+
+	// Channels
+	radiusReqChan chan *core.Session
+	coaReqChan    chan core.CoAContext
+	packetChan    chan []byte
+	shutdownChan  chan os.Signal
 }
 
 // termHandler is the signal handler for the daemon.
@@ -151,387 +186,445 @@ func reloadHandler(sig os.Signal) error {
 	return nil
 }
 
-func runApp(cfg *config.Config, reloader *config.Reloader) {
+func buildApplication(cfg *config.Config, reloader *config.Reloader) (*application, error) {
+	app := &application{
+		cfg:           cfg,
+		logger:        log.Logger,
+		reloader:      reloader,
+		radiusReqChan: make(chan *core.Session),
+		coaReqChan:    make(chan core.CoAContext),
+		packetChan:    make(chan []byte),
+		shutdownChan:  make(chan os.Signal, 1),
+	}
+	app.parser = gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &app.ethLayer, &app.ip4Layer, &app.udpLayer, &app.dnsLayer)
+
 	// Initialize metrics recorder
-	var metricsRecorder metrics.Recorder
 	if cfg.Metrics.Enabled {
 		switch cfg.Metrics.Backend {
 		case "prometheus":
-			log.Info().Msg("Prometheus metrics enabled")
-			metricsRecorder = metrics.NewPrometheusRecorder()
+			app.logger.Info().Msg("Prometheus metrics enabled")
+			app.metricsRecorder = metrics.NewPrometheusRecorder()
 		default:
-			log.Warn().Str("backend", cfg.Metrics.Backend).Msg("Unknown metrics backend, defaulting to no-op")
-			metricsRecorder = metrics.NewNoopRecorder()
+			app.logger.Warn().Str("backend", cfg.Metrics.Backend).Msg("Unknown metrics backend, defaulting to no-op")
+			app.metricsRecorder = metrics.NewNoopRecorder()
 		}
 	} else {
-		log.Info().Msg("Metrics are disabled")
-		metricsRecorder = metrics.NewNoopRecorder()
+		app.logger.Info().Msg("Metrics are disabled")
+		app.metricsRecorder = metrics.NewNoopRecorder()
 	}
 
-	// Start metrics server if applicable
-	if handler := metricsRecorder.Handler(); handler != nil {
+	// Initialize cluster manager
+	if cfg.Cluster.Enabled {
+		app.logger.Info().Msg("Cluster mode enabled.")
+		peerManager, err := cluster.NewManager(cfg.Cluster, cfg.DHCPIf, cfg.UAMListen)
+		if err != nil {
+			return nil, fmt.Errorf("error creating cluster manager: %w", err)
+		}
+		app.peerManager = peerManager
+	}
+
+	// Initialize firewall
+	fw, err := firewall.New(cfg, app.logger)
+	if err != nil {
+		return nil, fmt.Errorf("error creating firewall manager: %w", err)
+	}
+	app.firewall = fw
+
+	// Initialize TUN device
+	ifce, err := tun.New(cfg, app.logger)
+	if err != nil {
+		return nil, fmt.Errorf("error creating TUN interface: %w", err)
+	}
+	app.tunDevice = ifce
+
+	// Initialize other components
+	app.scriptRunner = script.NewRunner(app.logger, cfg)
+	app.sessionManager = core.NewSessionManager(cfg, app.metricsRecorder)
+	app.dnsProxy = dns.NewProxy(cfg, app.logger)
+	app.radiusClient = radius.NewClient(cfg, app.logger, app.metricsRecorder)
+	app.disconnectManager = disconnect.NewManager(cfg, app.sessionManager, app.firewall, app.radiusClient, app.scriptRunner, app.logger)
+	app.reaper = core.NewReaper(cfg, app.sessionManager, app.disconnectManager, app.logger)
+	app.httpServer = http.NewServer(cfg, app.sessionManager, app.radiusReqChan, app.disconnectManager, app.logger, app.metricsRecorder)
+	app.adminServer = admin.NewServer(cfg, app.sessionManager, app.disconnectManager, app.logger)
+
+	// Register reconfigurable components
+	reloader.Register(app.firewall)
+	reloader.Register(app.sessionManager)
+
+	return app, nil
+}
+
+func runApp(app *application) {
+	// Initialize firewall and defer cleanup
+	if err := app.firewall.Initialize(); err != nil {
+		app.logger.Fatal().Err(err).Msg("Error initializing firewall")
+	}
+	defer app.firewall.Cleanup()
+
+	// Drop privileges after network setup, but before starting listeners
+	if app.cfg.User != "" {
+		dropPrivileges(app.cfg, app.logger)
+	}
+
+	// Load existing sessions
+	app.loadSessions()
+
+	// Start background services
+	app.startServices()
+
+	// Setup signal handling
+	signal.Notify(app.shutdownChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Wait for shutdown signal
+	<-app.shutdownChan
+	app.logger.Info().Msg("Shutting down CoovaChilli-Go...")
+
+	// Perform graceful shutdown
+	app.shutdown()
+
+	app.logger.Info().Msg("Graceful shutdown completed")
+}
+
+func (app *application) startServices() {
+	// Start metrics server
+	if handler := app.metricsRecorder.Handler(); handler != nil {
 		go func() {
-			log.Info().Str("addr", cfg.Metrics.Listen).Msg("Starting metrics server")
+			app.logger.Info().Str("addr", app.cfg.Metrics.Listen).Msg("Starting metrics server")
 			mux := stdhttp.NewServeMux()
 			mux.Handle("/metrics", handler)
-			if err := stdhttp.ListenAndServe(cfg.Metrics.Listen, mux); err != nil {
-				log.Error().Err(err).Msg("Metrics server failed")
+			if err := stdhttp.ListenAndServe(app.cfg.Metrics.Listen, mux); err != nil {
+				app.logger.Error().Err(err).Msg("Metrics server failed")
 			}
 		}()
 	}
 
-	var peerManager *cluster.PeerManager
-	var err error
-	if cfg.Cluster.Enabled {
-		log.Info().Msg("Cluster mode enabled.")
-		peerManager, err = cluster.NewManager(cfg.Cluster, cfg.DHCPIf, cfg.UAMListen)
-		if err != nil {
-			log.Fatal().Err(err).Msg("Error creating cluster manager")
-		}
-		go peerManager.Start()
+	// Start cluster manager
+	if app.peerManager != nil {
+		go app.peerManager.Start()
 	}
 
-	fw, err := firewall.New(cfg, log.Logger)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Error creating firewall manager")
-	}
-	if err := fw.Initialize(); err != nil {
-		log.Fatal().Err(err).Msg("Error initializing firewall")
-	}
-	defer fw.Cleanup()
+	// Start DHCP and EAPOL listeners
+	app.startPcapListener()
 
-	ifce, err := tun.New(cfg, log.Logger)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Error creating TUN interface")
-	}
+	// Start session reaper
+	app.reaper.Start()
 
-	// Drop privileges if configured
-	if cfg.User != "" {
-		u, err := user.Lookup(cfg.User)
-		if err != nil {
-			log.Fatal().Err(err).Str("user", cfg.User).Msg("Failed to look up user")
-		}
-		uid, err := strconv.Atoi(u.Uid)
-		if err != nil {
-			log.Fatal().Err(err).Str("uid", u.Uid).Msg("Failed to parse UID")
-		}
-		gid, err := strconv.Atoi(u.Gid)
-		if err != nil {
-			log.Fatal().Err(err).Str("gid", u.Gid).Msg("Failed to parse GID")
-		}
+	// Start UAM/HTTP server
+	go app.httpServer.Start()
 
-		if cfg.Group != "" {
-			g, err := user.LookupGroup(cfg.Group)
-			if err != nil {
-				log.Fatal().Err(err).Str("group", cfg.Group).Msg("Failed to look up group")
-			}
-			gid, err = strconv.Atoi(g.Gid)
-			if err != nil {
-				log.Fatal().Err(err).Str("gid", g.Gid).Msg("Failed to parse group GID")
-			}
-		}
+	// Start packet processing from TUN device
+	go tun.ReadPackets(app.tunDevice, app.packetChan, app.logger)
+	go app.processPackets()
 
-		log.Info().Int("uid", uid).Int("gid", gid).Msg("Dropping privileges")
-		if err := syscall.Setgid(gid); err != nil {
-			log.Fatal().Err(err).Msg("Failed to set GID")
-		}
-		if err := syscall.Setuid(uid); err != nil {
-			log.Fatal().Err(err).Msg("Failed to set UID")
-		}
-	}
+	// Start admin API server
+	go app.adminServer.Start()
 
-	scriptRunner := script.NewRunner(log.Logger, cfg)
-	sessionManager := core.NewSessionManager(cfg, metricsRecorder)
-	dnsProxy := dns.NewProxy(cfg, log.Logger)
-
-	// Register reconfigurable components
-	reloader.Register(fw)
-	reloader.Register(sessionManager)
-
-	if err := sessionManager.LoadSessions(cfg.StateFile); err != nil {
-		log.Error().Err(err).Msg("Failed to load sessions from state file")
-	} else if len(sessionManager.GetAllSessions()) > 0 {
-		log.Info().Int("count", len(sessionManager.GetAllSessions())).Msg("Reloaded sessions from state file")
-		for _, s := range sessionManager.GetAllSessions() {
-			if s.Authenticated {
-				if err := fw.AddAuthenticatedUser(s.HisIP); err != nil {
-					log.Error().Err(err).Str("user", s.Redir.Username).Msg("Failed to re-apply firewall rule for loaded session")
-				}
-			}
-		}
-	}
-
-	radiusReqChan := make(chan *core.Session)
-	radiusClient := radius.NewClient(cfg, log.Logger, metricsRecorder)
-	disconnectManager := disconnect.NewManager(cfg, sessionManager, fw, radiusClient, scriptRunner, log.Logger)
-	reaper := core.NewReaper(cfg, sessionManager, disconnectManager, log.Logger)
-
-	// --- Network Handle and Interface Setup ---
-	dhcpIface, err := net.InterfaceByName(cfg.DHCPIf)
-	if err != nil {
-		log.Fatal().Err(err).Msgf("Failed to get interface %s", cfg.DHCPIf)
-	}
-
-	handle, err := pcap.OpenLive(cfg.DHCPIf, 65536, true, pcap.BlockForever)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to open pcap handle")
-	}
-	defer handle.Close()
-
-	// Combined filter for DHCP and EAPOL.
-	filter := fmt.Sprintf("(udp and (port 67 or 68 or 546 or 547)) or (ether proto 0x%X)", layers.EthernetTypeEAPOL)
-	if err := handle.SetBPFFilter(filter); err != nil {
-		log.Fatal().Err(err).Msg("Failed to set BPF filter")
-	}
-
-	eapolHandler := eapol.NewHandler(cfg, sessionManager, radiusClient, handle, *dhcpIface, log.Logger)
-
-	reaper.Start()
-	defer reaper.Stop()
-
-	_, err = dhcp.NewServer(cfg, sessionManager, radiusReqChan, eapolHandler, log.Logger, metricsRecorder, handle, dhcpIface)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Error creating DHCP server")
-	}
-
-	httpServer := http.NewServer(cfg, sessionManager, radiusReqChan, disconnectManager, log.Logger, metricsRecorder)
-	go httpServer.Start()
-
-	packetChan := make(chan []byte)
-	go tun.ReadPackets(ifce, packetChan, log.Logger)
-	go processPackets(ifce, packetChan, cfg, sessionManager, dnsProxy, fw, peerManager, log.Logger)
-
-	// Start the admin API server
-	adminServer := admin.NewServer(cfg, sessionManager, disconnectManager, log.Logger)
-	go adminServer.Start()
-
-	coaReqChan := make(chan radius.CoAIncomingRequest)
-	go radiusClient.StartCoAListener(coaReqChan)
-
-	if cfg.ProxyEnable {
-		proxyServer := radius.NewProxyServer(cfg, sessionManager, radiusClient, log.Logger)
+	// Start RADIUS listeners (CoA, Proxy)
+	go app.radiusClient.StartCoAListener(app.coaReqChan)
+	if app.cfg.ProxyEnable {
+		proxyServer := radius.NewProxyServer(app.cfg, app.sessionManager, app.radiusClient, app.logger)
 		go proxyServer.Start()
 	}
 
-	go func() {
-		for req := range coaReqChan {
-			userName := rfc2865.UserName_GetString(req.Packet)
+	// Start main application logic goroutines
+	go app.handleCoARequests()
+	go app.handleRadiusRequests()
 
-			// Find session by username with proper locking
-			var sessionToUpdate *core.Session
-			sessions := sessionManager.GetAllSessions()
-			for _, s := range sessions {
-				s.RLock()
-				match := s.Redir.Username == userName
-				s.RUnlock()
-				if match {
-					sessionToUpdate = s
-					break
-				}
-			}
+	app.logger.Info().Msg("CoovaChilli-Go is running. Press Ctrl-C to stop.")
+}
 
-			if sessionToUpdate == nil {
-				log.Warn().Str("user", userName).Msg("Received CoA/Disconnect request for unknown user")
-				var response *layehradius.Packet
-				if req.Packet.Code == layehradius.CodeDisconnectRequest {
-					response = req.Packet.Response(layehradius.CodeDisconnectACK)
-				} else {
-					response = req.Packet.Response(layehradius.CodeCoANAK)
-				}
-				radiusClient.SendCoAResponse(response, req.Peer)
-				continue
-			}
+func (app *application) shutdown() {
+	// Close channels to signal goroutines to stop
+	close(app.radiusReqChan)
+	close(app.coaReqChan)
+	close(app.packetChan)
 
-			switch req.Packet.Code {
-			case layehradius.CodeDisconnectRequest:
-				log.Info().Str("user", userName).Msg("Received Disconnect-Request")
-				disconnectManager.Disconnect(sessionToUpdate, "Admin-Reset")
-				response := req.Packet.Response(layehradius.CodeDisconnectACK)
-				radiusClient.SendCoAResponse(response, req.Peer)
-			default:
-				log.Warn().Str("code", req.Packet.Code.String()).Msg("Received unhandled CoA/DM code")
-				response := req.Packet.Response(layehradius.CodeCoANAK)
-				radiusClient.SendCoAResponse(response, req.Peer)
-			}
-		}
-	}()
+	// Stop the session reaper
+	app.reaper.Stop()
 
-	go func() {
-		for session := range radiusReqChan {
-			go func(s *core.Session) {
-				var username, password string
-				if s.Redir.Username == "" {
-					username = strings.ToUpper(strings.Replace(s.HisMAC.String(), ":", "-", -1))
-					if cfg.MACSuffix != "" {
-						username += cfg.MACSuffix
-					}
-					if cfg.MACPasswd != "" {
-						password = cfg.MACPasswd
-					} else {
-						password = username
-					}
-					s.Redir.Username = username
-				} else {
-					username = s.Redir.Username
-					password = s.Redir.Password
-				}
-				if cfg.UseLocalUsers {
-					authenticated, err := auth.AuthenticateLocalUser(cfg.LocalUsersFile, username, password)
-					if err != nil {
-						log.Error().Err(err).Str("user", username).Msg("Error during local authentication")
-					} else if authenticated {
-						s.Lock()
-						s.Authenticated = true
-						s.SessionParams.SessionTimeout = cfg.DefSessionTimeout
-						s.SessionParams.IdleTimeout = cfg.DefIdleTimeout
-						s.InitializeShaper(cfg)
-						if err := fw.AddAuthenticatedUser(s.HisIP); err != nil {
-							log.Error().Err(err).Str("user", s.Redir.Username).Msg("Error adding firewall/TC rules for local user")
-						}
-						s.Unlock()
-						s.AuthResult <- true
-						return
-					}
-				}
-				resp, err := radiusClient.SendAccessRequest(s, username, password)
-				if err != nil {
-					log.Error().Err(err).Str("user", username).Msg("Error sending RADIUS Access-Request")
-					s.AuthResult <- false
-					return
-				}
-				s.Lock()
-				defer s.Unlock()
-				if resp.Code == layehradius.CodeAccessAccept {
-					s.Authenticated = true
-					s.InitializeShaper(cfg)
-					if err := fw.AddAuthenticatedUser(s.HisIP); err != nil {
-						log.Error().Err(err).Str("user", s.Redir.Username).Msg("Error adding firewall/TC rules")
-						s.AuthResult <- false
-						return
-					}
-					go radiusClient.SendAccountingRequest(s, rfc2866.AcctStatusType(1)) // 1 = Start
-					scriptRunner.RunScript(cfg.ConUp, s, 0)
-					s.AuthResult <- true
-				} else {
-					s.AuthResult <- false
-				}
-			}(session)
-		}
-	}()
-
-	log.Info().Msg("CoovaChilli-Go is running. Press Ctrl-C to stop.")
-
-	// Setup signal handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Wait for shutdown signal
-	<-sigChan
-	log.Info().Msg("Shutting down CoovaChilli-Go...")
-
-	// Close channels to stop goroutines
-	close(radiusReqChan)
-	close(coaReqChan)
+	// Close network handles
+	if app.pcapHandle != nil {
+		app.pcapHandle.Close()
+	}
+	if app.tunDevice != nil {
+		app.tunDevice.Close()
+	}
 
 	// Save sessions before shutdown
-	if err := sessionManager.SaveSessions(cfg.StateFile); err != nil {
-		log.Error().Err(err).Msg("Failed to save sessions to state file")
+	if err := app.sessionManager.SaveSessions(app.cfg.StateFile); err != nil {
+		app.logger.Error().Err(err).Msg("Failed to save sessions to state file")
 	}
 
 	// Disconnect all authenticated sessions
-	for _, session := range sessionManager.GetAllSessions() {
+	for _, session := range app.sessionManager.GetAllSessions() {
 		if session != nil && session.Authenticated {
-			disconnectManager.Disconnect(session, "NAS-Reboot")
+			app.disconnectManager.Disconnect(session, "NAS-Reboot")
 		}
 	}
-
-	log.Info().Msg("Graceful shutdown completed")
 }
 
-func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config.Config, sessionManager *core.SessionManager, dnsProxy *dns.Proxy, fw firewall.FirewallManager, peerManager *cluster.PeerManager, logger zerolog.Logger) {
-	for rawPacket := range packetChan {
-		if peerManager != nil && peerManager.GetCurrentState() == cluster.PeerStateStandby {
-			logger.Debug().Msg("Node is in standby, dropping packet.")
+func (app *application) loadSessions() {
+	if err := app.sessionManager.LoadSessions(app.cfg.StateFile); err != nil {
+		app.logger.Error().Err(err).Msg("Failed to load sessions from state file")
+		return
+	}
+	if len(app.sessionManager.GetAllSessions()) > 0 {
+		app.logger.Info().Int("count", len(app.sessionManager.GetAllSessions())).Msg("Reloaded sessions from state file")
+		for _, s := range app.sessionManager.GetAllSessions() {
+			if s.Authenticated {
+				if err := app.firewall.AddAuthenticatedUser(s.HisIP); err != nil {
+					app.logger.Error().Err(err).Str("user", s.Redir.Username).Msg("Failed to re-apply firewall rule for loaded session")
+				}
+			}
+		}
+	}
+}
+
+func (app *application) startPcapListener() {
+	dhcpIface, err := net.InterfaceByName(app.cfg.DHCPIf)
+	if err != nil {
+		app.logger.Fatal().Err(err).Msgf("Failed to get interface %s", app.cfg.DHCPIf)
+	}
+
+	handle, err := pcap.OpenLive(app.cfg.DHCPIf, 65536, true, pcap.BlockForever)
+	if err != nil {
+		app.logger.Fatal().Err(err).Msg("Failed to open pcap handle")
+	}
+	app.pcapHandle = handle
+
+	filter := fmt.Sprintf("(udp and (port 67 or 68 or 546 or 547)) or (ether proto 0x%X)", layers.EthernetTypeEAPOL)
+	if err := app.pcapHandle.SetBPFFilter(filter); err != nil {
+		app.logger.Fatal().Err(err).Msg("Failed to set BPF filter")
+	}
+
+	eapolHandler := eapol.NewHandler(app.cfg, app.sessionManager, app.radiusClient, app.pcapHandle, *dhcpIface, app.logger)
+
+	_, err = dhcp.NewServer(app.cfg, app.sessionManager, app.radiusReqChan, eapolHandler, app.logger, app.metricsRecorder, app.pcapHandle, dhcpIface)
+	if err != nil {
+		app.logger.Fatal().Err(err).Msg("Error creating DHCP server")
+	}
+}
+
+func (app *application) handleCoARequests() {
+	for req := range app.coaReqChan {
+		userName := rfc2865.UserName_GetString(req.Packet())
+
+		var sessionToUpdate *core.Session
+		sessions := app.sessionManager.GetAllSessions()
+		for _, s := range sessions {
+			s.RLock()
+			match := s.Redir.Username == userName
+			s.RUnlock()
+			if match {
+				sessionToUpdate = s
+				break
+			}
+		}
+
+		if sessionToUpdate == nil {
+			app.logger.Warn().Str("user", userName).Msg("Received CoA/Disconnect request for unknown user")
+			var response *layehradius.Packet
+			if req.Packet().Code == layehradius.CodeDisconnectRequest {
+				response = req.Packet().Response(layehradius.CodeDisconnectACK)
+			} else {
+				response = req.Packet().Response(layehradius.CodeCoANAK)
+			}
+			app.radiusClient.SendCoAResponse(response, req.Peer())
 			continue
 		}
 
+		switch req.Packet().Code {
+		case layehradius.CodeDisconnectRequest:
+			app.logger.Info().Str("user", userName).Msg("Received Disconnect-Request")
+			app.disconnectManager.Disconnect(sessionToUpdate, "Admin-Reset")
+			response := req.Packet().Response(layehradius.CodeDisconnectACK)
+			app.radiusClient.SendCoAResponse(response, req.Peer())
+		default:
+			app.logger.Warn().Str("code", req.Packet().Code.String()).Msg("Received unhandled CoA/DM code")
+			response := req.Packet().Response(layehradius.CodeCoANAK)
+			app.radiusClient.SendCoAResponse(response, req.Peer())
+		}
+	}
+}
+
+func (app *application) handleRadiusRequests() {
+	for session := range app.radiusReqChan {
+		go func(s *core.Session) {
+			var username, password string
+			if s.Redir.Username == "" {
+				username = strings.ToUpper(strings.Replace(s.HisMAC.String(), ":", "-", -1))
+				if app.cfg.MACSuffix != "" {
+					username += app.cfg.MACSuffix
+				}
+				if app.cfg.MACPasswd != "" {
+					password = app.cfg.MACPasswd
+				} else {
+					password = username
+				}
+				s.Redir.Username = username
+			} else {
+				username = s.Redir.Username
+				password = s.Redir.Password
+			}
+
+			if app.cfg.UseLocalUsers {
+				authenticated, err := auth.AuthenticateLocalUser(app.cfg.LocalUsersFile, username, password)
+				if err != nil {
+					app.logger.Error().Err(err).Str("user", username).Msg("Error during local authentication")
+				} else if authenticated {
+					s.Lock()
+					s.Authenticated = true
+					s.SessionParams.SessionTimeout = app.cfg.DefSessionTimeout
+					s.SessionParams.IdleTimeout = app.cfg.DefIdleTimeout
+					s.InitializeShaper(app.cfg)
+					if err := app.firewall.AddAuthenticatedUser(s.HisIP); err != nil {
+						app.logger.Error().Err(err).Str("user", s.Redir.Username).Msg("Error adding firewall/TC rules for local user")
+					}
+					s.Unlock()
+					s.AuthResult <- true
+					return
+				}
+			}
+
+			resp, err := app.radiusClient.SendAccessRequest(s, username, password)
+			if err != nil {
+				app.logger.Error().Err(err).Str("user", username).Msg("Error sending RADIUS Access-Request")
+				s.AuthResult <- false
+				return
+			}
+
+			s.Lock()
+			defer s.Unlock()
+			if resp.Code == layehradius.CodeAccessAccept {
+				s.Authenticated = true
+				s.InitializeShaper(app.cfg)
+				if err := app.firewall.AddAuthenticatedUser(s.HisIP); err != nil {
+					app.logger.Error().Err(err).Str("user", s.Redir.Username).Msg("Error adding firewall/TC rules")
+					s.AuthResult <- false
+					return
+				}
+				go app.radiusClient.SendAccountingRequest(s, rfc2866.AcctStatusType(1)) // 1 = Start
+				app.scriptRunner.RunScript(app.cfg.ConUp, s, 0)
+				s.AuthResult <- true
+			} else {
+				s.AuthResult <- false
+			}
+		}(session)
+	}
+}
+
+func dropPrivileges(cfg *config.Config, logger zerolog.Logger) {
+	u, err := user.Lookup(cfg.User)
+	if err != nil {
+		logger.Fatal().Err(err).Str("user", cfg.User).Msg("Failed to look up user")
+	}
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		logger.Fatal().Err(err).Str("uid", u.Uid).Msg("Failed to parse UID")
+	}
+	gid, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		logger.Fatal().Err(err).Str("gid", u.Gid).Msg("Failed to parse GID")
+	}
+
+	if cfg.Group != "" {
+		g, err := user.LookupGroup(cfg.Group)
+		if err != nil {
+			logger.Fatal().Err(err).Str("group", cfg.Group).Msg("Failed to look up group")
+		}
+		gid, err = strconv.Atoi(g.Gid)
+		if err != nil {
+			logger.Fatal().Err(err).Str("gid", g.Gid).Msg("Failed to parse group GID")
+		}
+	}
+
+	logger.Info().Int("uid", uid).Int("gid", gid).Msg("Dropping privileges")
+	if err := syscall.Setgid(gid); err != nil {
+		logger.Fatal().Err(err).Msg("Failed to set GID")
+	}
+	if err := syscall.Setuid(uid); err != nil {
+		logger.Fatal().Err(err).Msg("Failed to set UID")
+	}
+}
+
+func (app *application) processPackets() {
+	decodedLayers := make([]gopacket.LayerType, 0, 4)
+	for rawPacket := range app.packetChan {
+		// In cluster mode, standby nodes do not process packets
+		if app.peerManager != nil && app.peerManager.GetCurrentState() == cluster.PeerStateStandby {
+			app.logger.Debug().Msg("Node is in standby, dropping packet.")
+			continue
+		}
 		if len(rawPacket) == 0 {
 			continue
 		}
-		packet := gopacket.NewPacket(rawPacket, layers.LayerTypeEthernet, gopacket.Default)
-		if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
-			ipv4, ok := ipv4Layer.(*layers.IPv4)
-			if !ok || ipv4 == nil {
+
+		// Use the decoding layer parser to avoid memory allocations.
+		err := app.parser.DecodeLayers(rawPacket, &decodedLayers)
+		if err != nil {
+			app.logger.Debug().Err(err).Msg("Error decoding packet")
+			continue
+		}
+
+		isIPv4 := false
+		isDNS := false
+		for _, layerType := range decodedLayers {
+			switch layerType {
+			case layers.LayerTypeIPv4:
+				isIPv4 = true
+			case layers.LayerTypeDNS:
+				isDNS = true
+			}
+		}
+
+		if !isIPv4 {
+			continue
+		}
+
+		ipv4 := &app.ip4Layer
+		packetSize := uint64(len(ipv4.Payload))
+
+		session, isUplink := app.sessionManager.GetSessionByIPs(ipv4.SrcIP, ipv4.DstIP)
+		if session == nil {
+			continue // No session found for this packet, drop it
+		}
+
+		session.RLock()
+		isAuthenticated := session.Authenticated
+		session.RUnlock()
+
+		if isAuthenticated {
+			if session.ShouldDropPacket(packetSize, isUplink) {
+				app.logger.Debug().Str("user", session.Redir.Username).Bool("isUplink", isUplink).Msg("Dropping packet due to bandwidth limit")
 				continue
 			}
-			packetSize := uint64(len(ipv4.Payload))
-
-			// Determine if the packet is uplink or downlink and find the session
-			session, isUplink := sessionManager.GetSessionByIPs(ipv4.SrcIP, ipv4.DstIP)
-			if session == nil {
-				continue // No session found for either IP, drop packet
-			}
-
-			session.RLock()
-			isAuthenticated := session.Authenticated
-			session.RUnlock()
-
-			if isAuthenticated {
-				// Apply bandwidth shaping for authenticated users
-				if session.ShouldDropPacket(packetSize, isUplink) {
-					logger.Debug().Str("user", session.Redir.Username).Bool("isUplink", isUplink).Msg("Dropping packet due to bandwidth limit")
-					continue
-				}
-
-				// Update accounting stats
-				session.Lock()
-				if isUplink {
-					session.OutputOctets += packetSize
-					session.OutputPackets++
-				} else {
-					session.InputOctets += packetSize
-					session.InputPackets++
-				}
-				session.Unlock()
+			session.Lock()
+			if isUplink {
+				session.OutputOctets += packetSize
+				session.OutputPackets++
 			} else {
-				// Handle unauthenticated traffic (DNS only)
-				if isUplink {
-					if dnsLayer := packet.Layer(layers.LayerTypeDNS); dnsLayer != nil {
-						dnsQuery, _ := dnsLayer.(*layers.DNS)
-						if !dnsQuery.QR {
-							upstreamAddr := fmt.Sprintf("%s:%d", cfg.DNS1.String(), 53)
-							responseBytes, _, err := dnsProxy.HandleQuery(dnsQuery, upstreamAddr)
-							if err == nil && responseBytes != nil {
-								sendDNSResponse(ifce, packet, responseBytes)
-							}
-						}
+				session.InputOctets += packetSize
+				session.InputPackets++
+			}
+			session.Unlock()
+		} else {
+			// For unauthenticated users, only allow DNS traffic
+			if isUplink && isDNS {
+				dnsQuery := &app.dnsLayer
+				if !dnsQuery.QR { // It's a query
+					upstreamAddr := fmt.Sprintf("%s:%d", app.cfg.DNS1.String(), 53)
+					responseBytes, _, err := app.dnsProxy.HandleQuery(dnsQuery, upstreamAddr)
+					if err == nil && responseBytes != nil {
+						sendDNSResponse(app.tunDevice, &app.ip4Layer, &app.udpLayer, responseBytes)
 					}
 				}
-				// Other unauthenticated traffic is dropped implicitly
 			}
+			// All other unauthenticated traffic is implicitly dropped
 		}
 	}
 }
 
-func sendDNSResponse(ifce *water.Interface, reqPacket gopacket.Packet, respPayload []byte) error {
-	reqIPv4Layer := reqPacket.Layer(layers.LayerTypeIPv4)
-	if reqIPv4Layer == nil {
-		return fmt.Errorf("no IPv4 layer in request packet")
-	}
-	reqIPv4, ok := reqIPv4Layer.(*layers.IPv4)
-	if !ok || reqIPv4 == nil {
-		return fmt.Errorf("invalid IPv4 layer")
-	}
-
-	reqUDPLayer := reqPacket.Layer(layers.LayerTypeUDP)
-	if reqUDPLayer == nil {
-		return fmt.Errorf("no UDP layer in request packet")
-	}
-	reqUDP, ok := reqUDPLayer.(*layers.UDP)
-	if !ok || reqUDP == nil {
-		return fmt.Errorf("invalid UDP layer")
-	}
-
+func sendDNSResponse(ifce *water.Interface, reqIPv4 *layers.IPv4, reqUDP *layers.UDP, respPayload []byte) error {
 	ipLayer := &layers.IPv4{Version: 4, TTL: 64, Protocol: layers.IPProtocolUDP, SrcIP: reqIPv4.DstIP, DstIP: reqIPv4.SrcIP}
 	udpLayer := &layers.UDP{SrcPort: reqUDP.DstPort, DstPort: reqUDP.SrcPort}
 
