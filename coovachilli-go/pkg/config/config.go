@@ -47,8 +47,9 @@ type Config struct {
 	DHCPListenV6 net.IP `yaml:"dhcplisten_v6"`
 
 	// DHCP settings
-	DHCPIf         string `yaml:"dhcpif"`
-	DHCPRelay      bool   `yaml:"dhcprelay"`
+	DHCPIf         string   `yaml:"dhcpif"`
+	MoreIf         []string `yaml:"moreif"`
+	DHCPRelay      bool     `yaml:"dhcprelay"`
 	DHCPUpstream   string `yaml:"dhcpupstream"`
 	DHCPStart      net.IP `yaml:"dhcpstart"`
 	DHCPEnd        net.IP `yaml:"dhcpend"`
@@ -102,6 +103,8 @@ type Config struct {
 	UAMRegex            []string `yaml:"uamregex"`
 	UAMRegexCompiled    []*regexp.Regexp    `yaml:"-"`
 	UAMUrl              string   `yaml:"uamurl"`
+	UAMAnyDNS           bool     `yaml:"uamanydns"`
+	UAMAnyIP            bool     `yaml:"uamanyip"`
 	UAMReadTimeout      time.Duration `yaml:"uam_read_timeout"`
 	UAMWriteTimeout     time.Duration `yaml:"uam_write_timeout"`
 	UAMIdleTimeout      time.Duration `yaml:"uam_idle_timeout"`
