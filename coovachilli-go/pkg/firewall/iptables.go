@@ -123,12 +123,25 @@ func (f *IPTablesFirewall) initializeIPv4Rules() error {
 		f.ipt.Append("nat", "POSTROUTING", "-s", f.cfg.Net.String(), "-o", f.cfg.ExtIf, "-j", "MASQUERADE")
 	}
 
-	f.ipt.Append("nat", "PREROUTING", "-i", f.cfg.TUNDev, "-j", chainChilli)
-	f.ipt.Append("nat", chainChilli, "-j", chainWalledGarden)
-	for _, domain := range f.cfg.UAMAllowed {
-		f.ipt.Append("nat", chainWalledGarden, "-d", domain, "-j", "RETURN")
+	// Allow DNS traffic if uamanydns is enabled
+	if f.cfg.UAMAnyDNS {
+		f.logger.Info().Msg("UAMAnyDNS enabled - allowing all DNS traffic")
+		f.ipt.Append("filter", "FORWARD", "-i", f.cfg.TUNDev, "-p", "udp", "--dport", "53", "-j", "ACCEPT")
+		f.ipt.Append("filter", "FORWARD", "-i", f.cfg.TUNDev, "-p", "tcp", "--dport", "53", "-j", "ACCEPT")
 	}
-	f.ipt.Append("nat", chainChilli, "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-ports", fmt.Sprintf("%d", f.cfg.UAMPort))
+
+	f.ipt.Append("nat", "PREROUTING", "-i", f.cfg.TUNDev, "-j", chainChilli)
+
+	// If uamanyip is enabled, don't redirect traffic for clients using static IPs
+	if !f.cfg.UAMAnyIP {
+		f.ipt.Append("nat", chainChilli, "-j", chainWalledGarden)
+		for _, domain := range f.cfg.UAMAllowed {
+			f.ipt.Append("nat", chainWalledGarden, "-d", domain, "-j", "RETURN")
+		}
+		f.ipt.Append("nat", chainChilli, "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-ports", fmt.Sprintf("%d", f.cfg.UAMPort))
+	} else {
+		f.logger.Info().Msg("UAMAnyIP enabled - allowing clients to use static IPs")
+	}
 
 	if f.cfg.ClientIsolation {
 		f.ipt.Append("filter", "FORWARD", "-i", f.cfg.TUNDev, "-o", f.cfg.TUNDev, "-j", "DROP")
@@ -148,12 +161,25 @@ func (f *IPTablesFirewall) initializeIPv6Rules() error {
 		f.ip6t.Append("nat", "POSTROUTING", "-s", f.cfg.NetV6.String(), "-o", f.cfg.ExtIf, "-j", "MASQUERADE")
 	}
 
-	f.ip6t.Append("nat", "PREROUTING", "-i", f.cfg.TUNDev, "-j", chainChilli)
-	f.ip6t.Append("nat", chainChilli, "-j", chainWalledGarden)
-	for _, domain := range f.cfg.UAMAllowedV6 {
-		f.ip6t.Append("nat", chainWalledGarden, "-d", domain, "-j", "RETURN")
+	// Allow DNS traffic if uamanydns is enabled
+	if f.cfg.UAMAnyDNS {
+		f.logger.Info().Msg("UAMAnyDNS enabled for IPv6 - allowing all DNS traffic")
+		f.ip6t.Append("filter", "FORWARD", "-i", f.cfg.TUNDev, "-p", "udp", "--dport", "53", "-j", "ACCEPT")
+		f.ip6t.Append("filter", "FORWARD", "-i", f.cfg.TUNDev, "-p", "tcp", "--dport", "53", "-j", "ACCEPT")
 	}
-	f.ip6t.Append("nat", chainChilli, "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-ports", fmt.Sprintf("%d", f.cfg.UAMPort))
+
+	f.ip6t.Append("nat", "PREROUTING", "-i", f.cfg.TUNDev, "-j", chainChilli)
+
+	// If uamanyip is enabled, don't redirect traffic for clients using static IPs
+	if !f.cfg.UAMAnyIP {
+		f.ip6t.Append("nat", chainChilli, "-j", chainWalledGarden)
+		for _, domain := range f.cfg.UAMAllowedV6 {
+			f.ip6t.Append("nat", chainWalledGarden, "-d", domain, "-j", "RETURN")
+		}
+		f.ip6t.Append("nat", chainChilli, "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-ports", fmt.Sprintf("%d", f.cfg.UAMPort))
+	} else {
+		f.logger.Info().Msg("UAMAnyIP enabled for IPv6 - allowing clients to use static IPs")
+	}
 
 	if f.cfg.ClientIsolation {
 		f.ip6t.Append("filter", "FORWARD", "-i", f.cfg.TUNDev, "-o", f.cfg.TUNDev, "-j", "DROP")

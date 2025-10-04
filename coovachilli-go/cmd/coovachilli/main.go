@@ -17,6 +17,7 @@ import (
 	"coovachilli-go/pkg/admin"
 	"coovachilli-go/pkg/auth"
 	"coovachilli-go/pkg/cluster"
+	"coovachilli-go/pkg/cmdsock"
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
 	"coovachilli-go/pkg/dhcp"
@@ -244,6 +245,16 @@ func runApp(cfg *config.Config, reloader *config.Reloader) {
 	sessionManager := core.NewSessionManager(cfg, metricsRecorder)
 	dnsProxy := dns.NewProxy(cfg, log.Logger)
 
+	// Set up session lifecycle hooks
+	sessionManager.SetHooks(core.SessionHooks{
+		OnIPUp: func(s *core.Session) {
+			scriptRunner.RunScript(cfg.IPUp, s, 0)
+		},
+		OnIPDown: func(s *core.Session) {
+			scriptRunner.RunScript(cfg.IPDown, s, 0)
+		},
+	})
+
 	// Register reconfigurable components
 	reloader.Register(fw)
 	reloader.Register(sessionManager)
@@ -294,6 +305,38 @@ func runApp(cfg *config.Config, reloader *config.Reloader) {
 		log.Fatal().Err(err).Msg("Error creating DHCP server")
 	}
 
+	// Start DHCP servers on additional interfaces if configured
+	if len(cfg.MoreIF) > 0 {
+		for _, ifName := range cfg.MoreIF {
+			iface, err := net.InterfaceByName(ifName)
+			if err != nil {
+				log.Error().Err(err).Str("interface", ifName).Msg("Failed to get additional interface, skipping")
+				continue
+			}
+
+			ifHandle, err := pcap.OpenLive(ifName, 65536, true, pcap.BlockForever)
+			if err != nil {
+				log.Error().Err(err).Str("interface", ifName).Msg("Failed to open pcap handle for additional interface, skipping")
+				continue
+			}
+
+			if err := ifHandle.SetBPFFilter(filter); err != nil {
+				log.Error().Err(err).Str("interface", ifName).Msg("Failed to set BPF filter for additional interface, skipping")
+				ifHandle.Close()
+				continue
+			}
+
+			_, err = dhcp.NewServer(cfg, sessionManager, radiusReqChan, eapolHandler, log.Logger, metricsRecorder, ifHandle, iface)
+			if err != nil {
+				log.Error().Err(err).Str("interface", ifName).Msg("Error creating DHCP server on additional interface, skipping")
+				ifHandle.Close()
+				continue
+			}
+
+			log.Info().Str("interface", ifName).Msg("Started DHCP server on additional interface")
+		}
+	}
+
 	httpServer := http.NewServer(cfg, sessionManager, radiusReqChan, disconnectManager, log.Logger, metricsRecorder)
 	go httpServer.Start()
 
@@ -304,6 +347,62 @@ func runApp(cfg *config.Config, reloader *config.Reloader) {
 	// Start the admin API server
 	adminServer := admin.NewServer(cfg, sessionManager, disconnectManager, log.Logger)
 	go adminServer.Start()
+
+	// Start the command socket listener
+	cmdChan := make(chan cmdsock.Command, 10)
+	cmdSocketListener := cmdsock.NewListener(cfg.CmdSocket, cmdChan, sessionManager, log.Logger)
+	go cmdSocketListener.Start()
+
+	// Handle command socket commands
+	go func() {
+		for cmd := range cmdChan {
+			parts := strings.Fields(cmd.Cmd)
+			if len(parts) == 0 {
+				cmd.ResponseCh <- "ERROR: Empty command"
+				continue
+			}
+
+			switch strings.ToLower(parts[0]) {
+			case "disconnect", "kick":
+				if len(parts) < 2 {
+					cmd.ResponseCh <- "ERROR: disconnect requires a session identifier"
+					continue
+				}
+				identifier := parts[1]
+				ip := net.ParseIP(identifier)
+				var session *core.Session
+				var ok bool
+
+				if ip != nil {
+					session, ok = sessionManager.GetSessionByIP(ip)
+				} else {
+					mac, err := net.ParseMAC(identifier)
+					if err == nil {
+						session, ok = sessionManager.GetSessionByMAC(mac)
+					}
+				}
+
+				if !ok || session == nil {
+					cmd.ResponseCh <- fmt.Sprintf("ERROR: Session not found for identifier: %s", identifier)
+				} else {
+					disconnectManager.Disconnect(session, "Admin-Reset")
+					cmd.ResponseCh <- fmt.Sprintf("OK: Session %s disconnected", identifier)
+				}
+
+			case "reload":
+				newCfg, err := config.Load("config.yaml")
+				if err != nil {
+					cmd.ResponseCh <- fmt.Sprintf("ERROR: Failed to reload config: %v", err)
+				} else {
+					reloader.Reload(newCfg)
+					cmd.ResponseCh <- "OK: Configuration reloaded"
+				}
+
+			default:
+				cmd.ResponseCh <- fmt.Sprintf("ERROR: Unknown command: %s", parts[0])
+			}
+		}
+	}()
 
 	coaReqChan := make(chan radius.CoAIncomingRequest)
 	go radiusClient.StartCoAListener(coaReqChan)

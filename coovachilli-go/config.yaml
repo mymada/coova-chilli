@@ -23,6 +23,7 @@ dhcplisten: 10.1.0.1
 
 # DHCP settings
 dhcpif: eth0
+moreif: [] # Additional interfaces to listen on, e.g., ["eth1", "eth2"]
 extif: eth0
 clientisolation: true
 dhcprelay: false
@@ -57,11 +58,15 @@ proxysecret: "proxysecret"
 uamport: 8080
 certfile: "" # /etc/coovachilli/cert.pem
 keyfile: ""  # /etc/coovachilli/key.pem
+wwwdir: ""   # Directory for custom captive portal files, e.g., "/var/www/hotspot"
+wwwbin: ""   # Path to CGI binary for dynamic portal pages
 uamallowed:
   - "www.google.com"
   - "www.google.co.in"
   - "www.github.com"
   - "github.com"
+uamanyip: false  # Allow clients to use static IPs
+uamanydns: false # Allow clients to use their own DNS servers
 defsessiontimeout: 86400 # 24 hours
 defidletimeout: 600     # 10 minutes
 defbandwidthmaxdown: 1000000 # 1 Mbps
@@ -76,10 +81,13 @@ firewallbackend: "auto"
 
 # Management
 statefile: /tmp/chilli.state
+cmdsocket: /var/run/chilli.sock
 
 # Scripts
 conup: "coovachilli-go/conup.sh"
 condown: "coovachilli-go/condown.sh"
+ipup: ""    # Script to run when a client gets an IP address
+ipdown: ""  # Script to run when a client releases an IP address
 
 # Cluster settings
 cluster:
