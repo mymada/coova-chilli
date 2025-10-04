@@ -2,8 +2,8 @@ package config
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net"
+	"os"
 	"time"
 
 	"gopkg.in/yaml.v2"
@@ -151,7 +151,7 @@ type ClusterConfig struct {
 
 // Load loads the configuration from a YAML file.
 func Load(path string) (*Config, error) {
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}

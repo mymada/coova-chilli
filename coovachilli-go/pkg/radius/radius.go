@@ -5,8 +5,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -66,7 +66,7 @@ func (c *Client) dialRadSec(serverAddr string) (net.Conn, error) {
 		return nil, fmt.Errorf("could not load radsec key pair: %w", err)
 	}
 
-	caCert, err := ioutil.ReadFile(c.cfg.RadSecCAFile)
+	caCert, err := os.ReadFile(c.cfg.RadSecCAFile)
 	if err != nil {
 		return nil, fmt.Errorf("could not load radsec ca file: %w", err)
 	}

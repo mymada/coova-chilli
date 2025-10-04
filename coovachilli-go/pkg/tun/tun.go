@@ -16,7 +16,6 @@ func New(cfg *config.Config, logger zerolog.Logger) (*water.Interface, error) {
 	waterCfg := water.Config{
 		DeviceType: water.TUN,
 	}
-	waterCfg.Name = cfg.TUNDev
 
 	ifce, err := water.New(waterCfg)
 	if err != nil {
@@ -25,20 +24,34 @@ func New(cfg *config.Config, logger zerolog.Logger) (*water.Interface, error) {
 
 	log.Info().Str("device", ifce.Name()).Msg("TUN interface created")
 
+	// Rename the interface if a specific name is configured
+	if cfg.TUNDev != "" && ifce.Name() != cfg.TUNDev {
+		cmd := exec.Command("ip", "link", "set", "dev", ifce.Name(), "name", cfg.TUNDev)
+		if err := cmd.Run(); err != nil {
+			return nil, fmt.Errorf("failed to rename TUN interface: %w", err)
+		}
+		log.Info().Str("old", ifce.Name()).Str("new", cfg.TUNDev).Msg("TUN interface renamed")
+	}
+
+	devName := ifce.Name()
+	if cfg.TUNDev != "" {
+		devName = cfg.TUNDev
+	}
+
 	// Configure the IP address and bring the interface up.
 	// This uses the `ip` command, which is Linux-specific.
 	// A more portable solution would be needed for other OSes.
-	cmd := exec.Command("ip", "addr", "add", cfg.Net.String(), "dev", ifce.Name())
+	cmd := exec.Command("ip", "addr", "add", cfg.Net.String(), "dev", devName)
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("failed to set IP address for TUN interface: %w", err)
 	}
 
-	cmd = exec.Command("ip", "link", "set", "dev", ifce.Name(), "up")
+	cmd = exec.Command("ip", "link", "set", "dev", devName, "up")
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("failed to bring up TUN interface: %w", err)
 	}
 
-	log.Info().Str("device", ifce.Name()).Msg("TUN interface configured and up")
+	log.Info().Str("device", devName).Msg("TUN interface configured and up")
 
 	return ifce, nil
 }

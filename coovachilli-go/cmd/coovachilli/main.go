@@ -3,14 +3,19 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
+	"log/syslog"
 	"net"
+	stdhttp "net/http"
 	"os"
 	"os/signal"
+	"os/user"
+	"strconv"
 	"strings"
 	"syscall"
 
-	"coovachilli-go/pkg/auth"
 	"coovachilli-go/pkg/admin"
+	"coovachilli-go/pkg/auth"
 	"coovachilli-go/pkg/cluster"
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
@@ -24,11 +29,6 @@ import (
 	"coovachilli-go/pkg/radius"
 	"coovachilli-go/pkg/script"
 	"coovachilli-go/pkg/tun"
-	"io"
-	stdhttp "net/http"
-	"log/syslog"
-	"os/user"
-	"strconv"
 
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
@@ -63,6 +63,7 @@ func main() {
 
 	// Setup logger
 	var logWriter io.Writer = os.Stderr
+	var logFile *os.File
 	if !cfg.Foreground {
 		switch cfg.Logging.Destination {
 		case "syslog":
@@ -74,10 +75,17 @@ func main() {
 		case "stdout":
 			logWriter = os.Stdout
 		default: // File
-			logWriter, err = os.OpenFile(cfg.Logging.Destination, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			logFile, err = os.OpenFile(cfg.Logging.Destination, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to open log file")
 			}
+			logWriter = logFile
+			// Close log file on exit
+			defer func() {
+				if logFile != nil {
+					logFile.Close()
+				}
+			}()
 		}
 		log.Logger = log.Output(logWriter)
 	} else {
@@ -203,15 +211,24 @@ func runApp(cfg *config.Config, reloader *config.Reloader) {
 		if err != nil {
 			log.Fatal().Err(err).Str("user", cfg.User).Msg("Failed to look up user")
 		}
-		uid, _ := strconv.Atoi(u.Uid)
-		gid, _ := strconv.Atoi(u.Gid)
+		uid, err := strconv.Atoi(u.Uid)
+		if err != nil {
+			log.Fatal().Err(err).Str("uid", u.Uid).Msg("Failed to parse UID")
+		}
+		gid, err := strconv.Atoi(u.Gid)
+		if err != nil {
+			log.Fatal().Err(err).Str("gid", u.Gid).Msg("Failed to parse GID")
+		}
 
 		if cfg.Group != "" {
 			g, err := user.LookupGroup(cfg.Group)
 			if err != nil {
 				log.Fatal().Err(err).Str("group", cfg.Group).Msg("Failed to look up group")
 			}
-			gid, _ = strconv.Atoi(g.Gid)
+			gid, err = strconv.Atoi(g.Gid)
+			if err != nil {
+				log.Fatal().Err(err).Str("gid", g.Gid).Msg("Failed to parse group GID")
+			}
 		}
 
 		log.Info().Int("uid", uid).Int("gid", gid).Msg("Dropping privileges")
@@ -299,13 +316,20 @@ func runApp(cfg *config.Config, reloader *config.Reloader) {
 	go func() {
 		for req := range coaReqChan {
 			userName := rfc2865.UserName_GetString(req.Packet)
+
+			// Find session by username with proper locking
 			var sessionToUpdate *core.Session
-			for _, s := range sessionManager.GetAllSessions() {
-				if s.Redir.Username == userName {
+			sessions := sessionManager.GetAllSessions()
+			for _, s := range sessions {
+				s.RLock()
+				match := s.Redir.Username == userName
+				s.RUnlock()
+				if match {
 					sessionToUpdate = s
 					break
 				}
 			}
+
 			if sessionToUpdate == nil {
 				log.Warn().Str("user", userName).Msg("Received CoA/Disconnect request for unknown user")
 				var response *layehradius.Packet
@@ -317,6 +341,7 @@ func runApp(cfg *config.Config, reloader *config.Reloader) {
 				radiusClient.SendCoAResponse(response, req.Peer)
 				continue
 			}
+
 			switch req.Packet.Code {
 			case layehradius.CodeDisconnectRequest:
 				log.Info().Str("user", userName).Msg("Received Disconnect-Request")
@@ -395,18 +420,32 @@ func runApp(cfg *config.Config, reloader *config.Reloader) {
 	}()
 
 	log.Info().Msg("CoovaChilli-Go is running. Press Ctrl-C to stop.")
+
+	// Setup signal handling
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Wait for shutdown signal
 	<-sigChan
 	log.Info().Msg("Shutting down CoovaChilli-Go...")
+
+	// Close channels to stop goroutines
+	close(radiusReqChan)
+	close(coaReqChan)
+
+	// Save sessions before shutdown
 	if err := sessionManager.SaveSessions(cfg.StateFile); err != nil {
 		log.Error().Err(err).Msg("Failed to save sessions to state file")
 	}
+
+	// Disconnect all authenticated sessions
 	for _, session := range sessionManager.GetAllSessions() {
-		if session.Authenticated {
+		if session != nil && session.Authenticated {
 			disconnectManager.Disconnect(session, "NAS-Reboot")
 		}
 	}
+
+	log.Info().Msg("Graceful shutdown completed")
 }
 
 func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config.Config, sessionManager *core.SessionManager, dnsProxy *dns.Proxy, fw firewall.FirewallManager, peerManager *cluster.PeerManager, logger zerolog.Logger) {
@@ -421,7 +460,10 @@ func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config
 		}
 		packet := gopacket.NewPacket(rawPacket, layers.LayerTypeEthernet, gopacket.Default)
 		if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
-			ipv4, _ := ipv4Layer.(*layers.IPv4)
+			ipv4, ok := ipv4Layer.(*layers.IPv4)
+			if !ok || ipv4 == nil {
+				continue
+			}
 			packetSize := uint64(len(ipv4.Payload))
 
 			// Determine if the packet is uplink or downlink and find the session
@@ -472,14 +514,41 @@ func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config
 }
 
 func sendDNSResponse(ifce *water.Interface, reqPacket gopacket.Packet, respPayload []byte) error {
-	reqIPv4, _ := reqPacket.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
-	reqUDP, _ := reqPacket.Layer(layers.LayerTypeUDP).(*layers.UDP)
+	reqIPv4Layer := reqPacket.Layer(layers.LayerTypeIPv4)
+	if reqIPv4Layer == nil {
+		return fmt.Errorf("no IPv4 layer in request packet")
+	}
+	reqIPv4, ok := reqIPv4Layer.(*layers.IPv4)
+	if !ok || reqIPv4 == nil {
+		return fmt.Errorf("invalid IPv4 layer")
+	}
+
+	reqUDPLayer := reqPacket.Layer(layers.LayerTypeUDP)
+	if reqUDPLayer == nil {
+		return fmt.Errorf("no UDP layer in request packet")
+	}
+	reqUDP, ok := reqUDPLayer.(*layers.UDP)
+	if !ok || reqUDP == nil {
+		return fmt.Errorf("invalid UDP layer")
+	}
+
 	ipLayer := &layers.IPv4{Version: 4, TTL: 64, Protocol: layers.IPProtocolUDP, SrcIP: reqIPv4.DstIP, DstIP: reqIPv4.SrcIP}
 	udpLayer := &layers.UDP{SrcPort: reqUDP.DstPort, DstPort: reqUDP.SrcPort}
-	_ = udpLayer.SetNetworkLayerForChecksum(ipLayer)
+
+	if err := udpLayer.SetNetworkLayerForChecksum(ipLayer); err != nil {
+		return fmt.Errorf("failed to set network layer for checksum: %w", err)
+	}
+
 	buffer := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true}
-	_ = gopacket.SerializeLayers(buffer, opts, ipLayer, udpLayer, gopacket.Payload(respPayload))
-	_, err := ifce.Write(buffer.Bytes())
-	return err
+
+	if err := gopacket.SerializeLayers(buffer, opts, ipLayer, udpLayer, gopacket.Payload(respPayload)); err != nil {
+		return fmt.Errorf("failed to serialize DNS response: %w", err)
+	}
+
+	if _, err := ifce.Write(buffer.Bytes()); err != nil {
+		return fmt.Errorf("failed to write DNS response: %w", err)
+	}
+
+	return nil
 }

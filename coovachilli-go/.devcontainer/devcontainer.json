@@ -1,0 +1,33 @@
+{
+  "name": "CoovaChilli-Go Development",
+  "image": "mcr.microsoft.com/devcontainers/go:1-1.24-bookworm",
+
+  "features": {
+    "ghcr.io/devcontainers/features/git:1": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "lts"
+    }
+  },
+
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "go.toolsManagement.checkForUpdates": "local",
+        "go.useLanguageServer": true,
+        "go.gopath": "/go"
+      },
+      "extensions": [
+        "golang.go",
+        "ms-vscode.makefile-tools",
+        "Anthropic.claude-code"
+      ]
+    }
+  },
+
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y build-essential libpcap-dev iptables iproute2 net-tools iputils-ping tcpdump && go mod download && npm install -g npm@latest && npm install -g @anthropic-ai/claude-code --no-fund",
+
+  "remoteUser": "vscode",
+
+  "runArgs": ["--cap-add=NET_ADMIN", "--device=/dev/net/tun"]
+}

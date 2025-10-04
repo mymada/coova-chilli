@@ -1,8 +1,6 @@
 module coovachilli-go
 
-go 1.23.0
-
-toolchain go1.24.3
+go 1.24
 
 require (
 	github.com/coreos/go-iptables v0.7.0
@@ -15,6 +13,7 @@ require (
 	github.com/songgao/water v0.0.0-20200317203138-2b4b6d7c09d8
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/crypto v0.0.0-20200709230013-948cd5f35899
+	golang.org/x/sync v0.13.0
 	gopkg.in/yaml.v2 v2.4.0
 	layeh.com/radius v0.0.0-20210819152912-ad72663a72ab
 )

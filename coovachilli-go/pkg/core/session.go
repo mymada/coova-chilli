@@ -3,7 +3,6 @@ package core
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"sync"
@@ -107,6 +106,11 @@ type RedirState struct {
 	CUI      []byte
 }
 
+const (
+	// MaxSessions is the maximum number of sessions allowed
+	MaxSessions = 10000
+)
+
 // SessionManager manages all active sessions.
 type SessionManager struct {
 	sync.RWMutex
@@ -116,6 +120,7 @@ type SessionManager struct {
 	sessionsByToken map[string]*Session
 	recorder        metrics.Recorder
 	cfg             *config.Config
+	sessionCount    int // Track total sessions
 }
 
 // NewSessionManager creates a new SessionManager.
@@ -144,6 +149,11 @@ func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID 
 	sm.Lock()
 	defer sm.Unlock()
 
+	// Check session limit
+	if sm.sessionCount >= MaxSessions {
+		return nil // Session limit reached
+	}
+
 	now := MonotonicTime()
 	session := &Session{
 		HisIP:               ip,
@@ -162,13 +172,18 @@ func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID 
 		},
 	}
 
-	if ip.To4() != nil {
-		sm.sessionsByIPv4[ip.String()] = session
-	} else {
-		sm.sessionsByIPv6[ip.String()] = session
+	if ip != nil {
+		if ip.To4() != nil {
+			sm.sessionsByIPv4[ip.String()] = session
+		} else {
+			sm.sessionsByIPv6[ip.String()] = session
+		}
 	}
-	sm.sessionsByMAC[mac.String()] = session
+	if mac != nil {
+		sm.sessionsByMAC[mac.String()] = session
+	}
 
+	sm.sessionCount++
 	sm.recorder.IncGauge("chilli_sessions_active_total", nil)
 
 	return session
@@ -242,6 +257,10 @@ func (sm *SessionManager) AssociateToken(session *Session) {
 
 // DeleteSession deletes a session.
 func (sm *SessionManager) DeleteSession(session *Session) {
+	if session == nil {
+		return
+	}
+
 	sm.Lock()
 	defer sm.Unlock()
 
@@ -258,7 +277,16 @@ func (sm *SessionManager) DeleteSession(session *Session) {
 	if session.Token != "" {
 		delete(sm.sessionsByToken, session.Token)
 	}
+
+	sm.sessionCount--
 	sm.recorder.DecGauge("chilli_sessions_active_total", nil)
+
+	// Close AuthResult channel to prevent goroutine leaks
+	select {
+	case <-session.AuthResult:
+	default:
+		close(session.AuthResult)
+	}
 }
 
 // Reconfigure updates the configuration for the SessionManager.
@@ -313,7 +341,7 @@ func (sm *SessionManager) SaveSessions(path string) error {
 		return fmt.Errorf("failed to marshal sessions: %w", err)
 	}
 
-	return ioutil.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0644)
 }
 
 // LoadSessions loads sessions from a file, adjusting for downtime.
@@ -325,7 +353,7 @@ func (sm *SessionManager) LoadSessions(path string) error {
 		return nil
 	}
 
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil // State file doesn't exist, which is fine on first start

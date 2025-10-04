@@ -49,16 +49,20 @@ func calculateMIC(kck, eapolFrame []byte) []byte {
 
 // verifyMIC verifies the MIC of an EAPOL-Key frame.
 func verifyMIC(kck, eapolFrame []byte) (bool, error) {
-	// The MIC is at bytes 85-101 in the full EAPOL frame.
-	micOffset := 85
+	// EAPOL-Key frame structure:
+	// EAPOL header (4 bytes) + Key Descriptor (1) + Key Info (2) + Key Length (2) +
+	// Replay Counter (8) + Key Nonce (32) + Key IV (16) + Key RSC (8) + Key ID (8) +
+	// Key MIC (16 @ offset 81) + Key Data Length (2) + Key Data (variable)
+	micOffset := 81
 	micEnd := micOffset + 16
 	if len(eapolFrame) < micEnd {
-		return false, fmt.Errorf("EAPOL frame too short for MIC verification")
+		return false, fmt.Errorf("EAPOL frame too short for MIC verification: got %d, need %d", len(eapolFrame), micEnd)
 	}
 	receivedMIC := make([]byte, 16)
 	copy(receivedMIC, eapolFrame[micOffset:micEnd])
 	tempFrame := make([]byte, len(eapolFrame))
 	copy(tempFrame, eapolFrame)
+	// Zero out the MIC field before calculating
 	copy(tempFrame[micOffset:micEnd], make([]byte, 16))
 	calculatedMIC := calculateMIC(kck, tempFrame)
 	return hmac.Equal(receivedMIC, calculatedMIC), nil
