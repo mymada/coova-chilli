@@ -219,7 +219,7 @@ func (s *Server) writeError(w http.ResponseWriter, code int, message string) {
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Don't authenticate if no token is configured, for easier development
-		if s.cfg.AdminAPI.AuthToken == nil {
+		if !s.cfg.AdminAPI.AuthToken.IsSet() {
 			s.logger.Warn().Msg("Admin API authentication is disabled because no auth_token is configured.")
 			next.ServeHTTP(w, r)
 			return
@@ -240,15 +240,9 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		}
 
 		token := parts[1]
-		var match bool
-		err := s.cfg.AdminAPI.AuthToken.Access(func(secret []byte) {
-			if string(secret) == token {
-				match = true
-			}
-		})
-
+		match, err := s.cfg.AdminAPI.AuthToken.EqualToConstantTime([]byte(token))
 		if err != nil {
-			s.logger.Error().Err(err).Msg("Failed to access secure auth token")
+			s.logger.Error().Err(err).Msg("Failed to compare secure auth token")
 			s.writeError(w, http.StatusInternalServerError, "Internal server error")
 			return
 		}

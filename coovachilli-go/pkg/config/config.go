@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"time"
 
 	"coovachilli-go/pkg/securestore"
@@ -62,12 +63,16 @@ type Config struct {
 	// RADIUS settings
 	RadiusListen       net.IP `yaml:"radiuslisten"`
 	RadiusListenV6     net.IP `yaml:"radiuslisten_v6"`
-	RadiusServer1      string `yaml:"radiusserver1"`
-	RadiusServer2      string `yaml:"radiusserver2"`
-	RadiusAuthPort     int    `yaml:"radiusauthport"`
-	RadiusAcctPort     int    `yaml:"radiusacctport"`
+	RadiusServer1      string              `yaml:"radiusserver1"`
+	RadiusServer2      string              `yaml:"radiusserver2"`
+	RadiusAcctServer1  string              `yaml:"radiusacctserver1"`
+	RadiusAcctServer2  string              `yaml:"radiusacctserver2"`
+	RadiusAuthPort     int                 `yaml:"radiusauthport"`
+	RadiusAcctPort     int                 `yaml:"radiusacctport"`
 	RadiusSecretStr    string              `yaml:"radiussecret"`
 	RadiusSecret       *securestore.Secret `yaml:"-"`
+	RadiusAcctSecretStr string             `yaml:"radiusacctsecret"`
+	RadiusAcctSecret   *securestore.Secret `yaml:"-"`
 	RadiusNASID        string              `yaml:"radiusnasid"`
 	RadiusTimeout      time.Duration       `yaml:"radiustimeout"`
 	RadSecIdleTimeout  time.Duration       `yaml:"radsecidletimeout"`
@@ -94,6 +99,8 @@ type Config struct {
 	UAMAllowed          []string `yaml:"uamallowed"`
 	UAMAllowedV6        []string `yaml:"uamallowed_v6"`
 	UAMDomains          []string `yaml:"uamdomains"`
+	UAMRegex            []string `yaml:"uamregex"`
+	UAMRegexCompiled    []*regexp.Regexp    `yaml:"-"`
 	UAMUrl              string   `yaml:"uamurl"`
 	UAMReadTimeout      time.Duration `yaml:"uam_read_timeout"`
 	UAMWriteTimeout     time.Duration `yaml:"uam_write_timeout"`
@@ -191,22 +198,32 @@ func Load(path string) (*Config, error) {
 
 	// Convert secrets to secure buffers
 	if cfg.RadiusSecretStr != "" {
-		if cfg.RadiusSecret, err = securestore.NewSecret(cfg.RadiusSecretStr); err != nil {
-			return nil, fmt.Errorf("failed to secure radiussecret: %w", err)
-		}
+		cfg.RadiusSecret = securestore.NewSecret(cfg.RadiusSecretStr)
 		cfg.RadiusSecretStr = "" // Clear the plaintext secret
 	}
 	if cfg.ProxySecretStr != "" {
-		if cfg.ProxySecret, err = securestore.NewSecret(cfg.ProxySecretStr); err != nil {
-			return nil, fmt.Errorf("failed to secure proxysecret: %w", err)
-		}
+		cfg.ProxySecret = securestore.NewSecret(cfg.ProxySecretStr)
 		cfg.ProxySecretStr = ""
 	}
 	if cfg.AdminAPI.AuthTokenStr != "" {
-		if cfg.AdminAPI.AuthToken, err = securestore.NewSecret(cfg.AdminAPI.AuthTokenStr); err != nil {
-			return nil, fmt.Errorf("failed to secure admin_api.auth_token: %w", err)
-		}
+		cfg.AdminAPI.AuthToken = securestore.NewSecret(cfg.AdminAPI.AuthTokenStr)
 		cfg.AdminAPI.AuthTokenStr = ""
+	}
+	if cfg.RadiusAcctSecretStr != "" {
+		cfg.RadiusAcctSecret = securestore.NewSecret(cfg.RadiusAcctSecretStr)
+		cfg.RadiusAcctSecretStr = ""
+	}
+
+	// Compile UAM regexes
+	if len(cfg.UAMRegex) > 0 {
+		cfg.UAMRegexCompiled = make([]*regexp.Regexp, len(cfg.UAMRegex))
+		for i, reStr := range cfg.UAMRegex {
+			re, err := regexp.Compile(reStr)
+			if err != nil {
+				return nil, fmt.Errorf("failed to compile uamregex '%s': %w", reStr, err)
+			}
+			cfg.UAMRegexCompiled[i] = re
+		}
 	}
 
 	// Manual parsing for CIDR notation fields

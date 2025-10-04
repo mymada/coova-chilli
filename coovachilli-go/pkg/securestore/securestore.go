@@ -4,43 +4,56 @@ import (
 	"github.com/awnumar/memguard"
 )
 
-// Secret holds a value securely in memory.
+// Secret holds a value securely in an encrypted enclave.
 type Secret struct {
-	buffer *memguard.LockedBuffer
+	enclave *memguard.Enclave
 }
 
 // NewSecret creates a new secret from a string.
 // The original string should be cleared from memory after use.
-func NewSecret(value string) (*Secret, error) {
-	buf, err := memguard.NewImmutableFromBytes([]byte(value))
-	if err != nil {
-		return nil, err
+func NewSecret(value string) *Secret {
+	if value == "" {
+		return &Secret{enclave: nil}
 	}
-	return &Secret{buffer: buf}, nil
+	// NewEnclave will wipe the source buffer.
+	return &Secret{enclave: memguard.NewEnclave([]byte(value))}
 }
 
-// Access securely calls a function with the plaintext value of the secret.
-// The provided byte slice is only valid for the duration of the function call.
-func (s *Secret) Access(f func([]byte)) error {
-	if s == nil || s.buffer == nil {
-		// Treat as empty secret, call function with nil slice
-		f(nil)
-		return nil
+// IsSet returns true if the secret has been configured with a value.
+func (s *Secret) IsSet() bool {
+	return s != nil && s.enclave != nil
+}
+
+// Access securely opens the enclave and calls a function with the plaintext value.
+// The plaintext is held in a LockedBuffer which is destroyed after the function returns.
+func (s *Secret) Access(f func(plaintext []byte) error) error {
+	if s == nil || s.enclave == nil {
+		// Pass nil to the function if the secret is empty/not set.
+		return f(nil)
 	}
 
-	b, err := s.buffer.Open()
+	// Open the enclave to get a LockedBuffer with the plaintext.
+	lockedBuffer, err := s.enclave.Open()
 	if err != nil {
 		return err
 	}
-	defer b.Destroy()
+	defer lockedBuffer.Destroy() // Ensure the plaintext buffer is destroyed.
 
-	f(b.Bytes())
-	return nil
+	// Pass the bytes from the locked buffer to the function.
+	return f(lockedBuffer.Bytes())
 }
 
-// Destroy securely wipes the secret from memory.
-func (s *Secret) Destroy() {
-	if s != nil && s.buffer != nil {
-		s.buffer.Destroy()
+// EqualToConstantTime compares the secret to a given byte slice in constant time.
+func (s *Secret) EqualToConstantTime(value []byte) (bool, error) {
+	if s == nil || s.enclave == nil {
+		return len(value) == 0, nil
 	}
+
+	lockedBuffer, err := s.enclave.Open()
+	if err != nil {
+		return false, err
+	}
+	defer lockedBuffer.Destroy()
+
+	return lockedBuffer.EqualTo(value), nil
 }

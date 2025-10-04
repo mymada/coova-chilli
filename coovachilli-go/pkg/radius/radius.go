@@ -183,10 +183,19 @@ func (c *Client) radsecExchange(packet *radius.Packet, serverAddr string) (*radi
 }
 
 func (c *Client) exchangeWithFailover(packet *radius.Packet, auth bool) (*radius.Packet, error) {
-	servers := []string{c.cfg.RadiusServer1, c.cfg.RadiusServer2}
+	var servers []string
 	requestType := "acct"
 	if auth {
 		requestType = "auth"
+		servers = []string{c.cfg.RadiusServer1, c.cfg.RadiusServer2}
+	} else {
+		// For accounting, prefer accounting-specific servers if configured
+		if c.cfg.RadiusAcctServer1 != "" {
+			servers = []string{c.cfg.RadiusAcctServer1, c.cfg.RadiusAcctServer2}
+		} else {
+			// Fallback to primary servers
+			servers = []string{c.cfg.RadiusServer1, c.cfg.RadiusServer2}
+		}
 	}
 
 	var lastErr error
@@ -311,7 +320,12 @@ func (c *Client) SendAccessRequest(session *core.Session, username, password str
 // SendAccountingRequest sends a RADIUS Accounting-Request packet.
 func (c *Client) SendAccountingRequest(session *core.Session, statusType rfc2866.AcctStatusType) (*radius.Packet, error) {
 	var packet *radius.Packet
-	err := c.cfg.RadiusSecret.Access(func(secret []byte) error {
+	secretToUse := c.cfg.RadiusSecret
+	if c.cfg.RadiusAcctSecret != nil {
+		secretToUse = c.cfg.RadiusAcctSecret
+	}
+
+	err := secretToUse.Access(func(secret []byte) error {
 		packet = radius.New(radius.CodeAccountingRequest, secret)
 		return nil
 	})

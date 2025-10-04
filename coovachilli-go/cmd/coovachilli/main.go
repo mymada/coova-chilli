@@ -263,7 +263,7 @@ func runApp(app *application) {
 
 	// Drop privileges after network setup, but before starting listeners
 	if app.cfg.User != "" {
-		dropPrivileges(app.cfg, app.logger)
+		app.dropPrivileges()
 	}
 
 	// Load existing sessions
@@ -406,7 +406,14 @@ func (app *application) startPcapListener() {
 }
 
 func (app *application) handleCoARequests() {
-	for req := range app.coaReqChan {
+	for reqCtx := range app.coaReqChan {
+		// Type assert the interface back to the concrete type
+		req, ok := reqCtx.(*radius.CoAIncomingRequest)
+		if !ok {
+			app.logger.Error().Msg("Received invalid type on CoA channel")
+			continue
+		}
+
 		userName := rfc2865.UserName_GetString(req.Packet())
 
 		var sessionToUpdate *core.Session
@@ -481,6 +488,9 @@ func (app *application) handleRadiusRequests() {
 						app.logger.Error().Err(err).Str("user", s.Redir.Username).Msg("Error adding firewall/TC rules for local user")
 					}
 					s.Unlock()
+					// Also send accounting start and run conup script for local users
+					go app.radiusClient.SendAccountingRequest(s, rfc2866.AcctStatusType(1)) // 1 = Start
+					app.scriptRunner.RunScript(app.cfg.ConUp, s, 0)
 					s.AuthResult <- true
 					return
 				}
@@ -513,37 +523,37 @@ func (app *application) handleRadiusRequests() {
 	}
 }
 
-func dropPrivileges(cfg *config.Config, logger zerolog.Logger) {
-	u, err := user.Lookup(cfg.User)
+func (app *application) dropPrivileges() {
+	u, err := user.Lookup(app.cfg.User)
 	if err != nil {
-		logger.Fatal().Err(err).Str("user", cfg.User).Msg("Failed to look up user")
+		app.logger.Fatal().Err(err).Str("user", app.cfg.User).Msg("Failed to look up user")
 	}
 	uid, err := strconv.Atoi(u.Uid)
 	if err != nil {
-		logger.Fatal().Err(err).Str("uid", u.Uid).Msg("Failed to parse UID")
+		app.logger.Fatal().Err(err).Str("uid", u.Uid).Msg("Failed to parse UID")
 	}
 	gid, err := strconv.Atoi(u.Gid)
 	if err != nil {
-		logger.Fatal().Err(err).Str("gid", u.Gid).Msg("Failed to parse GID")
+		app.logger.Fatal().Err(err).Str("gid", u.Gid).Msg("Failed to parse GID")
 	}
 
-	if cfg.Group != "" {
-		g, err := user.LookupGroup(cfg.Group)
+	if app.cfg.Group != "" {
+		g, err := user.LookupGroup(app.cfg.Group)
 		if err != nil {
-			logger.Fatal().Err(err).Str("group", cfg.Group).Msg("Failed to look up group")
+			app.logger.Fatal().Err(err).Str("group", app.cfg.Group).Msg("Failed to look up group")
 		}
 		gid, err = strconv.Atoi(g.Gid)
 		if err != nil {
-			logger.Fatal().Err(err).Str("gid", g.Gid).Msg("Failed to parse group GID")
+			app.logger.Fatal().Err(err).Str("gid", g.Gid).Msg("Failed to parse group GID")
 		}
 	}
 
-	logger.Info().Int("uid", uid).Int("gid", gid).Msg("Dropping privileges")
+	app.logger.Info().Int("uid", uid).Int("gid", gid).Msg("Dropping privileges")
 	if err := syscall.Setgid(gid); err != nil {
-		logger.Fatal().Err(err).Msg("Failed to set GID")
+		app.logger.Fatal().Err(err).Msg("Failed to set GID")
 	}
 	if err := syscall.Setuid(uid); err != nil {
-		logger.Fatal().Err(err).Msg("Failed to set UID")
+		app.logger.Fatal().Err(err).Msg("Failed to set UID")
 	}
 }
 
@@ -615,7 +625,7 @@ func (app *application) processPackets() {
 					upstreamAddr := fmt.Sprintf("%s:%d", app.cfg.DNS1.String(), 53)
 					responseBytes, _, err := app.dnsProxy.HandleQuery(dnsQuery, upstreamAddr)
 					if err == nil && responseBytes != nil {
-						sendDNSResponse(app.tunDevice, &app.ip4Layer, &app.udpLayer, responseBytes)
+						app.sendDNSResponse(&app.ip4Layer, &app.udpLayer, responseBytes)
 					}
 				}
 			}
@@ -624,7 +634,7 @@ func (app *application) processPackets() {
 	}
 }
 
-func sendDNSResponse(ifce *water.Interface, reqIPv4 *layers.IPv4, reqUDP *layers.UDP, respPayload []byte) error {
+func (app *application) sendDNSResponse(reqIPv4 *layers.IPv4, reqUDP *layers.UDP, respPayload []byte) error {
 	ipLayer := &layers.IPv4{Version: 4, TTL: 64, Protocol: layers.IPProtocolUDP, SrcIP: reqIPv4.DstIP, DstIP: reqIPv4.SrcIP}
 	udpLayer := &layers.UDP{SrcPort: reqUDP.DstPort, DstPort: reqUDP.SrcPort}
 
@@ -639,7 +649,7 @@ func sendDNSResponse(ifce *water.Interface, reqIPv4 *layers.IPv4, reqUDP *layers
 		return fmt.Errorf("failed to serialize DNS response: %w", err)
 	}
 
-	if _, err := ifce.Write(buffer.Bytes()); err != nil {
+	if _, err := app.tunDevice.Write(buffer.Bytes()); err != nil {
 		return fmt.Errorf("failed to write DNS response: %w", err)
 	}
 
