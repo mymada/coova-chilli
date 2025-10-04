@@ -20,6 +20,8 @@ type FirewallManager interface {
 	Cleanup()
 	AddAuthenticatedUser(ip net.IP) error
 	RemoveAuthenticatedUser(ip net.IP) error
+	AddWalledGardenNetwork(network string) error
+	AddWalledGardenIP(ip string) error
 	Reconfigure(newConfig *config.Config) error
 }
 

@@ -25,6 +25,7 @@ import (
 	"coovachilli-go/pkg/dns"
 	"coovachilli-go/pkg/eapol"
 	"coovachilli-go/pkg/firewall"
+	"coovachilli-go/pkg/garden"
 	"coovachilli-go/pkg/http"
 	"coovachilli-go/pkg/metrics"
 	"coovachilli-go/pkg/radius"
@@ -243,7 +244,13 @@ func runApp(cfg *config.Config, reloader *config.Reloader) {
 
 	scriptRunner := script.NewRunner(log.Logger, cfg)
 	sessionManager := core.NewSessionManager(cfg, metricsRecorder)
-	dnsProxy := dns.NewProxy(cfg, log.Logger)
+
+	// Initialize and start the Walled Garden service
+	gardenService := garden.NewGarden(&cfg.WalledGarden, fw, log.Logger)
+	gardenService.Start()
+	defer gardenService.Stop()
+
+	dnsProxy := dns.NewProxy(cfg, log.Logger, gardenService)
 
 	// Set up session lifecycle hooks
 	sessionManager.SetHooks(core.SessionHooks{
@@ -390,13 +397,9 @@ func runApp(cfg *config.Config, reloader *config.Reloader) {
 				}
 
 			case "reload":
-				newCfg, err := config.Load("config.yaml")
-				if err != nil {
-					cmd.ResponseCh <- fmt.Sprintf("ERROR: Failed to reload config: %v", err)
-				} else {
-					reloader.Reload(newCfg)
-					cmd.ResponseCh <- "OK: Configuration reloaded"
-				}
+				// PerformReload loads the config itself and applies it.
+				reloader.PerformReload()
+				cmd.ResponseCh <- "OK: Configuration reload triggered"
 
 			default:
 				cmd.ResponseCh <- fmt.Sprintf("ERROR: Unknown command: %s", parts[0])
@@ -593,20 +596,29 @@ func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config
 				}
 				session.Unlock()
 			} else {
-				// Handle unauthenticated traffic (DNS only)
+				// Handle unauthenticated traffic.
 				if isUplink {
-					if dnsLayer := packet.Layer(layers.LayerTypeDNS); dnsLayer != nil {
-						dnsQuery, _ := dnsLayer.(*layers.DNS)
-						if !dnsQuery.QR {
-							upstreamAddr := fmt.Sprintf("%s:%d", cfg.DNS1.String(), 53)
-							responseBytes, _, err := dnsProxy.HandleQuery(dnsQuery, upstreamAddr)
-							if err == nil && responseBytes != nil {
-								sendDNSResponse(ifce, packet, responseBytes)
+					// For unauthenticated users, only allow DNS traffic to be proxied through our server.
+					// The firewall should be configured to redirect DNS packets to the chilli instance,
+					// but we still need to process them here. The firewall also handles allowing
+					// traffic to the walled garden destinations.
+					if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+						udp, _ := udpLayer.(*layers.UDP)
+						// Check if it's a standard DNS query port
+						if udp.DstPort == 53 {
+							dnsQueryPayload := udp.Payload
+							if responsePayload, err := dnsProxy.HandleQuery(dnsQueryPayload); err != nil {
+								logger.Warn().Err(err).Msg("DNS proxy failed to handle query")
+							} else if responsePayload != nil {
+								// The proxy returned a response, send it back to the client.
+								if err := sendDNSResponse(ifce, packet, responsePayload); err != nil {
+									logger.Error().Err(err).Msg("Failed to send DNS response")
+								}
 							}
 						}
 					}
+					// Other unauthenticated traffic is implicitly dropped as it won't be forwarded.
 				}
-				// Other unauthenticated traffic is dropped implicitly
 			}
 		}
 	}

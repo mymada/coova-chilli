@@ -2,6 +2,7 @@ package cmdsock
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -23,6 +24,7 @@ type Listener struct {
 	logger         zerolog.Logger
 	cmdChan        chan<- Command
 	sessionManager *core.SessionManager
+	listener       net.Listener
 }
 
 // NewListener creates a new command socket listener.
@@ -32,6 +34,14 @@ func NewListener(path string, cmdChan chan<- Command, sm *core.SessionManager, l
 		logger:         logger.With().Str("component", "cmdsock").Logger(),
 		cmdChan:        cmdChan,
 		sessionManager: sm,
+	}
+}
+
+// Stop gracefully stops the command socket listener.
+func (l *Listener) Stop() {
+	if l.listener != nil {
+		l.logger.Info().Msg("Stopping command socket listener")
+		l.listener.Close()
 	}
 }
 
@@ -52,15 +62,21 @@ func (l *Listener) Start() {
 		l.logger.Fatal().Err(err).Msg("Failed to start command socket listener")
 		return
 	}
-	defer listener.Close()
+	l.listener = listener
 
 	l.logger.Info().Str("path", l.path).Msg("Command socket listener started")
 
 	for {
-		conn, err := listener.Accept()
+		conn, err := l.listener.Accept()
 		if err != nil {
-			l.logger.Error().Err(err).Msg("Failed to accept command socket connection")
-			continue
+			// When Stop() is called, Accept() will return an error.
+			// We check for this condition to exit gracefully.
+			if errors.Is(err, net.ErrClosed) {
+				l.logger.Info().Msg("Command socket listener has been closed.")
+				return
+			}
+			l.logger.Error().Err(err).Msg("Failed to accept command socket connection, stopping listener.")
+			return
 		}
 		go l.handleConnection(conn)
 	}
