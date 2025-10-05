@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"net"
 	"sync"
 	"testing"
+
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
@@ -97,4 +101,119 @@ func TestFullSessionFlow(t *testing.T) {
 	assert.True(t, fw.isAuthenticated(clientIP.String()), "User should be marked as authenticated in the firewall")
 
 	t.Log("Integration test passed: DNS -> Walled Garden -> Authentication flow is working.")
+}
+
+func TestARPHandling(t *testing.T) {
+	// --- Setup ---
+	logger := zerolog.Nop()
+	cfg := &config.Config{
+		DHCPListen: net.ParseIP("10.1.0.1"),
+	}
+	sessionManager := core.NewSessionManager(cfg, nil)
+	app := &application{
+		cfg:            cfg,
+		logger:         logger,
+		sessionManager: sessionManager,
+	}
+	app.tunMAC, _ = net.ParseMAC("00:00:5e:00:53:ff")
+
+	// Create a session for a client, so we know to respond to ARPs for its IP
+	clientIP := net.ParseIP("10.1.0.123")
+	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:11")
+	sessionManager.CreateSession(clientIP, clientMAC, 0)
+
+	// Create a mock writer to capture the ARP reply
+	var writer bytes.Buffer
+
+	// --- 1. Test ARP for a managed client IP ---
+	t.Run("ARP for managed client IP", func(t *testing.T) {
+		// Construct the ARP request packet
+		reqEth := &layers.Ethernet{
+			SrcMAC:       clientMAC,
+			DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, // Broadcast
+			EthernetType: layers.EthernetTypeARP,
+		}
+		reqArp := &layers.ARP{
+			AddrType:          layers.LinkTypeEthernet,
+			Protocol:          layers.EthernetTypeIPv4,
+			HwAddressSize:     6,
+			ProtAddressSize:   4,
+			Operation:         layers.ARPRequest,
+			SourceHwAddress:   []byte(clientMAC),
+			SourceProtAddress: []byte(clientIP),
+			DstHwAddress:      []byte{0, 0, 0, 0, 0, 0},
+			DstProtAddress:    []byte(clientIP), // ARP request for itself (gratuitous) or gateway
+		}
+
+		// Execute
+		writer.Reset()
+		app.handleARPRequest(reqEth, reqArp, &writer)
+
+		// Verify
+		require.NotZero(t, writer.Len(), "handleARPRequest should have written a reply")
+
+		// Decode the reply
+		var eth layers.Ethernet
+		var arp layers.ARP
+		parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &arp)
+		var decodedLayers []gopacket.LayerType
+		err := parser.DecodeLayers(writer.Bytes(), &decodedLayers)
+		require.NoError(t, err)
+		require.Contains(t, decodedLayers, layers.LayerTypeARP, "Decoded packet should contain an ARP layer")
+
+		assert.Equal(t, uint16(layers.ARPReply), arp.Operation, "ARP operation should be a reply")
+		assert.Equal(t, app.tunMAC, net.HardwareAddr(eth.SrcMAC), "Reply ethernet source MAC should be the TUN MAC")
+		assert.Equal(t, clientMAC, net.HardwareAddr(eth.DstMAC), "Reply ethernet destination MAC should be the client MAC")
+		assert.Equal(t, app.tunMAC, net.HardwareAddr(arp.SourceHwAddress), "Reply ARP source MAC should be the TUN MAC")
+		assert.Equal(t, clientIP, net.IP(arp.SourceProtAddress), "Reply ARP source IP should be the requested IP")
+	})
+
+	// --- 2. Test ARP for the gateway IP ---
+	t.Run("ARP for gateway IP", func(t *testing.T) {
+		reqEth := &layers.Ethernet{
+			SrcMAC:       clientMAC,
+			DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+			EthernetType: layers.EthernetTypeARP,
+		}
+		reqArp := &layers.ARP{
+			AddrType:          layers.LinkTypeEthernet,
+			Protocol:          layers.EthernetTypeIPv4,
+			HwAddressSize:     6,
+			ProtAddressSize:   4,
+			Operation:         layers.ARPRequest,
+			SourceHwAddress:   []byte(clientMAC),
+			SourceProtAddress: []byte(clientIP),
+			DstHwAddress:      []byte{0, 0, 0, 0, 0, 0},
+			DstProtAddress:    []byte(cfg.DHCPListen), // ARP for the gateway
+		}
+
+		writer.Reset()
+		app.handleARPRequest(reqEth, reqArp, &writer)
+		require.NotZero(t, writer.Len(), "handleARPRequest should have written a reply for the gateway IP")
+	})
+
+	// --- 3. Test ARP for an unmanaged IP ---
+	t.Run("ARP for unmanaged IP", func(t *testing.T) {
+		unmanagedIP := net.ParseIP("10.1.0.254")
+		reqEth := &layers.Ethernet{
+			SrcMAC:       clientMAC,
+			DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+			EthernetType: layers.EthernetTypeARP,
+		}
+		reqArp := &layers.ARP{
+			AddrType:          layers.LinkTypeEthernet,
+			Protocol:          layers.EthernetTypeIPv4,
+			HwAddressSize:     6,
+			ProtAddressSize:   4,
+			Operation:         layers.ARPRequest,
+			SourceHwAddress:   []byte(clientMAC),
+			SourceProtAddress: []byte(clientIP),
+			DstHwAddress:      []byte{0, 0, 0, 0, 0, 0},
+			DstProtAddress:    []byte(unmanagedIP),
+		}
+
+		writer.Reset()
+		app.handleARPRequest(reqEth, reqArp, &writer)
+		require.Zero(t, writer.Len(), "handleARPRequest should not write a reply for an unmanaged IP")
+	})
 }
