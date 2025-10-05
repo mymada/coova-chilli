@@ -1,0 +1,30 @@
+# Git files
+.git
+.gitignore
+.gitattributes
+
+# Docker files
+Dockerfile
+.dockerignore
+
+# Build artifacts and local binaries
+coovachilli
+*.out
+*.log
+
+# Test files and cache
+*_test.go
+test/
+.idea/
+.vscode/
+
+# Documentation
+docs/
+README.md
+ROADMAP.md
+TESTING.md
+INTEGRATION_TESTS_SUMMARY.txt
+
+# Scripts and Makefiles
+Makefile
+*.sh

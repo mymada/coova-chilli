@@ -17,7 +17,6 @@ type LoggingConfig struct {
 	Destination string `yaml:"dest"`      // "stdout", "syslog", or a file path
 	Level       string `yaml:"level"`       // "debug", "info", "warn", "error"
 	SyslogTag   string `yaml:"syslog_tag"`  // Tag for syslog messages
-	Format      string `yaml:"format"`      // "text" or "json"
 }
 
 // Config holds the application configuration.
@@ -155,14 +154,6 @@ type Config struct {
 	AdminAPI AdminAPIConfig `yaml:"admin_api"`
 	// Walled Garden settings
 	WalledGarden WalledGardenConfig `yaml:"walledgarden"`
-	// DNS settings
-	DNS DNSConfig `yaml:"dns"`
-}
-
-// DNSConfig holds the configuration for the DNS server/proxy.
-type DNSConfig struct {
-	BlocklistEnabled bool   `yaml:"blocklist_enabled"`
-	BlocklistPath    string `yaml:"blocklist_path"`
 }
 
 // AdminAPIConfig holds the configuration for the admin API.

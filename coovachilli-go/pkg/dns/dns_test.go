@@ -2,7 +2,6 @@ package dns
 
 import (
 	"net"
-	"os"
 	"testing"
 
 	"coovachilli-go/pkg/config"
@@ -176,63 +175,5 @@ func TestProxy_GardenIntegration(t *testing.T) {
 
 		// Garden should not be notified on error
 		assert.Equal(t, 0, garden.callCount)
-	})
-}
-
-func TestDNSProxyBlocklist(t *testing.T) {
-	// Create a temporary blocklist file
-	tmpfile, err := os.CreateTemp("", "blocklist_*.txt")
-	require.NoError(t, err)
-	defer os.Remove(tmpfile.Name()) // Clean up
-
-	// Write a domain to the blocklist
-	_, err = tmpfile.WriteString("blocked-domain.com\n")
-	require.NoError(t, err)
-	err = tmpfile.Close()
-	require.NoError(t, err)
-
-	// Configure the proxy to use the blocklist
-	cfg := &config.Config{
-		DNS1: net.ParseIP("8.8.8.8"), // A real upstream for the unblocked query
-		DNS: config.DNSConfig{
-			BlocklistEnabled: true,
-			BlocklistPath:    tmpfile.Name(),
-		},
-	}
-	logger := zerolog.Nop()
-	proxy := NewProxy(cfg, logger, nil)
-
-	// 1. Test a blocked domain
-	t.Run("query for blocked domain", func(t *testing.T) {
-		msg := new(dns.Msg)
-		msg.SetQuestion("blocked-domain.com.", dns.TypeA)
-		payload, err := msg.Pack()
-		require.NoError(t, err)
-
-		respPayload, err := proxy.HandleQuery(payload)
-		require.NoError(t, err)
-
-		respMsg := new(dns.Msg)
-		err = respMsg.Unpack(respPayload)
-		require.NoError(t, err)
-
-		assert.Equal(t, dns.RcodeNameError, respMsg.Rcode, "Expected NXDOMAIN for a blocked domain")
-	})
-
-	// 2. Test an unblocked domain
-	t.Run("query for unblocked domain", func(t *testing.T) {
-		msg := new(dns.Msg)
-		msg.SetQuestion("example.com.", dns.TypeA)
-		payload, err := msg.Pack()
-		require.NoError(t, err)
-
-		respPayload, err := proxy.HandleQuery(payload)
-		require.NoError(t, err)
-
-		respMsg := new(dns.Msg)
-		err = respMsg.Unpack(respPayload)
-		require.NoError(t, err)
-
-		assert.Equal(t, dns.RcodeSuccess, respMsg.Rcode, "Expected RcodeSuccess for an unblocked domain")
 	})
 }

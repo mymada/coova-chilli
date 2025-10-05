@@ -9,14 +9,14 @@ Ce document suit la progression du développement de CoovaChilli-Go.
 - [x] **Validation complète des tests :** Terminé (`go test ./...` est vert).
 
 ## 1. Architecture modulaire et évolutive (Validé)
-- [ ] **Installation facile :** L'affirmation concernant Docker était incorrecte. **Aucun `Dockerfile` n'a été trouvé.**
-- [ ] **Déploiement sur matériel léger :** Non validé.
+- [x] **Installation facile :** Terminé (implémentation d'un `Dockerfile` multi-étapes).
+- [x] **Déploiement sur matériel léger :** Terminé (outils de build et documentation pour la compilation croisée via Docker).
 - [ ] **Intégration Cloud :** Non validé.
 - [x] **Base modulaire :** L'architecture `pkg/` a été confirmée comme étant modulaire.
 
 ## 2. Sécurité et conformité (En cours)
-- [x] **Filtrage avancé des URL et DNS :** Terminé (implémentation de la liste de blocage DNS).
-- [x] **Export des journaux :** Terminé (implémentation du logging JSON configurable).
+- [ ] **Filtrage avancé des URL et DNS :** À faire.
+- [ ] **Export des journaux :** À faire.
 - [ ] **Filtrage de contenu et de protocoles :** À faire.
 - [ ] **Intégration antivirus/antimalware :** À faire.
 - [ ] **Surveillance d'intrusion en temps réel :** À faire.

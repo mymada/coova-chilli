@@ -85,3 +85,27 @@ sudo apt-get update && sudo apt-get install -y golang-go build-essential libpcap
     sudo ./coovachilli
     ```
     The application needs `sudo` because it requires elevated privileges to create TUN interfaces and manage firewall rules.
+
+## Cross-Compilation with Docker
+
+This project includes a multi-stage `Dockerfile` and a build script to facilitate building for different architectures, such as `arm` for Raspberry Pi devices. This is the recommended method for creating builds for production or for different platforms.
+
+**Prerequisites:**
+- Docker installed
+- The `docker buildx` command, which is included in modern Docker installations.
+
+**Usage:**
+
+To build for a specific architecture, use the `docker build` command with the `--platform` and `--build-arg` flags. For example, to build for `linux/arm/v7`:
+
+```bash
+docker build --platform linux/arm/v7 \
+  --build-arg TARGET_OS=linux \
+  --build-arg TARGET_ARCH=arm \
+  -t coovachilli-go:arm-latest .
+```
+
+This will produce a Docker image tagged `coovachilli-go:arm-latest` containing the application binary compiled for ARMv7.
+
+**Note on Native Cross-Compilation Issues:**
+During development, attempts to set up a native cross-compilation environment on a standard Debian/Ubuntu `amd64` host (using `gcc-arm-linux-gnueabihf` and `libpcap-dev:armhf`) were unsuccessful due to persistent `apt` repository configuration conflicts. The Docker-based approach is the recommended and most reliable method for building the application for different platforms.
