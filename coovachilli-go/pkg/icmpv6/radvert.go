@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"coovachilli-go/pkg/config"
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 )
 
 // BuildRouterAdvertisement creates a Router Advertisement packet using the modern gopacket API.

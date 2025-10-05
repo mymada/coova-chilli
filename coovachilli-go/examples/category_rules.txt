@@ -1,0 +1,47 @@
+# Category-based Filtering Rules
+# Format: category:action:regex_pattern
+# Actions: block, allow, log
+
+# Adult content - block
+adult:block:.*porn.*
+adult:block:.*xxx.*
+adult:block:.*sex.*
+
+# Advertising - log (for monitoring)
+advertising:log:.*ads.*
+advertising:log:.*advert.*
+advertising:log:.*banner.*
+
+# Social media - allow (whitelist specific patterns)
+social:allow:.*facebook.*
+social:allow:.*twitter.*
+social:allow:.*linkedin.*
+
+# Streaming services - log
+streaming:log:.*netflix.*
+streaming:log:.*youtube.*
+streaming:log:.*twitch.*
+
+# File sharing - block
+filesharing:block:.*torrent.*
+filesharing:block:.*piratebay.*
+filesharing:block:.*rapidshare.*
+
+# Gambling - block
+gambling:block:.*casino.*
+gambling:block:.*poker.*
+gambling:block:.*betting.*
+
+# Malware/Phishing - block
+security:block:.*malware.*
+security:block:.*phishing.*
+security:block:.*scam.*
+
+# Cryptocurrency mining - block
+mining:block:.*coinhive.*
+mining:block:.*cryptoloot.*
+
+# VPN/Proxy services - block (if you want to prevent circumvention)
+# proxy:block:.*vpn.*
+# proxy:block:.*proxy.*
+# proxy:block:.*tor.*

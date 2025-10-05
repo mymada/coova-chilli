@@ -1,0 +1,140 @@
+# Configuration Complète de Sécurité CoovaChilli-Go
+
+# Antimalware / Antivirus
+antimalware:
+  enabled: true
+  scanners:
+    - virustotal
+    - threatfox
+    # - clamav  # Décommenter si ClamAV est disponible
+  virustotal_api_key: "YOUR_VIRUSTOTAL_API_KEY"
+  clamav_host: "localhost:3310"
+  cache_ttl: 60  # Cache results for 60 minutes
+
+# Système de Détection d'Intrusion (IDS)
+ids:
+  enabled: true
+
+  # Types de détection
+  detect_port_scan: true
+  detect_brute_force: true
+  detect_ddos: true
+  detect_sql_injection: true
+  detect_xss: true
+
+  # Seuils de détection
+  port_scan_threshold: 10      # Nombre de ports différents scannés
+  brute_force_threshold: 5     # Nombre de tentatives d'auth échouées
+  ddos_threshold: 100          # Connexions par fenêtre de temps
+  ddos_time_window: 10         # Fenêtre de temps en secondes
+
+# Chiffrement SSL/TLS
+tls:
+  enabled: true
+  cert_file: "/etc/coovachilli/certs/server.crt"
+  key_file: "/etc/coovachilli/certs/server.key"
+  ca_file: "/etc/coovachilli/certs/ca.crt"
+
+  # Authentification client (optionnel)
+  require_client_cert: false
+  client_cert_file: "/etc/coovachilli/certs/client.crt"
+  client_key_file: "/etc/coovachilli/certs/client.key"
+
+  # NE PAS utiliser en production
+  insecure_skip_verify: false
+
+# Gestion VLAN Avancée
+vlan:
+  enabled: true
+  default_vlan: 100
+
+  vlans:
+    # Réseau invité
+    - id: 10
+      name: "guest"
+      description: "Guest WiFi Network"
+      network: "10.10.0.0/24"
+      gateway: "10.10.0.1"
+      dns: ["8.8.8.8", "8.8.4.4"]
+      isolated: true  # Client isolation activée
+
+    # Réseau employés
+    - id: 20
+      name: "employee"
+      description: "Employee Network"
+      network: "10.20.0.0/24"
+      gateway: "10.20.0.1"
+      dns: ["10.0.0.53", "10.0.0.54"]
+      isolated: false
+
+    # Réseau VIP
+    - id: 30
+      name: "vip"
+      description: "VIP/Executive Network"
+      network: "10.30.0.0/24"
+      gateway: "10.30.0.1"
+      dns: ["10.0.0.53"]
+      isolated: false
+
+    # Réseau IoT
+    - id: 40
+      name: "iot"
+      description: "IoT Devices"
+      network: "10.40.0.0/24"
+      gateway: "10.40.0.1"
+      dns: ["8.8.8.8"]
+      isolated: true
+
+  # Affectation de VLAN par rôle utilisateur
+  role_vlans:
+    guest: 10
+    employee: 20
+    vip: 30
+    iot: 40
+
+# Conformité RGPD
+gdpr:
+  enabled: true
+
+  # Durée de rétention des données (en jours)
+  data_retention_days: 365
+
+  # Anonymiser au lieu de supprimer (recommandé pour les logs)
+  anonymize_instead_of_delete: true
+
+  # Chiffrement des données personnelles
+  encrypt_personal_data: true
+  encryption_key: "CHANGE_THIS_TO_32_CHAR_SECRET_KEY_1234567890abcdef"
+
+# Filtrage URL/DNS (déjà configuré)
+urlfilter:
+  enabled: true
+  domain_blocklist_path: "/etc/coovachilli/blocklist_domains.txt"
+  ip_blocklist_path: "/etc/coovachilli/blocklist_ips.txt"
+  category_rules_path: "/etc/coovachilli/category_rules.txt"
+  default_action: "allow"
+
+# Export de logs (déjà configuré)
+logexport:
+  enabled: true
+  exporters:
+    - file
+    - syslog
+  syslog_addr: "192.0.2.10:514"
+  syslog_proto: "udp"
+  file_path: "/var/log/coovachilli/export.jsonl"
+  es_endpoint: "http://elasticsearch:9200"
+  es_index: "coovachilli-logs"
+
+# Autres paramètres de sécurité existants
+clientisolation: true  # Isoler les clients entre eux
+ieee8021q: true        # Support 802.1Q VLAN tagging
+vlans: [10, 20, 30, 40]  # VLANs autorisés
+
+# Firewall
+firewallbackend: "iptables"
+extif: "eth0"
+
+# Ports autorisés pour les utilisateurs non authentifiés
+tcpports: [80, 443, 8080]
+udpports: [53, 123]

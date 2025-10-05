@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -22,6 +23,9 @@ type Server struct {
 	disconnecter   core.Disconnector
 	logger         zerolog.Logger
 	router         *mux.Router
+	dashboard      *Dashboard
+	snapshotMgr    *SnapshotManager
+	rateLimiter    *RateLimiter
 }
 
 // NewServer creates a new admin API server.
@@ -32,7 +36,34 @@ func NewServer(cfg *config.Config, sm *core.SessionManager, dc core.Disconnector
 		disconnecter:   dc,
 		logger:         logger.With().Str("component", "admin-api").Logger(),
 		router:         mux.NewRouter(),
+		rateLimiter:    NewRateLimiter(),
 	}
+
+	// Initialize dashboard
+	s.dashboard = NewDashboard(sm)
+	s.dashboard.Start(10 * time.Second) // Collect stats every 10 seconds
+
+	// Initialize snapshot manager
+	snapshotDir := "/var/lib/coovachilli/snapshots"
+	if dir := os.Getenv("COOVACHILLI_SNAPSHOT_DIR"); dir != "" {
+		snapshotDir = dir
+	}
+	snapshotMgr, err := NewSnapshotManager(snapshotDir, cfg)
+	if err != nil {
+		logger.Warn().Err(err).Msg("Failed to initialize snapshot manager")
+	} else {
+		s.snapshotMgr = snapshotMgr
+	}
+
+	// Start cleanup goroutine for rate limiter
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.rateLimiter.CleanupOldEntries()
+		}
+	}()
+
 	s.setupRoutes()
 	return s
 }
@@ -76,15 +107,8 @@ func (s *Server) Start() {
 }
 
 func (s *Server) setupRoutes() {
-	api := s.router.PathPrefix("/api/v1").Subrouter()
-
-	// Apply authentication middleware to all API routes
-	api.Use(s.authMiddleware)
-
-	api.HandleFunc("/status", s.handleStatus).Methods("GET")
-	api.HandleFunc("/sessions", s.handleListSessions).Methods("GET")
-	api.HandleFunc("/sessions/{id}", s.handleGetSession).Methods("GET")
-	api.HandleFunc("/sessions/{id}/logout", s.handleLogoutSession).Methods("POST")
+	// Use the comprehensive API routes setup
+	s.setupAPIRoutes()
 }
 
 // --- Response Structs ---
@@ -214,6 +238,34 @@ func (s *Server) findSession(identifier string) *core.Session {
 func (s *Server) writeError(w http.ResponseWriter, code int, message string) {
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(errorResponse{Error: message})
+}
+
+// securityHeadersMiddleware adds security headers to all responses
+func (s *Server) securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Prevent MIME sniffing
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+
+		// Enable XSS protection in browsers
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+
+		// Prevent clickjacking
+		w.Header().Set("X-Frame-Options", "DENY")
+
+		// Strict Transport Security (HSTS) - 1 year
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+
+		// Content Security Policy - restrict to same origin
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'")
+
+		// Referrer Policy - don't leak referrer info
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+
+		// Permissions Policy - disable unnecessary features
+		w.Header().Set("Permissions-Policy", "geolocation=(), microphone=(), camera=(), payment=()")
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {

@@ -1,0 +1,107 @@
+# Configuration complète - Administration centralisée CoovaChilli-Go
+
+# API d'administration
+admin_api:
+  enabled: true
+  listen: "0.0.0.0:8080"
+
+  # Token d'authentification (générer avec: openssl rand -hex 32)
+  auth_token: "CHANGE_THIS_TO_A_SECURE_RANDOM_TOKEN_64_CHARS_MIN_1234567890"
+
+  # Timeouts
+  read_timeout: 30s
+  write_timeout: 30s
+  idle_timeout: 120s
+
+  # Rate limiting pour protéger l'API
+  rate_limit_enabled: true
+  rate_limit: 10.0        # 10 requêtes par seconde maximum
+  rate_limit_burst: 20    # Burst autorisé de 20 requêtes
+
+# Configuration réseau de base
+net: "10.10.0.0/16"
+dhcpif: "eth1"
+dhcpstart: "10.10.1.1"
+dhcpend: "10.10.254.254"
+uamport: 3990
+uamuiport: 4990
+
+# RADIUS
+radiusserver1: "192.0.2.1"
+radiusauthport: 1812
+radiusacctport: 1813
+radiussecret: "your-radius-secret"
+
+# Logging (requis pour le dashboard)
+logging:
+  dest: "stdout"
+  level: "info"
+
+# Métriques (pour intégration Prometheus)
+metrics:
+  enabled: true
+  backend: "prometheus"
+  listen: ":9090"
+
+# Sécurité (intégré au dashboard)
+antimalware:
+  enabled: true
+  scanners: [virustotal, threatfox]
+  virustotal_api_key: "YOUR_VIRUSTOTAL_KEY"
+
+ids:
+  enabled: true
+  detect_port_scan: true
+  detect_brute_force: true
+  detect_ddos: true
+  port_scan_threshold: 10
+  brute_force_threshold: 5
+  ddos_threshold: 100
+
+urlfilter:
+  enabled: true
+  domain_blocklist_path: "/etc/coovachilli/blocklist_domains.txt"
+  default_action: "allow"
+
+# VLAN (segmentation réseau)
+vlan:
+  enabled: true
+  default_vlan: 100
+  vlans:
+    - id: 10
+      name: "guest"
+      description: "Invités WiFi"
+      network: "10.10.0.0/24"
+      isolated: true
+    - id: 20
+      name: "employee"
+      description: "Employés"
+      network: "10.20.0.0/24"
+      isolated: false
+    - id: 30
+      name: "vip"
+      description: "VIP/Executives"
+      network: "10.30.0.0/24"
+      isolated: false
+  role_vlans:
+    guest: 10
+    employee: 20
+    vip: 30
+
+# RGPD (conformité)
+gdpr:
+  enabled: true
+  data_retention_days: 365
+  encrypt_personal_data: true
+  encryption_key: "CHANGE_THIS_TO_32_CHAR_SECRET_KEY_1234567890abcdef"
+  anonymize_instead_of_delete: true
+
+# Export de logs (pour SIEM/analyse)
+logexport:
+  enabled: true
+  exporters:
+    - file
+    - syslog
+  file_path: "/var/log/coovachilli/export.jsonl"
+  syslog_addr: "192.0.2.10:514"
+  syslog_proto: "udp"
