@@ -17,6 +17,7 @@ import (
 
 	"coovachilli-go/pkg/admin"
 	"coovachilli-go/pkg/auth"
+	ldapauth "coovachilli-go/pkg/auth/ldap"
 	"coovachilli-go/pkg/cluster"
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
@@ -518,6 +519,29 @@ func (app *application) handleRadiusRequests() {
 				}
 			}
 
+			// Try LDAP authentication if enabled
+			if app.cfg.LDAP.Enabled {
+				ldapAuthenticated, err := ldapauth.Authenticate(&app.cfg.LDAP, username, password, app.logger)
+				if err != nil {
+					// Log the error but fall through to RADIUS as a fallback
+					app.logger.Error().Err(err).Str("user", username).Msg("Error during LDAP authentication")
+				} else if ldapAuthenticated {
+					app.logger.Info().Str("user", username).Msg("User authenticated successfully via LDAP")
+					s.Lock()
+					s.Authenticated = true
+					s.InitializeShaper(app.cfg)
+					if err := app.firewall.AddAuthenticatedUser(s.HisIP); err != nil {
+						app.logger.Error().Err(err).Str("user", s.Redir.Username).Msg("Error adding firewall/TC rules for LDAP user")
+					}
+					s.Unlock()
+					go app.radiusClient.SendAccountingRequest(s, rfc2866.AcctStatusType(1)) // 1 = Start
+					app.scriptRunner.RunScript(app.cfg.ConUp, s, 0)
+					s.AuthResult <- true
+					return
+				}
+			}
+
+			// Fallback to RADIUS
 			resp, err := app.radiusClient.SendAccessRequest(s, username, password)
 			if err != nil {
 				app.logger.Error().Err(err).Str("user", username).Msg("Error sending RADIUS Access-Request")
