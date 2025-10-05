@@ -18,6 +18,7 @@ go test ./pkg/...
 # Avec race detector
 make test-race
 ```
+test
 
 ### Tests d'intégration
 

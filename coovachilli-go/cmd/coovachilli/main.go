@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io"
@@ -31,9 +32,10 @@ import (
 	"coovachilli-go/pkg/script"
 	"coovachilli-go/pkg/tun"
 
-	"github.com/gopacket/gopacket"
-	"github.com/gopacket/gopacket/layers"
-	"github.com/gopacket/gopacket/pcap"
+	"github.com/dreadl0ck/tlsx"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/sevlyar/go-daemon"
@@ -161,6 +163,7 @@ type application struct {
 	ethLayer          layers.Ethernet
 	ip4Layer          layers.IPv4
 	udpLayer          layers.UDP
+	tcpLayer          layers.TCP
 	dnsLayer          layers.DNS
 
 	// Channels
@@ -168,6 +171,43 @@ type application struct {
 	coaReqChan    chan core.CoAContext
 	packetChan    chan []byte
 	shutdownChan  chan os.Signal
+
+	// L7 Filtering
+	sniBlocklist map[string]struct{}
+}
+
+func loadSNIBlocklist(cfg *config.Config, logger zerolog.Logger) (map[string]struct{}, error) {
+	blocklist := make(map[string]struct{})
+	if !cfg.L7Filtering.SNIFilteringEnabled {
+		return blocklist, nil
+	}
+
+	if cfg.L7Filtering.SNIBlocklistPath == "" {
+		return nil, fmt.Errorf("SNI filtering is enabled but no blocklist path is configured")
+	}
+
+	file, err := os.Open(cfg.L7Filtering.SNIBlocklistPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open SNI blocklist file '%s': %w", cfg.L7Filtering.SNIBlocklistPath, err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	lines := 0
+	for scanner.Scan() {
+		domain := strings.TrimSpace(scanner.Text())
+		if domain != "" && !strings.HasPrefix(domain, "#") {
+			blocklist[domain] = struct{}{}
+			lines++
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading SNI blocklist file: %w", err)
+	}
+
+	logger.Info().Int("count", lines).Msg("Loaded domains into SNI blocklist")
+	return blocklist, nil
 }
 
 // termHandler is the signal handler for the daemon.
@@ -197,7 +237,7 @@ func buildApplication(cfg *config.Config, reloader *config.Reloader) (*applicati
 		packetChan:    make(chan []byte),
 		shutdownChan:  make(chan os.Signal, 1),
 	}
-	app.parser = gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &app.ethLayer, &app.ip4Layer, &app.udpLayer, &app.dnsLayer)
+	app.parser = gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &app.ethLayer, &app.ip4Layer, &app.tcpLayer, &app.udpLayer, &app.dnsLayer)
 
 	// Initialize metrics recorder
 	if cfg.Metrics.Enabled {
@@ -252,6 +292,13 @@ func buildApplication(cfg *config.Config, reloader *config.Reloader) (*applicati
 	// Register reconfigurable components
 	reloader.Register(app.firewall)
 	reloader.Register(app.sessionManager)
+
+	// Load SNI blocklist for L7 filtering
+	sniBlocklist, err := loadSNIBlocklist(cfg, app.logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load SNI blocklist: %w", err)
+	}
+	app.sniBlocklist = sniBlocklist
 
 	return app, nil
 }
@@ -585,6 +632,24 @@ func (app *application) processPackets() {
 		session.RUnlock()
 
 		if isAuthenticated {
+			// SNI-based content filtering for authenticated users
+			if len(app.sniBlocklist) > 0 {
+				// Re-parse the packet on-demand for TLS analysis
+				if clientHello := tlsx.GetClientHello(gopacket.NewPacket(rawPacket, layers.LayerTypeEthernet, gopacket.Default)); clientHello != nil {
+					serverName := clientHello.SNI
+					if serverName != "" {
+						if _, isBlocked := app.sniBlocklist[serverName]; isBlocked {
+							app.logger.Info().
+								Str("user", session.Redir.Username).
+								Str("ip", session.HisIP.String()).
+								Str("domain", serverName).
+								Msg("Blocking TLS connection due to SNI blocklist")
+							continue // Drop the packet
+						}
+					}
+				}
+			}
+
 			if session.ShouldDropPacket(packetSize, isUplink) {
 				app.logger.Debug().Str("user", session.Redir.Username).Bool("isUplink", isUplink).Msg("Dropping packet due to bandwidth limit")
 				continue

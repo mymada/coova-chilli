@@ -49,6 +49,24 @@ cluster:
   interface: "eth1" # The dedicated interface for cluster communication
 ```
 
+## Content Filtering (SNI)
+
+The application supports Layer 7 content filtering for authenticated users by inspecting the Server Name Indication (SNI) in TLS `ClientHello` messages. This allows you to block access to specific HTTPS websites without needing to perform full TLS decryption.
+
+**How it works:**
+- When an authenticated user attempts to connect to an HTTPS site, the application inspects the initial TLS handshake.
+- It extracts the requested domain name (SNI) from the `ClientHello` message.
+- If the domain is found in the SNI blocklist, the packet is dropped, preventing the TLS session from being established.
+
+**Configuration:**
+To enable SNI filtering, add the following section to your `config.yaml`:
+```yaml
+l7filtering:
+  sni_filtering_enabled: true
+  sni_blocklist_path: "/path/to/your/sni_blocklist.txt"
+```
+The `sni_blocklist.txt` file should contain one domain per line.
+
 ## Getting Started
 
 ### Prerequisites
@@ -85,3 +103,45 @@ sudo apt-get update && sudo apt-get install -y golang-go build-essential libpcap
     sudo ./coovachilli
     ```
     The application needs `sudo` because it requires elevated privileges to create TUN interfaces and manage firewall rules.
+
+## Configuration
+
+The application is configured using a YAML file (`config.yaml` by default). However, for cloud-native and containerized deployments, all configuration options can be overridden with environment variables.
+
+**Priority Order:**
+1.  Environment Variables (highest priority)
+2.  Values from `config.yaml` file (lowest priority)
+
+Environment variables must be prefixed with `COOVACHILLI_`. For nested configuration keys, the path is joined with an underscore.
+
+**Example:**
+
+To override the logging level defined in `config.yaml`, you can set the following environment variable:
+```bash
+export COOVACHILLI_LOGGING_LEVEL=debug
+```
+This corresponds to the `level` key inside the `logging` section.
+
+## Cross-Compilation with Docker
+
+This project includes a multi-stage `Dockerfile` and a build script to facilitate building for different architectures, such as `arm` for Raspberry Pi devices. This is the recommended method for creating builds for production or for different platforms.
+
+**Prerequisites:**
+- Docker installed
+- The `docker buildx` command, which is included in modern Docker installations.
+
+**Usage:**
+
+To build for a specific architecture, use the `docker build` command with the `--platform` and `--build-arg` flags. For example, to build for `linux/arm/v7`:
+
+```bash
+docker build --platform linux/arm/v7 \
+  --build-arg TARGET_OS=linux \
+  --build-arg TARGET_ARCH=arm \
+  -t coovachilli-go:arm-latest .
+```
+
+This will produce a Docker image tagged `coovachilli-go:arm-latest` containing the application binary compiled for ARMv7.
+
+**Note on Native Cross-Compilation Issues:**
+During development, attempts to set up a native cross-compilation environment on a standard Debian/Ubuntu `amd64` host (using `gcc-arm-linux-gnueabihf` and `libpcap-dev:armhf`) were unsuccessful due to persistent `apt` repository configuration conflicts. The Docker-based approach is the recommended and most reliable method for building the application for different platforms.
