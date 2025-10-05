@@ -171,3 +171,100 @@ func TestHandleJsonpStatus(t *testing.T) {
 	require.Equal(t, uint64(1024), resp.Accounting.InputOctets)
 	require.Equal(t, uint64(2048), resp.Accounting.OutputOctets)
 }
+
+// SECURITY TESTS
+func TestIsValidJSONPCallback(t *testing.T) {
+	tests := []struct {
+		name     string
+		callback string
+		valid    bool
+	}{
+		// Valid callbacks
+		{"simple function", "myCallback", true},
+		{"namespaced function", "jQuery.myCallback", true},
+		{"deep namespace", "app.utils.callbacks.handleResponse", true},
+		{"with underscore", "my_callback_function", true},
+		{"with dollar sign", "$callback", true},
+		{"mixed valid chars", "jQuery1_9$callback", true},
+
+		// Invalid callbacks - Security tests
+		{"XSS attempt - script tag", "<script>alert(1)</script>", false},
+		{"XSS attempt - event handler", "alert(document.cookie)", false},
+		{"XSS attempt - parentheses", "alert(1)", false},
+		{"XSS attempt - semicolon", "func;alert(1)", false},
+		{"XSS attempt - quotes", "func'alert(1)'", false},
+		{"XSS attempt - backslash", "func\\alert", false},
+		{"XSS attempt - newline", "func\nalert(1)", false},
+		{"XSS attempt - null byte", "func\x00alert", false},
+		{"path traversal attempt", "../../../etc/passwd", false},
+		{"starts with digit", "1callback", false},
+		{"starts with dot", ".callback", false},
+		{"empty string", "", false},
+		{"too long", strings.Repeat("a", 101), false},
+		{"space in middle", "my callback", false},
+		{"special chars", "my!callback", false},
+		{"SQL injection attempt", "'; DROP TABLE users--", false},
+		{"command injection", "`rm -rf /`", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isValidJSONPCallback(tt.callback)
+			if result != tt.valid {
+				t.Errorf("isValidJSONPCallback(%q) = %v, want %v", tt.callback, result, tt.valid)
+			}
+		})
+	}
+}
+
+func TestHandleJsonpStatus_SecurityValidation(t *testing.T) {
+	cfg := &config.Config{}
+	sm := core.NewSessionManager(cfg, nil)
+	server := NewServer(cfg, sm, nil, nil, zerolog.Nop(), nil)
+
+	maliciousCallbacks := []struct {
+		name     string
+		callback string
+	}{
+		{"script tag", "<script>alert(1)</script>"},
+		{"parentheses", "alert(document.cookie)"},
+		{"quotes", "';alert(1)//"},
+		{"path traversal", "../../etc/passwd"},
+		{"backticks", "`rm -rf /`"},
+		{"semicolon", "func;alert(1)"},
+		{"exclamation", "func!alert"},
+	}
+
+	for _, tc := range maliciousCallbacks {
+		t.Run("rejects_"+tc.name, func(t *testing.T) {
+			// Create request with query parameter directly to avoid URL parsing issues
+			req := httptest.NewRequest("GET", "/json/status", nil)
+			q := req.URL.Query()
+			q.Set("callback", tc.callback)
+			req.URL.RawQuery = q.Encode()
+			rr := httptest.NewRecorder()
+			req.RemoteAddr = "10.0.0.1:12345"
+
+			server.handleJsonpStatus(rr, req)
+
+			// Should reject with 400 Bad Request
+			require.Equal(t, http.StatusBadRequest, rr.Code)
+			require.Contains(t, rr.Body.String(), "Invalid callback")
+		})
+	}
+}
+
+func TestHandleJsonpStatus_NoCallback(t *testing.T) {
+	cfg := &config.Config{}
+	sm := core.NewSessionManager(cfg, nil)
+	server := NewServer(cfg, sm, nil, nil, zerolog.Nop(), nil)
+
+	req := httptest.NewRequest("GET", "/json/status", nil)
+	rr := httptest.NewRecorder()
+	req.RemoteAddr = "10.0.0.1:12345"
+
+	server.handleJsonpStatus(rr, req)
+
+	require.Equal(t, http.StatusBadRequest, rr.Code)
+	require.Contains(t, rr.Body.String(), "Callback function name is required")
+}

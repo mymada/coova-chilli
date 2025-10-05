@@ -18,6 +18,7 @@ import (
 
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
+	"coovachilli-go/pkg/securestore"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 	"layeh.com/radius"
@@ -28,23 +29,28 @@ func TestCoAListener(t *testing.T) {
 	// Setup
 	cfg := &config.Config{
 		CoaPort:      3799,
-		RadiusSecret: "secret",
+		RadiusSecret: securestore.NewSecret("secret"),
 	}
 	logger := zerolog.Nop()
 	client := NewClient(cfg, logger, nil)
-	coaReqChan := make(chan CoAIncomingRequest, 1)
+	coaReqChan := make(chan core.CoAContext, 1)
 
 	go client.StartCoAListener(coaReqChan)
 	time.Sleep(50 * time.Millisecond) // Give the listener time to start
 
-	// Create a Disconnect-Request packet
-	packet := radius.New(radius.CodeDisconnectRequest, []byte(cfg.RadiusSecret))
-	rfc2865.UserName_SetString(packet, "testuser")
+	// Create a Disconnect-Request packet and send it
+	var encoded []byte
+	var err error
+	cfg.RadiusSecret.Access(func(secret []byte) error {
+		packet := radius.New(radius.CodeDisconnectRequest, secret)
+		rfc2865.UserName_SetString(packet, "testuser")
+		encoded, err = packet.Encode()
+		return err
+	})
+	require.NoError(t, err)
 
 	// Send the packet to the listener
 	conn, err := net.Dial("udp", "127.0.0.1:3799")
-	require.NoError(t, err)
-	encoded, err := packet.Encode()
 	require.NoError(t, err)
 	_, err = conn.Write(encoded)
 	require.NoError(t, err)
@@ -53,8 +59,8 @@ func TestCoAListener(t *testing.T) {
 	// Assert that the request is received on the channel
 	select {
 	case req := <-coaReqChan:
-		require.Equal(t, radius.CodeDisconnectRequest, req.Packet.Code)
-		user := rfc2865.UserName_GetString(req.Packet)
+		require.Equal(t, radius.CodeDisconnectRequest, req.Packet().Code)
+		user := rfc2865.UserName_GetString(req.Packet())
 		require.Equal(t, "testuser", user)
 	case <-time.After(1 * time.Second):
 		t.Fatal("Did not receive CoA request on channel")
@@ -249,7 +255,7 @@ func TestRadSecExchange(t *testing.T) {
 	// Configure the radius.Client
 	cfg := &config.Config{
 		RadiusServer1:  serverHost,
-		RadiusSecret:   "1234567890123456",
+		RadiusSecret:   securestore.NewSecret("1234567890123456"),
 		RadSecEnable:   true,
 		RadSecPort:     serverPort,
 		RadSecCertFile: clientCertFile.Name(),
@@ -332,7 +338,7 @@ func TestRadiusFailover(t *testing.T) {
 		RadiusAuthPort: 1, // Invalid port to force failure
 		RadiusServer2:  serverHost,
 		RadiusAcctPort: serverPort, // For simplicity, use same port for auth/acct
-		RadiusSecret:   "1234567890123456",
+		RadiusSecret:   securestore.NewSecret("1234567890123456"),
 	}
 	cfg.RadiusAuthPort = serverPort // Point secondary auth to the mock server
 
@@ -396,10 +402,10 @@ func TestRadiusProxy(t *testing.T) {
 		ProxyEnable:    true,
 		ProxyListen:    "127.0.0.1",
 		ProxyPort:      0, // Use random port
-		ProxySecret:    proxySecret,
+		ProxySecret:    securestore.NewSecret(proxySecret),
 		RadiusServer1:  upstreamHost,
 		RadiusAuthPort: upstreamPort,
-		RadiusSecret:   upstreamSecret,
+		RadiusSecret:   securestore.NewSecret(upstreamSecret),
 	}
 	sm := core.NewSessionManager(cfg, nil)
 	mac, _ := net.ParseMAC("00:11:22:33:44:55")

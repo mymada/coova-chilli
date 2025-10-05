@@ -10,6 +10,7 @@ import (
 
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
+	"coovachilli-go/pkg/securestore"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 )
@@ -134,7 +135,7 @@ func TestHandleLogoutSession(t *testing.T) {
 func TestAuthMiddleware(t *testing.T) {
 	cfg := &config.Config{
 		AdminAPI: config.AdminAPIConfig{
-			AuthToken: "secret-token",
+			AuthToken: securestore.NewSecret("secret-token"),
 		},
 	}
 	server, _, _ := setupTestServer(t, cfg)

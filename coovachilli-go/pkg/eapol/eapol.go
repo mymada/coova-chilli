@@ -176,12 +176,15 @@ func (h *Handler) handleRadiusAccept(session *core.Session, radiusResp *layehrad
 
 	var pmk []byte
 	if encryptedKey := radius.GetMSMPPERecvKey(radiusResp); encryptedKey != nil {
-		decryptedKey, err := decryptMSMPPEKey([]byte(h.cfg.RadiusSecret), requestAuthenticator, encryptedKey)
-		if err == nil {
-			pmk = decryptedKey
-		} else {
-			h.logger.Error().Err(err).Msg("Failed to decrypt MS-MPPE-Recv-Key")
-		}
+		h.cfg.RadiusSecret.Access(func(secret []byte) error {
+			decryptedKey, err := decryptMSMPPEKey(secret, requestAuthenticator, encryptedKey)
+			if err == nil {
+				pmk = decryptedKey
+			} else {
+				h.logger.Error().Err(err).Msg("Failed to decrypt MS-MPPE-Recv-Key")
+			}
+			return nil
+		})
 	}
 	if pmk != nil {
 		session.EAPOL.PMK = pmk

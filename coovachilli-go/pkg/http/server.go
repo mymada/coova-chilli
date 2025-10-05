@@ -476,10 +476,42 @@ type jsonpAccounting struct {
 	OutputOctets uint64 `json:"outputOctets"`
 }
 
+// isValidJSONPCallback validates that a JSONP callback is safe.
+// It only allows alphanumeric characters, underscores, dots, and dollar signs.
+// This prevents XSS attacks via callback injection.
+func isValidJSONPCallback(callback string) bool {
+	if len(callback) == 0 || len(callback) > 100 {
+		return false
+	}
+	// First character must be letter, underscore, or dollar sign
+	if !((callback[0] >= 'a' && callback[0] <= 'z') ||
+		(callback[0] >= 'A' && callback[0] <= 'Z') ||
+		callback[0] == '_' || callback[0] == '$') {
+		return false
+	}
+	// Subsequent characters can include digits and dots
+	for _, ch := range callback[1:] {
+		if !((ch >= 'a' && ch <= 'z') ||
+			(ch >= 'A' && ch <= 'Z') ||
+			(ch >= '0' && ch <= '9') ||
+			ch == '_' || ch == '.' || ch == '$') {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) handleJsonpStatus(w http.ResponseWriter, r *http.Request) {
 	callback := r.URL.Query().Get("callback")
 	if callback == "" {
 		http.Error(w, "Callback function name is required", http.StatusBadRequest)
+		return
+	}
+
+	// SECURITY: Validate callback to prevent XSS injection
+	if !isValidJSONPCallback(callback) {
+		s.logger.Warn().Str("callback", callback).Msg("Invalid JSONP callback rejected")
+		http.Error(w, "Invalid callback function name", http.StatusBadRequest)
 		return
 	}
 

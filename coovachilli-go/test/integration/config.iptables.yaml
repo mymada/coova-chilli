@@ -1,0 +1,90 @@
+# CoovaChilli-Go Integration Test Configuration - iptables
+
+foreground: true
+pidfile: /var/run/chilli.pid
+interval: 3600s
+
+logging:
+  dest: "stdout"
+  level: "debug"
+  syslog_tag: "coovachilli-iptables"
+
+# TUN/TAP settings
+tundev: tun0
+
+# Network settings (IPv4)
+net: 10.1.0.0/24
+uamlisten: 10.1.0.1
+dhcplisten: 10.1.0.1
+
+# IPv6 settings
+net_v6: fd01:1::/64
+uamlisten_v6: fd01:1::1
+dhcplisten_v6: fd01:1::1
+
+# DHCP settings
+dhcpif: eth0
+extif: eth0
+clientisolation: true
+dhcprelay: false
+dhcpstart: 10.1.0.100
+dhcpend: 10.1.0.200
+dhcpstart_v6: "fd01:1::100"
+dhcpend_v6: "fd01:1::200"
+lease: 1h
+dns1: 8.8.8.8
+dns2: 8.8.4.4
+dns1_v6: "2001:4860:4860::8888"
+dns2_v6: "2001:4860:4860::8844"
+
+# RADIUS settings
+radiuslisten: 10.1.0.1
+radiusserver1: 192.168.100.10
+radiusauthport: 1812
+radiusacctport: 1813
+radiussecret: "testing123"
+radiusnasid: "coovachilli-iptables"
+coaport: 3799
+radsecenable: false
+
+# UAM/Captive Portal settings
+uamport: 8080
+uamallowed:
+  - "192.168.100.10"  # RADIUS server
+  - "192.168.100.200" # Test webserver
+uamanyip: false
+uamanydns: false
+defsessiontimeout: 3600
+defidletimeout: 600
+defbandwidthmaxdown: 10000000  # 10 Mbps
+defbandwidthmaxup: 10000000    # 10 Mbps
+
+# Firewall settings - iptables
+firewallbackend: "iptables"
+
+# Management
+statefile: /tmp/chilli.state
+cmdsocket: /var/run/chilli.sock
+
+# Cluster settings (disabled for tests)
+cluster:
+  enabled: false
+
+# Metrics settings
+metrics:
+  enabled: true
+  backend: "prometheus"
+  listen: "0.0.0.0:9090"
+
+# Admin API settings
+admin_api:
+  enabled: true
+  listen: "0.0.0.0:8081"
+  auth_token: "test-admin-token-12345"
+
+# Walled Garden settings
+walledgarden:
+  allowedDomains:
+    - "*.google.com"
+  allowedNetworks:
+    - "192.168.100.0/24"

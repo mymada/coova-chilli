@@ -1,7 +1,18 @@
 {
   "permissions": {
     "allow": [
-      "Bash(go build:*)"
+      "Bash(go build:*)",
+      "Bash(cat:*)",
+      "Bash(find:*)",
+      "Bash(go test:*)",
+      "Bash(go get:*)",
+      "Read(//tmp/**)",
+      "Bash(go clean:*)",
+      "Bash(awk:*)",
+      "Bash(sort:*)",
+      "Bash(go tool cover:*)",
+      "Bash(chmod:*)",
+      "Bash(./verify_setup.sh:*)"
     ],
     "deny": [],
     "ask": []

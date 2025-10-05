@@ -50,7 +50,12 @@ func (s *ProxyServer) Start() {
 			continue
 		}
 
-		packet, err := radius.Parse(buf[:n], []byte(s.cfg.ProxySecret))
+		var packet *radius.Packet
+		err = s.cfg.ProxySecret.Access(func(secret []byte) error {
+			var parseErr error
+			packet, parseErr = radius.Parse(buf[:n], secret)
+			return parseErr
+		})
 		if err != nil {
 			s.logger.Error().Err(err).Msg("Failed to parse incoming proxy packet")
 			continue
@@ -92,9 +97,17 @@ func (s *ProxyServer) handleProxyRequest(pc net.PacketConn, peer net.Addr, reque
 		// For a proxy, we must forward the original packet's attributes,
 		// especially the encrypted User-Password, which we cannot decrypt.
 		// We create a new packet and copy all attributes.
-		upstreamPacket := radius.New(request.Code, []byte(s.radiusClient.cfg.RadiusSecret))
-		upstreamPacket.Attributes = request.Attributes
-		upstreamPacket.Authenticator = request.Authenticator
+		var upstreamPacket *radius.Packet
+		err = s.radiusClient.cfg.RadiusSecret.Access(func(secret []byte) error {
+			upstreamPacket = radius.New(request.Code, secret)
+			upstreamPacket.Attributes = request.Attributes
+			upstreamPacket.Authenticator = request.Authenticator
+			return nil
+		})
+		if err != nil {
+			s.logger.Error().Err(err).Msg("Failed to access RADIUS secret for upstream packet")
+			return
+		}
 
 		// Use the client's exchange mechanism to send the request upstream.
 		upstreamResponse, err = s.radiusClient.exchangeWithFailover(upstreamPacket, true)

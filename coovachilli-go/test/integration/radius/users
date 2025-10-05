@@ -1,0 +1,39 @@
+# RADIUS users file for integration tests
+
+# Test user with full access
+testuser Cleartext-Password := "testpass"
+    Reply-Message = "Hello testuser, welcome to CoovaChilli-Go!",
+    Session-Timeout = 3600,
+    Idle-Timeout = 600,
+    WISPr-Bandwidth-Max-Down = 10000000,
+    WISPr-Bandwidth-Max-Up = 10000000
+
+# Test user with limited bandwidth
+limiteduser Cleartext-Password := "limitedpass"
+    Reply-Message = "Limited bandwidth user",
+    Session-Timeout = 1800,
+    Idle-Timeout = 300,
+    WISPr-Bandwidth-Max-Down = 1000000,
+    WISPr-Bandwidth-Max-Up = 512000
+
+# Test user with short session
+shortuser Cleartext-Password := "shortpass"
+    Reply-Message = "Short session user",
+    Session-Timeout = 300,
+    Idle-Timeout = 60
+
+# IPv6-only test user
+ipv6user Cleartext-Password := "ipv6pass"
+    Reply-Message = "IPv6 test user",
+    Session-Timeout = 3600,
+    Idle-Timeout = 600,
+    Framed-IPv6-Prefix = "fd01:1::/64"
+
+# User for reject testing
+rejectuser Cleartext-Password := "rejectpass"
+    Auth-Type := Reject,
+    Reply-Message = "Access denied for testing"
+
+# Default deny (catch-all)
+DEFAULT Auth-Type := Reject
+    Reply-Message = "Invalid credentials"

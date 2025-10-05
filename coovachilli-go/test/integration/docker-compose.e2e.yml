@@ -1,0 +1,255 @@
+version: '3.8'
+
+services:
+  # FreeRADIUS server for authentication
+  radius:
+    image: freeradius/freeradius-server:latest
+    container_name: radius-server
+    hostname: radius
+    volumes:
+      - ./radius/clients.conf:/etc/raddb/clients.conf
+      - ./radius/users:/etc/raddb/mods-config/files/authorize
+    networks:
+      chilli_ipv4:
+        ipv4_address: 192.168.100.10
+      chilli_ipv6:
+        ipv6_address: fd00:100::10
+    healthcheck:
+      test: ["CMD", "radtest", "testuser", "testpass", "localhost", "0", "testing123"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # CoovaChilli with iptables
+  chilli-iptables:
+    build:
+      context: ../..
+      dockerfile: test/integration/Dockerfile.chilli
+    container_name: chilli-iptables
+    hostname: chilli-iptables
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      - FIREWALL_BACKEND=iptables
+    volumes:
+      - ./config.iptables.yaml:/app/config.yaml
+      - /lib/modules:/lib/modules:ro
+    networks:
+      chilli_ipv4:
+        ipv4_address: 192.168.100.2
+      chilli_ipv6:
+        ipv6_address: fd00:100::2
+      client_net_iptables:
+        ipv4_address: 10.1.0.1
+        ipv6_address: fd01:1::1
+    depends_on:
+      radius:
+        condition: service_healthy
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+      - net.ipv6.conf.all.disable_ipv6=0
+
+  # CoovaChilli with ufw
+  chilli-ufw:
+    build:
+      context: ../..
+      dockerfile: test/integration/Dockerfile.chilli
+    container_name: chilli-ufw
+    hostname: chilli-ufw
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      - FIREWALL_BACKEND=ufw
+    volumes:
+      - ./config.ufw.yaml:/app/config.yaml
+      - /lib/modules:/lib/modules:ro
+    networks:
+      chilli_ipv4:
+        ipv4_address: 192.168.100.3
+      chilli_ipv6:
+        ipv6_address: fd00:100::3
+      client_net_ufw:
+        ipv4_address: 10.2.0.1
+        ipv6_address: fd01:2::1
+    depends_on:
+      radius:
+        condition: service_healthy
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+      - net.ipv6.conf.all.disable_ipv6=0
+
+  # Test web server (simulates internet)
+  webserver:
+    image: nginx:alpine
+    container_name: webserver
+    hostname: webserver
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./www:/usr/share/nginx/html:ro
+    networks:
+      chilli_ipv4:
+        ipv4_address: 192.168.100.200
+      chilli_ipv6:
+        ipv6_address: fd00:100::200
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost/"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # Test client for iptables (IPv4)
+  client-iptables-ipv4:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: client-iptables-ipv4
+    hostname: client-iptables-ipv4
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - TEST_TYPE=ipv4
+      - CHILLI_HOST=10.1.0.1
+      - CHILLI_UAM_PORT=8080
+      - WEB_HOST=192.168.100.200
+      - TEST_USER=testuser
+      - TEST_PASS=testpass
+      - FIREWALL_TYPE=iptables
+    volumes:
+      - ./tests:/tests:ro
+      - ./results:/results
+    networks:
+      client_net_iptables:
+    depends_on:
+      chilli-iptables:
+        condition: service_started
+      webserver:
+        condition: service_healthy
+    command: ["/tests/run_e2e_tests.sh"]
+
+  # Test client for iptables (IPv6)
+  client-iptables-ipv6:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: client-iptables-ipv6
+    hostname: client-iptables-ipv6
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - TEST_TYPE=ipv6
+      - CHILLI_HOST=fd01:1::1
+      - CHILLI_UAM_PORT=8080
+      - WEB_HOST=fd00:100::200
+      - TEST_USER=testuser
+      - TEST_PASS=testpass
+      - FIREWALL_TYPE=iptables
+    volumes:
+      - ./tests:/tests:ro
+      - ./results:/results
+    networks:
+      client_net_iptables:
+    depends_on:
+      chilli-iptables:
+        condition: service_started
+      webserver:
+        condition: service_healthy
+    command: ["/tests/run_e2e_tests.sh"]
+
+  # Test client for ufw (IPv4)
+  client-ufw-ipv4:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: client-ufw-ipv4
+    hostname: client-ufw-ipv4
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - TEST_TYPE=ipv4
+      - CHILLI_HOST=10.2.0.1
+      - CHILLI_UAM_PORT=8080
+      - WEB_HOST=192.168.100.200
+      - TEST_USER=testuser
+      - TEST_PASS=testpass
+      - FIREWALL_TYPE=ufw
+    volumes:
+      - ./tests:/tests:ro
+      - ./results:/results
+    networks:
+      client_net_ufw:
+    depends_on:
+      chilli-ufw:
+        condition: service_started
+      webserver:
+        condition: service_healthy
+    command: ["/tests/run_e2e_tests.sh"]
+
+  # Test client for ufw (IPv6)
+  client-ufw-ipv6:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: client-ufw-ipv6
+    hostname: client-ufw-ipv6
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - TEST_TYPE=ipv6
+      - CHILLI_HOST=fd01:2::1
+      - CHILLI_UAM_PORT=8080
+      - WEB_HOST=fd00:100::200
+      - TEST_USER=testuser
+      - TEST_PASS=testpass
+      - FIREWALL_TYPE=ufw
+    volumes:
+      - ./tests:/tests:ro
+      - ./results:/results
+    networks:
+      client_net_ufw:
+    depends_on:
+      chilli-ufw:
+        condition: service_started
+      webserver:
+        condition: service_healthy
+    command: ["/tests/run_e2e_tests.sh"]
+
+networks:
+  # Upstream network (internet simulation)
+  chilli_ipv4:
+    driver: bridge
+    enable_ipv6: false
+    ipam:
+      config:
+        - subnet: 192.168.100.0/24
+          gateway: 192.168.100.1
+
+  chilli_ipv6:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: fd00:100::/64
+          gateway: fd00:100::1
+
+  # Client networks (hotspot LANs)
+  client_net_iptables:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 10.1.0.0/24
+        - subnet: fd01:1::/64
+
+  client_net_ufw:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 10.2.0.0/24
+        - subnet: fd01:2::/64

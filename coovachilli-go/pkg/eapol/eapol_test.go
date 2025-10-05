@@ -4,6 +4,7 @@ import (
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
 	cr "coovachilli-go/pkg/radius"
+	"coovachilli-go/pkg/securestore"
 	"net"
 	"testing"
 
@@ -59,7 +60,7 @@ func (m *mockRadiusClient) SendEAPAccessRequest(session *core.Session, eapPayloa
 }
 
 func setupTestHandler(t *testing.T) (*Handler, *core.SessionManager, *mockRadiusClient, *mockEAPOLSender) {
-	cfg := &config.Config{RadiusSecret: "testing123"}
+	cfg := &config.Config{RadiusSecret: securestore.NewSecret("testing123")}
 	sm := core.NewSessionManager(cfg, nil)
 	rc := &mockRadiusClient{}
 	sender := &mockEAPOLSender{}
@@ -104,11 +105,14 @@ func TestHandleRadiusAccept_StartsHandshake(t *testing.T) {
 	session := handler.sm.CreateSession(nil, testStaMAC, 0)
 	session.EAPOL.EapID = 5
 
-	rc.Response = radius.New(radius.CodeAccessAccept, []byte(handler.cfg.RadiusSecret))
-	_, requestAuthenticator, _ := rc.SendEAPAccessRequest(session, nil, nil)
-	encryptedPMK, err := rfc2548Encrypt([]byte(handler.cfg.RadiusSecret), requestAuthenticator, testPMK, 0xAB)
-	require.NoError(t, err)
-	cr.SetMSMPPERecvKey(rc.Response, encryptedPMK)
+	handler.cfg.RadiusSecret.Access(func(secret []byte) error {
+		rc.Response = radius.New(radius.CodeAccessAccept, secret)
+		_, requestAuthenticator, _ := rc.SendEAPAccessRequest(session, nil, nil)
+		encryptedPMK, err := rfc2548Encrypt(secret, requestAuthenticator, testPMK, 0xAB)
+		require.NoError(t, err)
+		cr.SetMSMPPERecvKey(rc.Response, encryptedPMK)
+		return nil
+	})
 
 	handler.handleRadiusAccept(session, rc.Response, rc.RequestAuthenticator)
 

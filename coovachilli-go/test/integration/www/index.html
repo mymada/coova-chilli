@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CoovaChilli-Go Test Server</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background-color: #f0f0f0;
+        }
+        .container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+        }
+        .success {
+            color: #28a745;
+            font-weight: bold;
+        }
+        .info {
+            background-color: #d1ecf1;
+            border: 1px solid #bee5eb;
+            color: #0c5460;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 20px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>CoovaChilli-Go Test Server</h1>
+        <p class="success">✓ Connection Successful!</p>
+        <div class="info">
+            <p><strong>This is the integration test web server.</strong></p>
+            <p>If you can see this page, it means:</p>
+            <ul>
+                <li>You have successfully obtained an IP address via DHCP</li>
+                <li>You have been authenticated through the captive portal</li>
+                <li>The firewall rules are allowing your traffic</li>
+                <li>Network routing is working correctly</li>
+            </ul>
+        </div>
+        <h2>Available Test Endpoints:</h2>
+        <ul>
+            <li><a href="/health">/health</a> - Health check endpoint</li>
+            <li><a href="/test">/test</a> - Simple test response</li>
+            <li><a href="/speedtest">/speedtest</a> - Bandwidth test (10MB)</li>
+        </ul>
+    </div>
+</body>
+</html>

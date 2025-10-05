@@ -1,0 +1,410 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [ master, develop ]
+  pull_request:
+    branches: [ master, develop ]
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: 'Enable debug logging'
+        required: false
+        default: 'false'
+
+env:
+  GO_VERSION: '1.25.1'
+
+jobs:
+  # =============================================================================
+  # Unit and Race Tests
+  # =============================================================================
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev
+
+      - name: Run unit tests with race detector
+        run: |
+          go test -v -race -coverprofile=coverage.txt -covermode=atomic ./pkg/...
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.txt
+          flags: unittests
+          name: codecov-unit
+
+  # =============================================================================
+  # Integration Tests - IPv4 with iptables
+  # =============================================================================
+  integration-ipv4-iptables:
+    name: Integration Tests (IPv4 + iptables)
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Enable IPv6 for Docker
+        run: |
+          sudo mkdir -p /etc/docker
+          echo '{
+            "ipv6": true,
+            "fixed-cidr-v6": "2001:db8:1::/64",
+            "experimental": true,
+            "ip6tables": true
+          }' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+
+      - name: Build test images
+        run: |
+          cd test/integration
+          docker compose -f docker-compose.e2e.yml build chilli-iptables client-iptables-ipv4
+
+      - name: Start services
+        run: |
+          cd test/integration
+          docker compose -f docker-compose.e2e.yml up -d radius webserver chilli-iptables
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for CoovaChilli to start..."
+          sleep 15
+          docker compose -f test/integration/docker-compose.e2e.yml logs chilli-iptables
+
+      - name: Run IPv4 iptables tests
+        run: |
+          cd test/integration
+          docker compose -f docker-compose.e2e.yml run --rm client-iptables-ipv4
+
+      - name: Collect test results
+        if: always()
+        run: |
+          mkdir -p test-results
+          docker compose -f test/integration/docker-compose.e2e.yml cp client-iptables-ipv4:/results/. test-results/ || true
+
+      - name: Display logs on failure
+        if: failure()
+        run: |
+          echo "=== CoovaChilli Logs ==="
+          docker compose -f test/integration/docker-compose.e2e.yml logs chilli-iptables
+          echo "=== RADIUS Logs ==="
+          docker compose -f test/integration/docker-compose.e2e.yml logs radius
+          echo "=== Client Logs ==="
+          docker compose -f test/integration/docker-compose.e2e.yml logs client-iptables-ipv4
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-results-ipv4-iptables
+          path: test-results/
+
+      - name: Cleanup
+        if: always()
+        run: |
+          cd test/integration
+          docker compose -f docker-compose.e2e.yml down -v
+
+  # =============================================================================
+  # Integration Tests - IPv6 with iptables
+  # =============================================================================
+  integration-ipv6-iptables:
+    name: Integration Tests (IPv6 + iptables)
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Enable IPv6 for Docker
+        run: |
+          sudo mkdir -p /etc/docker
+          echo '{
+            "ipv6": true,
+            "fixed-cidr-v6": "2001:db8:1::/64",
+            "experimental": true,
+            "ip6tables": true
+          }' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+
+      - name: Build test images
+        run: |
+          cd test/integration
+          docker compose -f docker-compose.e2e.yml build chilli-iptables client-iptables-ipv6
+
+      - name: Start services
+        run: |
+          cd test/integration
+          docker compose -f docker-compose.e2e.yml up -d radius webserver chilli-iptables
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for CoovaChilli to start..."
+          sleep 15
+
+      - name: Run IPv6 iptables tests
+        run: |
+          cd test/integration
+          docker compose -f docker-compose.e2e.yml run --rm client-iptables-ipv6
+
+      - name: Collect test results
+        if: always()
+        run: |
+          mkdir -p test-results
+          docker compose -f test/integration/docker-compose.e2e.yml cp client-iptables-ipv6:/results/. test-results/ || true
+
+      - name: Display logs on failure
+        if: failure()
+        run: |
+          docker compose -f test/integration/docker-compose.e2e.yml logs chilli-iptables
+          docker compose -f test/integration/docker-compose.e2e.yml logs radius
+          docker compose -f test/integration/docker-compose.e2e.yml logs client-iptables-ipv6
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-results-ipv6-iptables
+          path: test-results/
+
+      - name: Cleanup
+        if: always()
+        run: |
+          cd test/integration
+          docker compose -f docker-compose.e2e.yml down -v
+
+  # =============================================================================
+  # Integration Tests - IPv4 with ufw
+  # =============================================================================
+  integration-ipv4-ufw:
+    name: Integration Tests (IPv4 + ufw)
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Enable IPv6 for Docker
+        run: |
+          sudo mkdir -p /etc/docker
+          echo '{
+            "ipv6": true,
+            "fixed-cidr-v6": "2001:db8:1::/64",
+            "experimental": true,
+            "ip6tables": true
+          }' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+
+      - name: Build test images
+        run: |
+          cd test/integration
+          docker compose -f docker-compose.e2e.yml build chilli-ufw client-ufw-ipv4
+
+      - name: Start services
+        run: |
+          cd test/integration
+          docker compose -f docker-compose.e2e.yml up -d radius webserver chilli-ufw
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for CoovaChilli to start..."
+          sleep 15
+
+      - name: Run IPv4 ufw tests
+        run: |
+          cd test/integration
+          docker compose -f docker-compose.e2e.yml run --rm client-ufw-ipv4
+
+      - name: Collect test results
+        if: always()
+        run: |
+          mkdir -p test-results
+          docker compose -f test/integration/docker-compose.e2e.yml cp client-ufw-ipv4:/results/. test-results/ || true
+
+      - name: Display logs on failure
+        if: failure()
+        run: |
+          docker compose -f test/integration/docker-compose.e2e.yml logs chilli-ufw
+          docker compose -f test/integration/docker-compose.e2e.yml logs radius
+          docker compose -f test/integration/docker-compose.e2e.yml logs client-ufw-ipv4
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-results-ipv4-ufw
+          path: test-results/
+
+      - name: Cleanup
+        if: always()
+        run: |
+          cd test/integration
+          docker compose -f docker-compose.e2e.yml down -v
+
+  # =============================================================================
+  # Integration Tests - IPv6 with ufw
+  # =============================================================================
+  integration-ipv6-ufw:
+    name: Integration Tests (IPv6 + ufw)
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Enable IPv6 for Docker
+        run: |
+          sudo mkdir -p /etc/docker
+          echo '{
+            "ipv6": true,
+            "fixed-cidr-v6": "2001:db8:1::/64",
+            "experimental": true,
+            "ip6tables": true
+          }' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+
+      - name: Build test images
+        run: |
+          cd test/integration
+          docker compose -f docker-compose.e2e.yml build chilli-ufw client-ufw-ipv6
+
+      - name: Start services
+        run: |
+          cd test/integration
+          docker compose -f docker-compose.e2e.yml up -d radius webserver chilli-ufw
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for CoovaChilli to start..."
+          sleep 15
+
+      - name: Run IPv6 ufw tests
+        run: |
+          cd test/integration
+          docker compose -f docker-compose.e2e.yml run --rm client-ufw-ipv6
+
+      - name: Collect test results
+        if: always()
+        run: |
+          mkdir -p test-results
+          docker compose -f test/integration/docker-compose.e2e.yml cp client-ufw-ipv6:/results/. test-results/ || true
+
+      - name: Display logs on failure
+        if: failure()
+        run: |
+          docker compose -f test/integration/docker-compose.e2e.yml logs chilli-ufw
+          docker compose -f test/integration/docker-compose.e2e.yml logs radius
+          docker compose -f test/integration/docker-compose.e2e.yml logs client-ufw-ipv6
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-results-ipv6-ufw
+          path: test-results/
+
+      - name: Cleanup
+        if: always()
+        run: |
+          cd test/integration
+          docker compose -f docker-compose.e2e.yml down -v
+
+  # =============================================================================
+  # Aggregate Results
+  # =============================================================================
+  aggregate-results:
+    name: Aggregate Test Results
+    runs-on: ubuntu-latest
+    needs:
+      - integration-ipv4-iptables
+      - integration-ipv6-iptables
+      - integration-ipv4-ufw
+      - integration-ipv6-ufw
+    if: always()
+    steps:
+      - name: Download all test results
+        uses: actions/download-artifact@v4
+        with:
+          path: all-results
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Aggregate results
+        run: |
+          echo "# Integration Test Results" > summary.md
+          echo "" >> summary.md
+          echo "## Summary by Test Suite" >> summary.md
+          echo "" >> summary.md
+
+          for dir in all-results/*; do
+            if [ -d "$dir" ]; then
+              suite_name=$(basename "$dir")
+              echo "### $suite_name" >> summary.md
+
+              for result_file in "$dir"/*.json; do
+                if [ -f "$result_file" ]; then
+                  total=$(jq -r '.summary.total' "$result_file")
+                  passed=$(jq -r '.summary.passed' "$result_file")
+                  failed=$(jq -r '.summary.failed' "$result_file")
+                  success_rate=$(jq -r '.summary.success_rate' "$result_file")
+
+                  echo "- Total: $total | Passed: $passed | Failed: $failed | Success Rate: $success_rate" >> summary.md
+                fi
+              done
+
+              echo "" >> summary.md
+            fi
+          done
+
+          cat summary.md
+
+      - name: Upload aggregated results
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-summary
+          path: summary.md
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('summary.md', 'utf8');
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });

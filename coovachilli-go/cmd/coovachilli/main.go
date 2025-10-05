@@ -412,51 +412,6 @@ func (app *application) startPcapListener() {
 	}
 }
 
-			case "reload":
-				// PerformReload loads the config itself and applies it.
-				reloader.PerformReload()
-				cmd.ResponseCh <- "OK: Configuration reload triggered"
-
-		userName := rfc2865.UserName_GetString(req.Packet())
-
-		var sessionToUpdate *core.Session
-		sessions := app.sessionManager.GetAllSessions()
-		for _, s := range sessions {
-			s.RLock()
-			match := s.Redir.Username == userName
-			s.RUnlock()
-			if match {
-				sessionToUpdate = s
-				break
-			}
-		}
-
-		if sessionToUpdate == nil {
-			app.logger.Warn().Str("user", userName).Msg("Received CoA/Disconnect request for unknown user")
-			var response *layehradius.Packet
-			if req.Packet().Code == layehradius.CodeDisconnectRequest {
-				response = req.Packet().Response(layehradius.CodeDisconnectACK)
-			} else {
-				response = req.Packet().Response(layehradius.CodeCoANAK)
-			}
-			app.radiusClient.SendCoAResponse(response, req.Peer())
-			continue
-		}
-
-		switch req.Packet().Code {
-		case layehradius.CodeDisconnectRequest:
-			app.logger.Info().Str("user", userName).Msg("Received Disconnect-Request")
-			app.disconnectManager.Disconnect(sessionToUpdate, "Admin-Reset")
-			response := req.Packet().Response(layehradius.CodeDisconnectACK)
-			app.radiusClient.SendCoAResponse(response, req.Peer())
-		default:
-			app.logger.Warn().Str("code", req.Packet().Code.String()).Msg("Received unhandled CoA/DM code")
-			response := req.Packet().Response(layehradius.CodeCoANAK)
-			app.radiusClient.SendCoAResponse(response, req.Peer())
-		}
-	}
-}
-
 func (app *application) handleRadiusRequests() {
 	for session := range app.radiusReqChan {
 		go func(s *core.Session) {

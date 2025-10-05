@@ -1,10 +1,32 @@
-FROM alpine:latest
+FROM debian:bookworm-slim
 
 # Install necessary tools for testing
-RUN apk update && apk add --no-cache curl bind-tools
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    dnsutils \
+    iputils-ping \
+    iproute2 \
+    net-tools \
+    tcpdump \
+    dhcping \
+    netcat-openbsd \
+    jq \
+    iperf3 \
+    busybox-static \
+    && rm -rf /var/lib/apt/lists/*
 
-# Create a directory for the test scripts
-RUN mkdir -p /tests
+# Install dhclient for DHCP testing
+RUN apt-get update && apt-get install -y \
+    isc-dhcp-client \
+    wide-dhcpv6-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create directories for test scripts and results
+RUN mkdir -p /tests /results
 
 # Set the working directory
 WORKDIR /tests
+
+# Default command
+CMD ["/bin/bash"]

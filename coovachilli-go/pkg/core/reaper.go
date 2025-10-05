@@ -7,14 +7,8 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// Disconnector defines the interface for disconnecting a session.
-// This allows us to avoid circular dependencies.
-type Disconnector interface {
-	Disconnect(session *Session, reason string)
-}
-
-// Reaper periodically checks for expired sessions and disconnects them.
-type Reaper struct {
+// SessionReaper periodically checks for expired sessions and disconnects them.
+type SessionReaper struct {
 	cfg          *config.Config
 	sm           *SessionManager
 	disconnecter Disconnector
@@ -24,8 +18,8 @@ type Reaper struct {
 }
 
 // NewReaper creates a new session reaper.
-func NewReaper(cfg *config.Config, sm *SessionManager, disconnecter Disconnector, logger zerolog.Logger) *Reaper {
-	return &Reaper{
+func NewReaper(cfg *config.Config, sm *SessionManager, disconnecter Disconnector, logger zerolog.Logger) *SessionReaper {
+	return &SessionReaper{
 		cfg:          cfg,
 		sm:           sm,
 		disconnecter: disconnecter,
@@ -35,7 +29,7 @@ func NewReaper(cfg *config.Config, sm *SessionManager, disconnecter Disconnector
 }
 
 // Start begins the reaping process in a background goroutine.
-func (r *Reaper) Start() {
+func (r *SessionReaper) Start() {
 	// Use the main interval from config, or a default of 60s if not set
 	interval := r.cfg.Interval
 	if interval == 0 {
@@ -47,7 +41,7 @@ func (r *Reaper) Start() {
 }
 
 // Stop terminates the reaping process.
-func (r *Reaper) Stop() {
+func (r *SessionReaper) Stop() {
 	if r.ticker != nil {
 		r.ticker.Stop()
 	}
@@ -55,7 +49,7 @@ func (r *Reaper) Stop() {
 	r.logger.Info().Msg("Session reaper stopped")
 }
 
-func (r *Reaper) run() {
+func (r *SessionReaper) run() {
 	for {
 		select {
 		case <-r.ticker.C:
@@ -66,7 +60,7 @@ func (r *Reaper) run() {
 	}
 }
 
-func (r *Reaper) reapSessions() {
+func (r *SessionReaper) reapSessions() {
 	sessions := r.sm.GetAllSessions()
 	now := MonotonicTime()
 	r.logger.Debug().Int("count", len(sessions)).Msg("Reaping sessions")

@@ -35,18 +35,18 @@ type EAPOLAuthenticator interface {
 
 // CoAIncomingRequest holds a parsed CoA/Disconnect packet and the sender's address.
 type CoAIncomingRequest struct {
-	Packet *radius.Packet
-	Peer   *net.UDPAddr
+	packet *radius.Packet
+	peer   *net.UDPAddr
 }
 
 // Packet returns the underlying RADIUS packet to satisfy the core.CoAContext interface.
 func (r *CoAIncomingRequest) Packet() *radius.Packet {
-	return r.Packet
+	return r.packet
 }
 
 // Peer returns the sender's network address to satisfy the core.CoAContext interface.
 func (r *CoAIncomingRequest) Peer() *net.UDPAddr {
-	return r.Peer
+	return r.peer
 }
 
 // Client holds the state for the RADIUS client.
@@ -72,21 +72,22 @@ func NewClient(cfg *config.Config, logger zerolog.Logger, recorder metrics.Recor
 		cb:          make([]*gobreaker.CircuitBreaker, 2),
 	}
 
-	if cfg.RadiusCircuitBreaker.Enabled {
-		st := gobreaker.Settings{
-			Name:        "RADIUS Server 1",
-			MaxRequests: cfg.RadiusCircuitBreaker.MaxRequests,
-			Interval:    cfg.RadiusCircuitBreaker.Interval,
-			Timeout:     cfg.RadiusCircuitBreaker.Timeout,
-			OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
-				logger.Info().Str("name", name).Str("from", from.String()).Str("to", to.String()).Msg("Circuit breaker state changed")
-			},
-		}
-		client.cb[0] = gobreaker.NewCircuitBreaker(st)
-
-		st.Name = "RADIUS Server 2"
-		client.cb[1] = gobreaker.NewCircuitBreaker(st)
+	// TODO: Circuit breaker configuration not yet in config.yaml
+	// Enable with default settings for now
+	_ = cfg // prevent unused variable warning
+	st := gobreaker.Settings{
+		Name:        "RADIUS Server 1",
+		MaxRequests: 100,
+		Interval:    60 * time.Second,
+		Timeout:     30 * time.Second,
+		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
+			logger.Info().Str("name", name).Str("from", from.String()).Str("to", to.String()).Msg("Circuit breaker state changed")
+		},
 	}
+	client.cb[0] = gobreaker.NewCircuitBreaker(st)
+
+	st.Name = "RADIUS Server 2"
+	client.cb[1] = gobreaker.NewCircuitBreaker(st)
 
 	return client
 }
@@ -204,8 +205,8 @@ func (c *Client) exchangeWithFailover(packet *radius.Packet, auth bool) (*radius
 			continue // Skip if server is not configured
 		}
 
-		// If circuit breaker is disabled, execute directly
-		if !c.cfg.RadiusCircuitBreaker.Enabled || c.cb[i] == nil {
+		// If circuit breaker is nil (disabled), execute directly
+		if c.cb[i] == nil {
 			resp, err := c.executeRequest(packet, serverAddr, auth, requestType)
 			if err == nil {
 				return resp, nil
@@ -526,8 +527,8 @@ func (c *Client) listen(network, addr string, coaReqChan chan<- core.CoAContext)
 
 		c.logger.Info().Str("code", packet.Code.String()).Str("peer", peer.String()).Msg("Received CoA/Disconnect request")
 		coaReqChan <- &CoAIncomingRequest{
-			Packet: packet,
-			Peer:   peer.(*net.UDPAddr),
+			packet: packet,
+			peer:   peer.(*net.UDPAddr),
 		}
 	}
 }
