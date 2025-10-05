@@ -17,6 +17,7 @@ type LoggingConfig struct {
 	Destination string `yaml:"dest"`      // "stdout", "syslog", or a file path
 	Level       string `yaml:"level"`       // "debug", "info", "warn", "error"
 	SyslogTag   string `yaml:"syslog_tag"`  // Tag for syslog messages
+	Format      string `yaml:"format"`      // "text" or "json"
 }
 
 // Config holds the application configuration.

@@ -62,34 +62,47 @@ func main() {
 	}
 
 	// Setup logger
-	var logWriter io.Writer = os.Stderr
+	var logWriter io.Writer
 	var logFile *os.File
-	if !cfg.Foreground {
-		switch cfg.Logging.Destination {
-		case "syslog":
-			writer, err := syslog.New(syslog.LOG_NOTICE, cfg.Logging.SyslogTag)
-			if err != nil {
-				log.Fatal().Err(err).Msg("Unable to set up syslog")
-			}
-			logWriter = writer
-		case "stdout":
-			logWriter = os.Stdout
-		default: // File
-			logFile, err = os.OpenFile(cfg.Logging.Destination, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if err != nil {
-				log.Fatal().Err(err).Msg("Failed to open log file")
-			}
-			logWriter = logFile
-			// Close log file on exit
-			defer func() {
-				if logFile != nil {
-					logFile.Close()
-				}
-			}()
+
+	switch cfg.Logging.Destination {
+	case "syslog":
+		writer, err := syslog.New(syslog.LOG_NOTICE, cfg.Logging.SyslogTag)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Unable to set up syslog")
 		}
-		log.Logger = log.Output(logWriter)
+		logWriter = writer
+	case "stdout":
+		logWriter = os.Stdout
+	case "", "stderr":
+		logWriter = os.Stderr
+	default: // File
+		logFile, err = os.OpenFile(cfg.Logging.Destination, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to open log file")
+		}
+		logWriter = logFile
+		// Close log file on exit
+		defer func() {
+			if logFile != nil {
+				logFile.Close()
+			}
+		}()
+	}
+
+	logFormat := cfg.Logging.Format
+	if logFormat == "" {
+		if cfg.Foreground {
+			logFormat = "text"
+		} else {
+			logFormat = "json"
+		}
+	}
+
+	if logFormat == "text" {
+		log.Logger = log.Output(zerolog.ConsoleWriter{Out: logWriter})
 	} else {
-		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+		log.Logger = log.Output(logWriter)
 	}
 
 	if *debug || cfg.Logging.Level == "debug" {
