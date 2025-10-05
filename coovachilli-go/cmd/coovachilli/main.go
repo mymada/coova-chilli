@@ -557,10 +557,24 @@ func processPackets(ifce *water.Interface, packetChan <-chan []byte, cfg *config
 			continue
 		}
 
-		if len(rawPacket) == 0 {
+		if len(rawPacket) < 1 {
 			continue
 		}
-		packet := gopacket.NewPacket(rawPacket, layers.LayerTypeEthernet, gopacket.Default)
+
+		var packet gopacket.Packet
+		ipVersion := rawPacket[0] >> 4
+		switch ipVersion {
+		case 4:
+			packet = gopacket.NewPacket(rawPacket, layers.LayerTypeIPv4, gopacket.Default)
+		case 6:
+			// The current logic inside only handles IPv4. For now, we decode but drop IPv6.
+			// To support IPv6 here, a similar block to the one below for ipv4 would be needed.
+			continue
+		default:
+			logger.Debug().Uint8("version", ipVersion).Msg("Dropping unknown packet type from TUN")
+			continue
+		}
+
 		if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
 			ipv4, ok := ipv4Layer.(*layers.IPv4)
 			if !ok || ipv4 == nil {
@@ -653,7 +667,13 @@ func sendDNSResponse(ifce *water.Interface, reqPacket gopacket.Packet, respPaylo
 	buffer := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true}
 
-	if err := gopacket.SerializeLayers(buffer, opts, ipLayer, udpLayer, gopacket.Payload(respPayload)); err != nil {
+	dnsLayer := &layers.DNS{}
+	if err := dnsLayer.DecodeFromBytes(respPayload, gopacket.NilDecodeFeedback); err != nil {
+		return fmt.Errorf("failed to decode dns response payload for serialization: %w", err)
+	}
+	dnsLayer.QR = true // Set the QR bit to indicate a response
+
+	if err := gopacket.SerializeLayers(buffer, opts, ipLayer, udpLayer, dnsLayer); err != nil {
 		return fmt.Errorf("failed to serialize DNS response: %w", err)
 	}
 

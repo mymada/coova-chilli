@@ -26,6 +26,8 @@ type Garden struct {
 }
 
 // NewGarden creates and initializes a new Garden service.
+// It takes the walled garden configuration, a firewall manager to apply rules,
+// and a logger.
 func NewGarden(cfg *config.WalledGardenConfig, fw firewall.FirewallManager, logger zerolog.Logger) *Garden {
 	ctx, cancel := context.WithCancel(context.Background())
 	g := &Garden{
@@ -40,13 +42,17 @@ func NewGarden(cfg *config.WalledGardenConfig, fw firewall.FirewallManager, logg
 	return g
 }
 
-// Start begins the periodic resolution of allowed domains.
+// Start begins the Garden service.
+// It performs an initial setup of firewall rules for static networks and domains,
+// and then starts a background goroutine to periodically re-resolve domain names
+// to keep the IP whitelist up to date.
 func (g *Garden) Start() {
 	g.logger.Info().Msg("Starting walled garden service")
 	g.initialSetup()
 
 	go func() {
-		ticker := time.NewTicker(15 * time.Minute) // Periodically re-resolve domains
+		// Periodically re-resolve domains to catch IP changes.
+		ticker := time.NewTicker(15 * time.Minute)
 		defer ticker.Stop()
 
 		for {
@@ -61,7 +67,7 @@ func (g *Garden) Start() {
 	}()
 }
 
-// Stop terminates the garden service.
+// Stop gracefully terminates the Garden service and its background goroutines.
 func (g *Garden) Stop() {
 	g.cancel()
 }

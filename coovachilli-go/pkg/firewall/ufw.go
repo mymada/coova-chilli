@@ -14,12 +14,14 @@ import (
 type UfwFirewall struct {
 	cfg    *config.Config
 	logger zerolog.Logger
+	config *ufwConfigManager
 }
 
 func newUfwFirewall(cfg *config.Config, logger zerolog.Logger) (*UfwFirewall, error) {
 	return &UfwFirewall{
 		cfg:    cfg,
 		logger: logger,
+		config: newUfwConfigManager(logger),
 	}, nil
 }
 
@@ -30,14 +32,27 @@ func (f *UfwFirewall) runUfwCmd(args ...string) error {
 	f.logger.Debug().Str("command", cmd.String()).Msg("Executing ufw command")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		// Don't error out if rule already exists or doesn't exist on deletion
+		if strings.Contains(string(output), "Skipping") || strings.Contains(string(output), "not found") {
+			return nil
+		}
 		return fmt.Errorf("ufw command failed: %s, output: %s, error: %w", cmd.String(), string(output), err)
 	}
 	return nil
 }
 
 func (f *UfwFirewall) Initialize() error {
-	f.logger.Info().Msg("Initializing ufw firewall rules")
-	f.logger.Warn().Msg("NAT/Masquerading and DNS redirection must be configured manually in /etc/ufw/before.rules for full functionality.")
+	f.logger.Info().Msg("Initializing ufw firewall rules...")
+
+	// Automatically configure system files for NAT
+	if err := f.config.ensureUfwIpForwarding(); err != nil {
+		f.logger.Error().Err(err).Msg("Failed to automatically configure IP forwarding. Masquerading may not work.")
+		// Continue, as it might be configured manually or not needed.
+	}
+	if err := f.config.ensureUfwNatMasquerade(f.cfg.ExtIf, f.cfg.Net.String()); err != nil {
+		f.logger.Error().Err(err).Msg("Failed to automatically configure NAT masquerade rule. Internet access for clients may not work.")
+		// Continue, as it might be configured manually or not needed.
+	}
 
 	// Ensure ufw is active
 	if err := f.runUfwCmd("enable"); err != nil {
@@ -56,17 +71,6 @@ func (f *UfwFirewall) Initialize() error {
 	if f.cfg.UAMUIPort > 0 {
 		f.runUfwCmd("allow", fmt.Sprintf("%d/tcp", f.cfg.UAMUIPort))
 	}
-
-	// --- DNS Handling ---
-	// For the walled garden to work with domain names, we must intercept DNS traffic.
-	// UFW doesn't support REDIRECT targets easily. This needs to be done in before.rules.
-	// Example for /etc/ufw/before.rules:
-	// *nat
-	// :PREROUTING ACCEPT [0:0]
-	// -A PREROUTING -i <tundev> -p udp --dport 53 -j REDIRECT --to-port <dns_proxy_port>
-	// -A PREROUTING -i <tundev> -p tcp --dport 53 -j REDIRECT --to-port <dns_proxy_port>
-	// COMMIT
-	f.logger.Warn().Msg("UFW requires manual configuration in before.rules to redirect DNS for walled garden domains.")
 
 	// Allow traffic to our DNS servers (for DNS proxying)
 	if f.cfg.DNS1 != nil {

@@ -1,0 +1,36 @@
+# Integration test configuration for CoovaChilli-Go
+
+foreground: true
+pidfile: /var/run/chilli.pid
+user: "" # Run as root inside container for simplicity
+group: ""
+
+# Network settings for the Docker environment
+net: 10.1.0.0/24
+dhcpif: eth0
+tundev: tun0
+uamlisten: 10.1.0.1
+dhcplisten: 10.1.0.1
+dhcpstart: 10.1.0.100
+dhcpend: 10.1.0.200
+dns1: 8.8.8.8 # A public DNS server
+
+# UAM/Captive Portal settings
+uamport: 3990
+uamuiport: 3991
+uamanydns: false # We want to intercept DNS
+
+# Walled Garden settings
+# We will allow access to the webserver container by its IP.
+walledgarden:
+  allowedNetworks:
+    - "10.1.0.254"
+
+# Logging
+logging:
+  dest: "stdout"
+  level: "debug"
+
+# Firewall
+firewallbackend: "iptables"
+extif: eth0 # The interface for masquerading to the container network
