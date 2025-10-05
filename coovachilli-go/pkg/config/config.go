@@ -156,12 +156,117 @@ type Config struct {
 	WalledGarden WalledGardenConfig `yaml:"walledgarden"`
 	// L7 Filtering settings
 	L7Filtering L7FilteringConfig `yaml:"l7filtering"`
+	// URL/DNS Filtering settings
+	URLFilter URLFilterConfig `yaml:"urlfilter"`
+	// Log Export settings
+	LogExport LogExportConfig `yaml:"logexport"`
+	// Antimalware settings
+	AntiMalware AntiMalwareConfig `yaml:"antimalware"`
+	// IDS settings
+	IDS IDSConfig `yaml:"ids"`
+	// TLS settings
+	TLS TLSConfig `yaml:"tls"`
+	// VLAN settings
+	VLAN VLANConfig `yaml:"vlan"`
+	// GDPR settings
+	GDPR GDPRConfig `yaml:"gdpr"`
 }
 
 // L7FilteringConfig holds the configuration for Layer 7 filtering, such as SNI-based blocking.
 type L7FilteringConfig struct {
 	SNIFilteringEnabled bool   `yaml:"sni_filtering_enabled" envconfig:"SNI_FILTERING_ENABLED"`
 	SNIBlocklistPath    string `yaml:"sni_blocklist_path" envconfig:"SNI_BLOCKLIST_PATH"`
+}
+
+// URLFilterConfig holds the configuration for URL and DNS filtering
+type URLFilterConfig struct {
+	Enabled             bool   `yaml:"enabled" envconfig:"ENABLED"`
+	DomainBlocklistPath string `yaml:"domain_blocklist_path" envconfig:"DOMAIN_BLOCKLIST_PATH"`
+	IPBlocklistPath     string `yaml:"ip_blocklist_path" envconfig:"IP_BLOCKLIST_PATH"`
+	CategoryRulesPath   string `yaml:"category_rules_path" envconfig:"CATEGORY_RULES_PATH"`
+	DefaultAction       string `yaml:"default_action" envconfig:"DEFAULT_ACTION"` // "allow" or "block"
+}
+
+// LogExportConfig holds the configuration for log export
+type LogExportConfig struct {
+	Enabled    bool     `yaml:"enabled" envconfig:"ENABLED"`
+	Exporters  []string `yaml:"exporters" envconfig:"EXPORTERS"` // syslog, file, elasticsearch, s3
+	SyslogAddr string   `yaml:"syslog_addr" envconfig:"SYSLOG_ADDR"`
+	SyslogProto string  `yaml:"syslog_proto" envconfig:"SYSLOG_PROTO"` // tcp, udp
+	FilePath   string   `yaml:"file_path" envconfig:"FILE_PATH"`
+	ESEndpoint string   `yaml:"es_endpoint" envconfig:"ES_ENDPOINT"`
+	ESIndex    string   `yaml:"es_index" envconfig:"ES_INDEX"`
+	S3Bucket   string   `yaml:"s3_bucket" envconfig:"S3_BUCKET"`
+	S3Region   string   `yaml:"s3_region" envconfig:"S3_REGION"`
+}
+
+// AntiMalwareConfig holds the configuration for antimalware integration
+type AntiMalwareConfig struct {
+	Enabled           bool     `yaml:"enabled" envconfig:"ENABLED"`
+	Scanners          []string `yaml:"scanners" envconfig:"SCANNERS"` // virustotal, clamav, threatfox
+	VirusTotalAPIKey  string   `yaml:"virustotal_api_key" envconfig:"VIRUSTOTAL_API_KEY"`
+	ClamAVHost        string   `yaml:"clamav_host" envconfig:"CLAMAV_HOST"`
+	CacheTTL          int      `yaml:"cache_ttl" envconfig:"CACHE_TTL"` // minutes
+}
+
+// IDSConfig holds the configuration for Intrusion Detection System
+type IDSConfig struct {
+	Enabled              bool `yaml:"enabled" envconfig:"ENABLED"`
+	DetectPortScan       bool `yaml:"detect_port_scan" envconfig:"DETECT_PORT_SCAN"`
+	DetectBruteForce     bool `yaml:"detect_brute_force" envconfig:"DETECT_BRUTE_FORCE"`
+	DetectDDoS           bool `yaml:"detect_ddos" envconfig:"DETECT_DDOS"`
+	DetectSQLInjection   bool `yaml:"detect_sql_injection" envconfig:"DETECT_SQL_INJECTION"`
+	DetectXSS            bool `yaml:"detect_xss" envconfig:"DETECT_XSS"`
+	PortScanThreshold    int  `yaml:"port_scan_threshold" envconfig:"PORT_SCAN_THRESHOLD"`
+	BruteForceThreshold  int  `yaml:"brute_force_threshold" envconfig:"BRUTE_FORCE_THRESHOLD"`
+	DDoSThreshold        int  `yaml:"ddos_threshold" envconfig:"DDOS_THRESHOLD"`
+	DDoSTimeWindow       int  `yaml:"ddos_time_window" envconfig:"DDOS_TIME_WINDOW"` // seconds
+}
+
+// TLSConfig holds the configuration for TLS/SSL
+type TLSConfig struct {
+	Enabled            bool   `yaml:"enabled" envconfig:"ENABLED"`
+	CertFile           string `yaml:"cert_file" envconfig:"CERT_FILE"`
+	KeyFile            string `yaml:"key_file" envconfig:"KEY_FILE"`
+	CAFile             string `yaml:"ca_file" envconfig:"CA_FILE"`
+	ClientCertFile     string `yaml:"client_cert_file" envconfig:"CLIENT_CERT_FILE"`
+	ClientKeyFile      string `yaml:"client_key_file" envconfig:"CLIENT_KEY_FILE"`
+	RequireClientCert  bool   `yaml:"require_client_cert" envconfig:"REQUIRE_CLIENT_CERT"`
+	InsecureSkipVerify bool   `yaml:"insecure_skip_verify" envconfig:"INSECURE_SKIP_VERIFY"`
+}
+
+// Now returns current time (can be overridden for testing)
+func (t *TLSConfig) Now() interface{} {
+	return time.Now()
+}
+
+// VLANConfigEntry represents a single VLAN configuration
+type VLANConfigEntry struct {
+	ID          uint16   `yaml:"id"`
+	Name        string   `yaml:"name"`
+	Description string   `yaml:"description"`
+	Network     string   `yaml:"network"`
+	Gateway     string   `yaml:"gateway"`
+	DNS         []string `yaml:"dns"`
+	Isolated    bool     `yaml:"isolated"`
+}
+
+// VLANConfig holds the configuration for VLAN management
+type VLANConfig struct {
+	Enabled     bool                   `yaml:"enabled" envconfig:"ENABLED"`
+	DefaultVLAN uint16                 `yaml:"default_vlan" envconfig:"DEFAULT_VLAN"`
+	VLANs       []VLANConfigEntry      `yaml:"vlans"`
+	RoleVLANs   map[string]uint16      `yaml:"role_vlans"` // role -> VLAN ID mapping
+}
+
+// GDPRConfig holds the configuration for GDPR compliance
+type GDPRConfig struct {
+	Enabled                 bool   `yaml:"enabled" envconfig:"ENABLED"`
+	DataRetentionDays       int    `yaml:"data_retention_days" envconfig:"DATA_RETENTION_DAYS"`
+	AnonymizeInsteadOfDelete bool  `yaml:"anonymize_instead_of_delete" envconfig:"ANONYMIZE_INSTEAD_OF_DELETE"`
+	EncryptPersonalData     bool   `yaml:"encrypt_personal_data" envconfig:"ENCRYPT_PERSONAL_DATA"`
+	EncryptionKey           string `yaml:"encryption_key" envconfig:"ENCRYPTION_KEY"`
+	SaltPath                string `yaml:"salt_path" envconfig:"SALT_PATH"` // Path to salt file for Argon2id
 }
 
 // AdminAPIConfig holds the configuration for the admin API.

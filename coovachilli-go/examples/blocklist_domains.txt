@@ -1,0 +1,28 @@
+# Domain Blocklist Example
+# Lines starting with # are comments
+# Supports exact domains and wildcards
+
+# Malicious sites
+malware.example.com
+phishing.example.net
+
+# Adult content
+*.porn.com
+*.xxx
+
+# Social media (if you want to block)
+# facebook.com
+# *.facebook.com
+# twitter.com
+
+# Advertising networks
+ads.example.com
+*.doubleclick.net
+
+# Gaming sites
+# *.gaming.com
+# *.steam.com
+
+# Wildcard examples
+*.torrent-site.com
+*.gambling.net

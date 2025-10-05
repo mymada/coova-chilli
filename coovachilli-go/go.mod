@@ -7,8 +7,7 @@ toolchain go1.24.3
 require (
 	github.com/awnumar/memguard v0.23.0
 	github.com/coreos/go-iptables v0.7.0
-	github.com/dreadl0ck/tlsx v1.0.3
-	github.com/google/gopacket v1.1.17
+	github.com/gopacket/gopacket v1.3.1
 	github.com/gorilla/mux v1.8.1
 	github.com/insomniacslk/dhcp v0.0.0-20231016090811-6a2c8fbdcc1c
 	github.com/kelseyhightower/envconfig v1.4.0

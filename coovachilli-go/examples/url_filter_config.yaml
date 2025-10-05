@@ -1,0 +1,36 @@
+# URL and DNS Filtering Configuration Example
+
+# URL/DNS Filtering
+urlfilter:
+  enabled: true
+  # Path to domain blocklist (one domain per line)
+  domain_blocklist_path: "/etc/coovachilli/blocklist_domains.txt"
+  # Path to IP blocklist (one IP per line)
+  ip_blocklist_path: "/etc/coovachilli/blocklist_ips.txt"
+  # Path to category rules (format: category:action:pattern)
+  category_rules_path: "/etc/coovachilli/category_rules.txt"
+  # Default action when no rule matches: "allow" or "block"
+  default_action: "allow"
+
+# Log Export Configuration
+logexport:
+  enabled: true
+  # List of exporters to use: syslog, file, elasticsearch, s3
+  exporters:
+    - file
+    - syslog
+
+  # Syslog configuration
+  syslog_addr: "192.0.2.10:514"
+  syslog_proto: "udp"  # tcp or udp
+
+  # File export configuration
+  file_path: "/var/log/coovachilli/export.jsonl"
+
+  # Elasticsearch configuration
+  es_endpoint: "http://elasticsearch:9200"
+  es_index: "coovachilli-logs"
+
+  # S3 configuration (not yet implemented)
+  # s3_bucket: "my-log-bucket"
+  # s3_region: "us-east-1"

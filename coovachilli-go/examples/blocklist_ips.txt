@@ -1,0 +1,13 @@
+# IP Blocklist Example
+# One IP address per line
+# Lines starting with # are comments
+
+# Known malicious IPs
+192.0.2.66
+198.51.100.77
+
+# Command and control servers
+203.0.113.88
+
+# Spam sources
+# 192.0.2.100

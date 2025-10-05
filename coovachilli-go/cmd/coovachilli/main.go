@@ -32,10 +32,9 @@ import (
 	"coovachilli-go/pkg/script"
 	"coovachilli-go/pkg/tun"
 
-	"github.com/dreadl0ck/tlsx"
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
+	"github.com/gopacket/gopacket/pcap"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/sevlyar/go-daemon"
@@ -632,24 +631,6 @@ func (app *application) processPackets() {
 		session.RUnlock()
 
 		if isAuthenticated {
-			// SNI-based content filtering for authenticated users
-			if len(app.sniBlocklist) > 0 {
-				// Re-parse the packet on-demand for TLS analysis
-				if clientHello := tlsx.GetClientHello(gopacket.NewPacket(rawPacket, layers.LayerTypeEthernet, gopacket.Default)); clientHello != nil {
-					serverName := clientHello.SNI
-					if serverName != "" {
-						if _, isBlocked := app.sniBlocklist[serverName]; isBlocked {
-							app.logger.Info().
-								Str("user", session.Redir.Username).
-								Str("ip", session.HisIP.String()).
-								Str("domain", serverName).
-								Msg("Blocking TLS connection due to SNI blocklist")
-							continue // Drop the packet
-						}
-					}
-				}
-			}
-
 			if session.ShouldDropPacket(packetSize, isUplink) {
 				app.logger.Debug().Str("user", session.Redir.Username).Bool("isUplink", isUplink).Msg("Dropping packet due to bandwidth limit")
 				continue
