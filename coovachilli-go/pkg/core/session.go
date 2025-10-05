@@ -232,6 +232,19 @@ func (sm *SessionManager) GetSessionByIPs(srcIP, dstIP net.IP) (*Session, bool) 
 	return nil, false
 }
 
+// HasSessionByIP checks if a session exists for a given IP address.
+func (sm *SessionManager) HasSessionByIP(ip net.IP) bool {
+	sm.RLock()
+	defer sm.RUnlock()
+	var exists bool
+	if ip.To4() != nil {
+		_, exists = sm.sessionsByIPv4[ip.String()]
+	} else {
+		_, exists = sm.sessionsByIPv6[ip.String()]
+	}
+	return exists
+}
+
 // GetSessionByIP returns a session by IP address.
 func (sm *SessionManager) GetSessionByIP(ip net.IP) (*Session, bool) {
 	sm.RLock()
