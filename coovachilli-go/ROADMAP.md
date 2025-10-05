@@ -11,7 +11,7 @@ Ce document suit la progression du développement de CoovaChilli-Go.
 ## 1. Architecture modulaire et évolutive (Validé)
 - [x] **Installation facile :** Terminé (implémentation d'un `Dockerfile` multi-étapes).
 - [x] **Déploiement sur matériel léger :** Terminé (outils de build et documentation pour la compilation croisée via Docker).
-- [ ] **Intégration Cloud :** Non validé.
+- [x] **Intégration Cloud :** Terminé (configuration via les variables d'environnement).
 - [x] **Base modulaire :** L'architecture `pkg/` a été confirmée comme étant modulaire.
 
 ## 2. Sécurité et conformité (En cours)
