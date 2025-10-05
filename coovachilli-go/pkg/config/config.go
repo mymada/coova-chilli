@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"time"
+
+	"coovachilli-go/pkg/securestore"
 
 	"gopkg.in/yaml.v2"
 )
@@ -45,13 +48,13 @@ type Config struct {
 
 	// DHCP settings
 	DHCPIf         string   `yaml:"dhcpif"`
-	MoreIF         []string `yaml:"moreif"`
+	MoreIf         []string `yaml:"moreif"`
 	DHCPRelay      bool     `yaml:"dhcprelay"`
-	DHCPUpstream   string   `yaml:"dhcpupstream"`
-	DHCPStart      net.IP   `yaml:"dhcpstart"`
-	DHCPEnd        net.IP   `yaml:"dhcpend"`
-	DHCPStartV6    net.IP   `yaml:"dhcpstart_v6"`
-	DHCPEndV6      net.IP   `yaml:"dhcpend_v6"`
+	DHCPUpstream   string `yaml:"dhcpupstream"`
+	DHCPStart      net.IP `yaml:"dhcpstart"`
+	DHCPEnd        net.IP `yaml:"dhcpend"`
+	DHCPStartV6    net.IP `yaml:"dhcpstart_v6"`
+	DHCPEndV6      net.IP `yaml:"dhcpend_v6"`
 	Lease          time.Duration `yaml:"lease"`
 	DNS1           net.IP   `yaml:"dns1"`
 	DNS2           net.IP   `yaml:"dns2"`
@@ -61,22 +64,30 @@ type Config struct {
 	// RADIUS settings
 	RadiusListen       net.IP `yaml:"radiuslisten"`
 	RadiusListenV6     net.IP `yaml:"radiuslisten_v6"`
-	RadiusServer1      string `yaml:"radiusserver1"`
-	RadiusServer2      string `yaml:"radiusserver2"`
-	RadiusAuthPort     int    `yaml:"radiusauthport"`
-	RadiusAcctPort     int    `yaml:"radiusacctport"`
-	RadiusSecret       string `yaml:"radiussecret"`
-	RadiusNASID        string `yaml:"radiusnasid"`
-	CoaPort            int    `yaml:"coaport"`
-	RadSecEnable       bool   `yaml:"radsecenable"`
-	RadSecPort         int    `yaml:"radsecport"`
-	RadSecCertFile     string `yaml:"radseccertfile"`
-	RadSecKeyFile      string `yaml:"radseckeyfile"`
-	RadSecCAFile       string `yaml:"radseccafile"`
-	ProxyEnable        bool   `yaml:"proxyenable"`
-	ProxyListen        string `yaml:"proxylisten"`
-	ProxyPort          int    `yaml:"proxyport"`
-	ProxySecret        string `yaml:"proxysecret"`
+	RadiusServer1      string              `yaml:"radiusserver1"`
+	RadiusServer2      string              `yaml:"radiusserver2"`
+	RadiusAcctServer1  string              `yaml:"radiusacctserver1"`
+	RadiusAcctServer2  string              `yaml:"radiusacctserver2"`
+	RadiusAuthPort     int                 `yaml:"radiusauthport"`
+	RadiusAcctPort     int                 `yaml:"radiusacctport"`
+	RadiusSecretStr    string              `yaml:"radiussecret"`
+	RadiusSecret       *securestore.Secret `yaml:"-"`
+	RadiusAcctSecretStr string             `yaml:"radiusacctsecret"`
+	RadiusAcctSecret   *securestore.Secret `yaml:"-"`
+	RadiusNASID        string              `yaml:"radiusnasid"`
+	RadiusTimeout      time.Duration       `yaml:"radiustimeout"`
+	RadSecIdleTimeout  time.Duration       `yaml:"radsecidletimeout"`
+	CoaPort            int                 `yaml:"coaport"`
+	RadSecEnable       bool                `yaml:"radsecenable"`
+	RadSecPort         int                 `yaml:"radsecport"`
+	RadSecCertFile     string              `yaml:"radseccertfile"`
+	RadSecKeyFile      string              `yaml:"radseckeyfile"`
+	RadSecCAFile       string              `yaml:"radseccafile"`
+	ProxyEnable        bool                `yaml:"proxyenable"`
+	ProxyListen        string              `yaml:"proxylisten"`
+	ProxyPort          int                 `yaml:"proxyport"`
+	ProxySecretStr     string              `yaml:"proxysecret"`
+	ProxySecret        *securestore.Secret `yaml:"-"`
 
 	// UAM/Captive Portal settings
 	UAMPort             int      `yaml:"uamport"`
@@ -91,9 +102,17 @@ type Config struct {
 	UAMAllowed          []string `yaml:"uamallowed"`
 	UAMAllowedV6        []string `yaml:"uamallowed_v6"`
 	UAMDomains          []string `yaml:"uamdomains"`
+	UAMRegex            []string `yaml:"uamregex"`
+	UAMRegexCompiled    []*regexp.Regexp    `yaml:"-"`
 	UAMUrl              string   `yaml:"uamurl"`
-	UAMAnyIP            bool     `yaml:"uamanyip"`
 	UAMAnyDNS           bool     `yaml:"uamanydns"`
+	UAMAnyIP            bool     `yaml:"uamanyip"`
+	UAMReadTimeout      time.Duration `yaml:"uam_read_timeout"`
+	UAMWriteTimeout     time.Duration `yaml:"uam_write_timeout"`
+	UAMIdleTimeout      time.Duration `yaml:"uam_idle_timeout"`
+	UAMRateLimitEnabled bool          `yaml:"uam_rate_limit_enabled"`
+	UAMRateLimit        float64       `yaml:"uam_rate_limit"`
+	UAMRateLimitBurst   int           `yaml:"uam_rate_limit_burst"`
 	MACAuth             bool     `yaml:"macauth"`
 	MACSuffix           string   `yaml:"macsuffix"`
 	MACPasswd           string   `yaml:"macpasswd"`
@@ -132,14 +151,30 @@ type Config struct {
 	// Metrics settings
 	Metrics MetricsConfig `yaml:"metrics"`
 	// Admin API settings
-	AdminAPI AdminAPIConfig `yaml:"admin_api"`
+	AdminAPI             AdminAPIConfig `yaml:"admin_api"`
+	RadiusCircuitBreaker CircuitBreakerConfig `yaml:"radius_circuit_breaker"`
+}
+
+// CircuitBreakerConfig holds settings for the circuit breaker.
+type CircuitBreakerConfig struct {
+	Enabled     bool          `yaml:"enabled"`
+	MaxRequests uint32        `yaml:"max_requests"` // Number of requests allowed to pass through in half-open state
+	Interval    time.Duration `yaml:"interval"`     // The cyclic period of the closed state
+	Timeout     time.Duration `yaml:"timeout"`      // The period of the open state
 }
 
 // AdminAPIConfig holds the configuration for the admin API.
 type AdminAPIConfig struct {
-	Enabled   bool   `yaml:"enabled"`
-	Listen    string `yaml:"listen"`
-	AuthToken string `yaml:"auth_token"`
+	Enabled          bool                `yaml:"enabled"`
+	Listen           string              `yaml:"listen"`
+	AuthTokenStr     string              `yaml:"auth_token"`
+	AuthToken        *securestore.Secret `yaml:"-"`
+	ReadTimeout      time.Duration       `yaml:"read_timeout"`
+	WriteTimeout     time.Duration       `yaml:"write_timeout"`
+	IdleTimeout      time.Duration       `yaml:"idle_timeout"`
+	RateLimitEnabled bool                `yaml:"rate_limit_enabled"`
+	RateLimit        float64             `yaml:"rate_limit"`
+	RateLimitBurst   int                 `yaml:"rate_limit_burst"`
 }
 
 // MetricsConfig holds the configuration for the metrics system.
@@ -167,6 +202,36 @@ func Load(path string) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config data: %w", err)
+	}
+
+	// Convert secrets to secure buffers
+	if cfg.RadiusSecretStr != "" {
+		cfg.RadiusSecret = securestore.NewSecret(cfg.RadiusSecretStr)
+		cfg.RadiusSecretStr = "" // Clear the plaintext secret
+	}
+	if cfg.ProxySecretStr != "" {
+		cfg.ProxySecret = securestore.NewSecret(cfg.ProxySecretStr)
+		cfg.ProxySecretStr = ""
+	}
+	if cfg.AdminAPI.AuthTokenStr != "" {
+		cfg.AdminAPI.AuthToken = securestore.NewSecret(cfg.AdminAPI.AuthTokenStr)
+		cfg.AdminAPI.AuthTokenStr = ""
+	}
+	if cfg.RadiusAcctSecretStr != "" {
+		cfg.RadiusAcctSecret = securestore.NewSecret(cfg.RadiusAcctSecretStr)
+		cfg.RadiusAcctSecretStr = ""
+	}
+
+	// Compile UAM regexes
+	if len(cfg.UAMRegex) > 0 {
+		cfg.UAMRegexCompiled = make([]*regexp.Regexp, len(cfg.UAMRegex))
+		for i, reStr := range cfg.UAMRegex {
+			re, err := regexp.Compile(reStr)
+			if err != nil {
+				return nil, fmt.Errorf("failed to compile uamregex '%s': %w", reStr, err)
+			}
+			cfg.UAMRegexCompiled[i] = re
+		}
 	}
 
 	// Manual parsing for CIDR notation fields

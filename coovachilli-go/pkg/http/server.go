@@ -83,33 +83,17 @@ func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<-
 
 // Start starts the HTTP server.
 func (s *Server) Start() {
-	// If wwwdir is configured, serve static files
-	if s.cfg.WWWDir != "" {
-		s.logger.Info().Str("wwwdir", s.cfg.WWWDir).Msg("Serving static files from directory")
-		fs := http.FileServer(http.Dir(s.cfg.WWWDir))
-		http.Handle("/www/", http.StripPrefix("/www/", fs))
-
-		// Serve root from wwwdir if configured
-		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/" || r.URL.Path == "/index.html" {
-				http.ServeFile(w, r, s.cfg.WWWDir+"/index.html")
-			} else {
-				s.handlePortal(w, r)
-			}
-		})
-	} else {
-		http.HandleFunc("/", s.handlePortal)
-	}
-
-	http.HandleFunc("/login", s.handleLogin)
-	http.HandleFunc("/status", s.handleStatus)
-	http.HandleFunc("/logout", s.handleLogout)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handlePortal)
+	mux.HandleFunc("/login", s.handleLogin)
+	mux.HandleFunc("/status", s.handleStatus)
+	mux.HandleFunc("/logout", s.handleLogout)
 
 	// API endpoints
-	http.HandleFunc("/api/v1/status", s.handleApiStatus)
-	http.HandleFunc("/api/v1/login", s.handleApiLogin)
-	http.HandleFunc("/api/v1/logout", s.handleApiLogout)
-	http.HandleFunc("/json/status", s.handleJsonpStatus)
+	mux.HandleFunc("/api/v1/status", s.handleApiStatus)
+	mux.HandleFunc("/api/v1/login", s.handleApiLogin)
+	mux.HandleFunc("/api/v1/logout", s.handleApiLogout)
+	mux.HandleFunc("/json/status", s.handleJsonpStatus)
 
 	// WISPr endpoints
 	http.HandleFunc("/wispr", s.handleWISPr)
@@ -117,16 +101,34 @@ func (s *Server) Start() {
 
 	addr := fmt.Sprintf(":%d", s.cfg.UAMPort)
 
+	rateLimiter := NewRateLimiter(s.logger, s.cfg.UAMRateLimitEnabled, s.cfg.UAMRateLimit, s.cfg.UAMRateLimitBurst)
+
+	server := &http.Server{
+		Addr:         addr,
+		Handler:      rateLimiter.Middleware(mux),
+		ReadTimeout:  s.cfg.UAMReadTimeout,
+		WriteTimeout: s.cfg.UAMWriteTimeout,
+		IdleTimeout:  s.cfg.UAMIdleTimeout,
+	}
+
+	s.logger.Info().
+		Str("addr", addr).
+		Dur("read_timeout", server.ReadTimeout).
+		Dur("write_timeout", server.WriteTimeout).
+		Dur("idle_timeout", server.IdleTimeout).
+		Msg("Starting UAM server")
+
+	var err error
 	if s.cfg.CertFile != "" && s.cfg.KeyFile != "" {
-		s.logger.Info().Str("addr", addr).Msg("Starting HTTPS server")
-		if err := http.ListenAndServeTLS(addr, s.cfg.CertFile, s.cfg.KeyFile, nil); err != nil {
-			s.logger.Fatal().Err(err).Msg("Failed to start HTTPS server")
-		}
+		s.logger.Info().Msg("UAM server will use HTTPS")
+		err = server.ListenAndServeTLS(s.cfg.CertFile, s.cfg.KeyFile)
 	} else {
-		s.logger.Info().Str("addr", addr).Msg("Starting HTTP server")
-		if err := http.ListenAndServe(addr, nil); err != nil {
-			s.logger.Fatal().Err(err).Msg("Failed to start HTTP server")
-		}
+		s.logger.Info().Msg("UAM server will use HTTP")
+		err = server.ListenAndServe()
+	}
+
+	if err != nil && err != http.ErrServerClosed {
+		s.logger.Fatal().Err(err).Msg("UAM server failed")
 	}
 }
 

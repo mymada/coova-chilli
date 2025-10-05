@@ -13,7 +13,9 @@ import (
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
 	"coovachilli-go/pkg/metrics"
+
 	"github.com/rs/zerolog"
+	"github.com/sony/gobreaker"
 	"layeh.com/radius"
 	"layeh.com/radius/rfc2865"
 	"layeh.com/radius/rfc2866"
@@ -37,14 +39,24 @@ type CoAIncomingRequest struct {
 	Peer   *net.UDPAddr
 }
 
+// Packet returns the underlying RADIUS packet to satisfy the core.CoAContext interface.
+func (r *CoAIncomingRequest) Packet() *radius.Packet {
+	return r.Packet
+}
+
+// Peer returns the sender's network address to satisfy the core.CoAContext interface.
+func (r *CoAIncomingRequest) Peer() *net.UDPAddr {
+	return r.Peer
+}
+
 // Client holds the state for the RADIUS client.
 type Client struct {
-	cfg            *config.Config
-	logger         zerolog.Logger
-	radsecConns    map[string]net.Conn
-	radsecMutex    sync.Mutex
-	lastGoodServer int // 0 for server1, 1 for server2
-	recorder       metrics.Recorder
+	cfg         *config.Config
+	logger      zerolog.Logger
+	radsecConns map[string]net.Conn
+	radsecMutex sync.Mutex
+	recorder    metrics.Recorder
+	cb          []*gobreaker.CircuitBreaker
 }
 
 // NewClient creates a new RADIUS client.
@@ -52,12 +64,31 @@ func NewClient(cfg *config.Config, logger zerolog.Logger, recorder metrics.Recor
 	if recorder == nil {
 		recorder = metrics.NewNoopRecorder()
 	}
-	return &Client{
+	client := &Client{
 		cfg:         cfg,
 		logger:      logger.With().Str("component", "radius").Logger(),
 		radsecConns: make(map[string]net.Conn),
 		recorder:    recorder,
+		cb:          make([]*gobreaker.CircuitBreaker, 2),
 	}
+
+	if cfg.RadiusCircuitBreaker.Enabled {
+		st := gobreaker.Settings{
+			Name:        "RADIUS Server 1",
+			MaxRequests: cfg.RadiusCircuitBreaker.MaxRequests,
+			Interval:    cfg.RadiusCircuitBreaker.Interval,
+			Timeout:     cfg.RadiusCircuitBreaker.Timeout,
+			OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
+				logger.Info().Str("name", name).Str("from", from.String()).Str("to", to.String()).Msg("Circuit breaker state changed")
+			},
+		}
+		client.cb[0] = gobreaker.NewCircuitBreaker(st)
+
+		st.Name = "RADIUS Server 2"
+		client.cb[1] = gobreaker.NewCircuitBreaker(st)
+	}
+
+	return client
 }
 
 func (c *Client) dialRadSec(serverAddr string) (net.Conn, error) {
@@ -79,7 +110,8 @@ func (c *Client) dialRadSec(serverAddr string) (net.Conn, error) {
 	}
 
 	server := fmt.Sprintf("%s:%d", serverAddr, c.cfg.RadSecPort)
-	conn, err := tls.Dial("tcp", server, tlsConfig)
+	dialer := &net.Dialer{Timeout: c.cfg.RadiusTimeout}
+	conn, err := tls.DialWithDialer(dialer, "tcp", server, tlsConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial radsec server: %w", err)
 	}
@@ -101,6 +133,15 @@ func (c *Client) radsecExchange(packet *radius.Packet, serverAddr string) (*radi
 		c.radsecMutex.Lock()
 		c.radsecConns[serverAddr] = conn
 		c.radsecMutex.Unlock()
+	}
+
+	// Set a deadline for the entire request/response exchange.
+	if c.cfg.RadiusTimeout > 0 {
+		if err := conn.SetDeadline(time.Now().Add(c.cfg.RadiusTimeout)); err != nil {
+			c.logger.Error().Err(err).Msg("Failed to set deadline on RadSec connection")
+			// Not fatal, we can still try
+		}
+		defer conn.SetDeadline(time.Time{}) // Clear the deadline
 	}
 
 	encoded, err := packet.Encode()
@@ -129,80 +170,120 @@ func (c *Client) radsecExchange(packet *radius.Packet, serverAddr string) (*radi
 		return nil, fmt.Errorf("failed to read from radsec connection: %w", err)
 	}
 
-	response, err := radius.Parse(buf[:n], []byte(c.cfg.RadiusSecret))
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse radsec response: %w", err)
+	var response *radius.Packet
+	parseErr := c.cfg.RadiusSecret.Access(func(secret []byte) (err error) {
+		response, err = radius.Parse(buf[:n], secret)
+		return
+	})
+	if parseErr != nil {
+		return nil, fmt.Errorf("failed to parse radsec response: %w", parseErr)
 	}
 
 	return response, nil
 }
 
 func (c *Client) exchangeWithFailover(packet *radius.Packet, auth bool) (*radius.Packet, error) {
-	servers := []string{c.cfg.RadiusServer1, c.cfg.RadiusServer2}
-
-	// Order of preference: start with the last known good server
-	serverOrder := []int{c.lastGoodServer, 1 - c.lastGoodServer}
-
-	// If no secondary server is configured, just try the primary
-	if servers[1] == "" {
-		serverOrder = []int{0}
-	}
-
+	var servers []string
 	requestType := "acct"
 	if auth {
 		requestType = "auth"
+		servers = []string{c.cfg.RadiusServer1, c.cfg.RadiusServer2}
+	} else {
+		// For accounting, prefer accounting-specific servers if configured
+		if c.cfg.RadiusAcctServer1 != "" {
+			servers = []string{c.cfg.RadiusAcctServer1, c.cfg.RadiusAcctServer2}
+		} else {
+			// Fallback to primary servers
+			servers = []string{c.cfg.RadiusServer1, c.cfg.RadiusServer2}
+		}
 	}
 
 	var lastErr error
-	for _, serverIndex := range serverOrder {
-		serverAddr := servers[serverIndex]
+	for i, serverAddr := range servers {
 		if serverAddr == "" {
 			continue // Skip if server is not configured
 		}
 
-		now := time.Now()
-		labels := metrics.Labels{
-			"server": serverAddr,
-			"type":   requestType,
-		}
-
-		var response *radius.Packet
-		var err error
-
-		if c.cfg.RadSecEnable {
-			response, err = c.radsecExchange(packet, serverAddr)
-		} else {
-			port := c.cfg.RadiusAcctPort
-			if auth {
-				port = c.cfg.RadiusAuthPort
+		// If circuit breaker is disabled, execute directly
+		if !c.cfg.RadiusCircuitBreaker.Enabled || c.cb[i] == nil {
+			resp, err := c.executeRequest(packet, serverAddr, auth, requestType)
+			if err == nil {
+				return resp, nil
 			}
-			target := fmt.Sprintf("%s:%d", serverAddr, port)
-			c.logger.Debug().Str("server", target).Msg("Sending RADIUS request")
-			response, err = radius.Exchange(context.Background(), packet, target)
+			lastErr = err
+			continue // Try next server
 		}
 
-		c.recorder.ObserveHistogram("chilli_radius_request_duration_seconds", labels, time.Since(now).Seconds())
+		// Execute with circuit breaker protection
+		resp, err := c.cb[i].Execute(func() (interface{}, error) {
+			return c.executeRequest(packet, serverAddr, auth, requestType)
+		})
 
 		if err == nil {
-			c.logger.Info().Str("server", serverAddr).Msg("RADIUS request successful")
-			c.lastGoodServer = serverIndex // Update last good server
-			labels["status"] = "success"
-			c.recorder.IncCounter("chilli_radius_requests_total", labels)
-			return response, nil
+			return resp.(*radius.Packet), nil
 		}
+		lastErr = err
+		c.logger.Warn().Err(err).Str("server", serverAddr).Str("state", c.cb[i].State().String()).Msg("Circuit breaker protected RADIUS request failed")
+	}
 
+	return nil, fmt.Errorf("all RADIUS servers failed or circuit breakers open: %w", lastErr)
+}
+
+// executeRequest performs the actual RADIUS request and is wrapped by the circuit breaker.
+func (c *Client) executeRequest(packet *radius.Packet, serverAddr string, auth bool, requestType string) (*radius.Packet, error) {
+	now := time.Now()
+	labels := metrics.Labels{
+		"server": serverAddr,
+		"type":   requestType,
+	}
+
+	var response *radius.Packet
+	var err error
+
+	if c.cfg.RadSecEnable {
+		response, err = c.radsecExchange(packet, serverAddr)
+	} else {
+		port := c.cfg.RadiusAcctPort
+		if auth {
+			port = c.cfg.RadiusAuthPort
+		}
+		target := fmt.Sprintf("%s:%d", serverAddr, port)
+		c.logger.Debug().Str("server", target).Msg("Sending RADIUS request")
+
+		ctx := context.Background()
+		if c.cfg.RadiusTimeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, c.cfg.RadiusTimeout)
+			defer cancel()
+		}
+		response, err = radius.Exchange(ctx, packet, target)
+	}
+
+	c.recorder.ObserveHistogram("chilli_radius_request_duration_seconds", labels, time.Since(now).Seconds())
+
+	if err != nil {
 		c.logger.Warn().Err(err).Str("server", serverAddr).Msg("RADIUS request failed")
 		labels["status"] = "failure"
 		c.recorder.IncCounter("chilli_radius_requests_total", labels)
-		lastErr = err
+		return nil, err
 	}
 
-	return nil, fmt.Errorf("all RADIUS servers failed: %w", lastErr)
+	c.logger.Info().Str("server", serverAddr).Msg("RADIUS request successful")
+	labels["status"] = "success"
+	c.recorder.IncCounter("chilli_radius_requests_total", labels)
+	return response, nil
 }
 
 // SendAccessRequest sends a RADIUS Access-Request packet.
 func (c *Client) SendAccessRequest(session *core.Session, username, password string) (*radius.Packet, error) {
-	packet := radius.New(radius.CodeAccessRequest, []byte(c.cfg.RadiusSecret))
+	var packet *radius.Packet
+	err := c.cfg.RadiusSecret.Access(func(secret []byte) error {
+		packet = radius.New(radius.CodeAccessRequest, secret)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to access RADIUS secret for Access-Request: %w", err)
+	}
 
 	// Add standard attributes
 	rfc2865.UserName_SetString(packet, username)
@@ -238,7 +319,19 @@ func (c *Client) SendAccessRequest(session *core.Session, username, password str
 
 // SendAccountingRequest sends a RADIUS Accounting-Request packet.
 func (c *Client) SendAccountingRequest(session *core.Session, statusType rfc2866.AcctStatusType) (*radius.Packet, error) {
-	packet := radius.New(radius.CodeAccountingRequest, []byte(c.cfg.RadiusSecret))
+	var packet *radius.Packet
+	secretToUse := c.cfg.RadiusSecret
+	if c.cfg.RadiusAcctSecret != nil {
+		secretToUse = c.cfg.RadiusAcctSecret
+	}
+
+	err := secretToUse.Access(func(secret []byte) error {
+		packet = radius.New(radius.CodeAccountingRequest, secret)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to access RADIUS secret for Accounting-Request: %w", err)
+	}
 
 	// Add standard attributes
 	rfc2866.AcctStatusType_Set(packet, statusType)
@@ -283,7 +376,14 @@ func (c *Client) SendAccountingRequest(session *core.Session, statusType rfc2866
 // SendEAPAccessRequest sends a RADIUS Access-Request with an EAP payload.
 // It returns the response packet, the original request's authenticator, and any error.
 func (c *Client) SendEAPAccessRequest(session *core.Session, eapPayload []byte, state []byte) (*radius.Packet, []byte, error) {
-	packet := radius.New(radius.CodeAccessRequest, []byte(c.cfg.RadiusSecret))
+	var packet *radius.Packet
+	err := c.cfg.RadiusSecret.Access(func(secret []byte) error {
+		packet = radius.New(radius.CodeAccessRequest, secret)
+		return nil
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to access RADIUS secret for EAP-Request: %w", err)
+	}
 
 	// Add standard attributes
 	rfc2865.UserName_SetString(packet, session.Redir.Username)
@@ -369,7 +469,7 @@ func SetMSMPPERecvKey(p *radius.Packet, key []byte) {
 }
 
 // StartCoAListener starts listeners for incoming CoA and Disconnect requests.
-func (c *Client) StartCoAListener(coaReqChan chan<- CoAIncomingRequest) {
+func (c *Client) StartCoAListener(coaReqChan chan<- core.CoAContext) {
 	// Listener for IPv4. If no specific address is configured, listen on all interfaces.
 	ipv4Addr := "0.0.0.0"
 	if c.cfg.RadiusListen != nil {
@@ -394,7 +494,7 @@ func (c *Client) StartCoAListener(coaReqChan chan<- CoAIncomingRequest) {
 }
 
 // listen is a helper function to listen on a specific address and protocol.
-func (c *Client) listen(network, addr string, coaReqChan chan<- CoAIncomingRequest) {
+func (c *Client) listen(network, addr string, coaReqChan chan<- core.CoAContext) {
 	conn, err := net.ListenPacket(network, addr)
 	if err != nil {
 		// Log as an error instead of fatal, as one of the listeners might fail (e.g., no IPv6 on host)
@@ -414,14 +514,18 @@ func (c *Client) listen(network, addr string, coaReqChan chan<- CoAIncomingReque
 			continue
 		}
 
-		packet, err := radius.Parse(buf[:n], []byte(c.cfg.RadiusSecret))
-		if err != nil {
-			c.logger.Error().Err(err).Msg("Failed to parse incoming CoA packet")
+		var packet *radius.Packet
+		parseErr := c.cfg.RadiusSecret.Access(func(secret []byte) (err error) {
+			packet, err = radius.Parse(buf[:n], secret)
+			return
+		})
+		if parseErr != nil {
+			c.logger.Error().Err(parseErr).Msg("Failed to parse incoming CoA packet")
 			continue
 		}
 
 		c.logger.Info().Str("code", packet.Code.String()).Str("peer", peer.String()).Msg("Received CoA/Disconnect request")
-		coaReqChan <- CoAIncomingRequest{
+		coaReqChan <- &CoAIncomingRequest{
 			Packet: packet,
 			Peer:   peer.(*net.UDPAddr),
 		}
