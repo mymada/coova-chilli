@@ -151,16 +151,9 @@ type Config struct {
 	// Metrics settings
 	Metrics MetricsConfig `yaml:"metrics"`
 	// Admin API settings
-	AdminAPI             AdminAPIConfig `yaml:"admin_api"`
-	RadiusCircuitBreaker CircuitBreakerConfig `yaml:"radius_circuit_breaker"`
-}
-
-// CircuitBreakerConfig holds settings for the circuit breaker.
-type CircuitBreakerConfig struct {
-	Enabled     bool          `yaml:"enabled"`
-	MaxRequests uint32        `yaml:"max_requests"` // Number of requests allowed to pass through in half-open state
-	Interval    time.Duration `yaml:"interval"`     // The cyclic period of the closed state
-	Timeout     time.Duration `yaml:"timeout"`      // The period of the open state
+	AdminAPI AdminAPIConfig `yaml:"admin_api"`
+	// Walled Garden settings
+	WalledGarden WalledGardenConfig `yaml:"walledgarden"`
 }
 
 // AdminAPIConfig holds the configuration for the admin API.
@@ -175,6 +168,12 @@ type AdminAPIConfig struct {
 	RateLimitEnabled bool                `yaml:"rate_limit_enabled"`
 	RateLimit        float64             `yaml:"rate_limit"`
 	RateLimitBurst   int                 `yaml:"rate_limit_burst"`
+}
+
+// WalledGardenConfig holds the configuration for the walled garden.
+type WalledGardenConfig struct {
+	AllowedDomains  []string `yaml:"allowedDomains"`
+	AllowedNetworks []string `yaml:"allowedNetworks"`
 }
 
 // MetricsConfig holds the configuration for the metrics system.

@@ -107,3 +107,12 @@ admin_api:
   enabled: true
   listen: "127.0.0.1:8081"
   auth_token: "your-secret-admin-token"
+
+# Walled Garden settings
+walledgarden:
+  allowedDomains:
+    - "example.com"
+    - "*.example.org"
+  allowedNetworks:
+    - "10.0.0.0/24"
+    - "192.168.1.10"

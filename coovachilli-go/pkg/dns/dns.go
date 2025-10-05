@@ -6,121 +6,98 @@ import (
 	"strings"
 
 	"coovachilli-go/pkg/config"
-	"github.com/gopacket/gopacket"
-	"github.com/gopacket/gopacket/layers"
+	"github.com/miekg/dns"
 	"github.com/rs/zerolog"
 )
+
+// GardenInterface defines the methods the DNS proxy needs from the garden service.
+// This is used to break the circular dependency between dns and garden packages.
+type GardenInterface interface {
+	HandleDNSResponse(domain string, ips []net.IP)
+}
 
 // Proxy handles DNS proxying for unauthenticated clients.
 type Proxy struct {
 	cfg    *config.Config
 	logger zerolog.Logger
+	garden GardenInterface // Interface to the walled garden service
 }
 
 // NewProxy creates a new DNS proxy.
-func NewProxy(cfg *config.Config, logger zerolog.Logger) *Proxy {
+func NewProxy(cfg *config.Config, logger zerolog.Logger, garden GardenInterface) *Proxy {
 	return &Proxy{
 		cfg:    cfg,
 		logger: logger.With().Str("component", "dns").Logger(),
+		garden: garden,
 	}
 }
 
-// isAllowed checks if a domain is in the walled garden.
-func (p *Proxy) isAllowed(domain string) bool {
-	// Check exact domain matches and subdomains in uamdomains
-	for _, allowedDomain := range p.cfg.UAMDomains {
-		if strings.HasSuffix(domain, "."+allowedDomain) || domain == allowedDomain {
-			return true
+// HandleQuery forwards a DNS query to an upstream server and notifies the
+// walled garden of the response. It takes the raw DNS query payload and returns
+// the raw DNS response payload.
+func (p *Proxy) HandleQuery(queryPayload []byte) ([]byte, error) {
+	req := new(dns.Msg)
+	if err := req.Unpack(queryPayload); err != nil {
+		return nil, fmt.Errorf("failed to unpack dns query: %w", err)
+	}
+
+	if len(req.Question) == 0 {
+		return nil, fmt.Errorf("received dns query with no questions")
+	}
+
+	qname := req.Question[0].Name
+	p.logger.Debug().Str("qname", qname).Msg("Handling DNS query")
+
+	// Create a new DNS client
+	c := new(dns.Client)
+	// Use the configured DNS servers
+	upstreamAddr := net.JoinHostPort(p.cfg.DNS1.String(), "53")
+
+	// Forward the request to the upstream server
+	resp, _, err := c.Exchange(req, upstreamAddr)
+	if err != nil {
+		p.logger.Error().Err(err).Str("qname", qname).Msg("Failed to forward DNS query to upstream")
+		// Try the secondary DNS server if the first one fails
+		if p.cfg.DNS2 != nil {
+			p.logger.Debug().Str("dns_server", p.cfg.DNS2.String()).Msg("Trying secondary DNS server")
+			upstreamAddr = net.JoinHostPort(p.cfg.DNS2.String(), "53")
+			resp, _, err = c.Exchange(req, upstreamAddr)
+			if err != nil {
+				p.logger.Error().Err(err).Str("qname", qname).Msg("Failed to forward DNS query to secondary upstream")
+				return nil, err
+			}
+		} else {
+			return nil, err
 		}
 	}
 
-	// Check regex matches
-	for _, re := range p.cfg.UAMRegexCompiled {
-		if re.MatchString(domain) {
-			return true
+	// If the response is successful, extract IPs and notify the garden
+	if resp != nil && resp.Rcode == dns.RcodeSuccess {
+		var ips []net.IP
+		for _, ans := range resp.Answer {
+			switch rec := ans.(type) {
+			case *dns.A:
+				ips = append(ips, rec.A)
+			case *dns.AAAA:
+				ips = append(ips, rec.AAAA)
+			}
+		}
+
+		if len(ips) > 0 && p.garden != nil {
+			// Trim the trailing dot from the domain name before sending to garden
+			trimmedDomain := qname
+			if strings.HasSuffix(qname, ".") {
+				trimmedDomain = qname[:len(qname)-1]
+			}
+			p.garden.HandleDNSResponse(trimmedDomain, ips)
 		}
 	}
 
-	return false
-}
-
-// HandleQuery processes a DNS query. It checks against the walled garden rules.
-// If the domain is allowed, it proxies the request.
-// Otherwise, it returns the captive portal's IP address.
-func (p *Proxy) HandleQuery(query *layers.DNS, upstreamAddr string) ([]byte, map[string]uint32, error) {
-	if len(query.Questions) == 0 {
-		return nil, nil, fmt.Errorf("no questions in DNS query")
-	}
-
-	question := query.Questions[0]
-	domain := string(question.Name)
-
-	p.logger.Debug().Str("domain", domain).Msg("Processing DNS query for walled garden check")
-
-	if p.isAllowed(domain) {
-		p.logger.Debug().Str("domain", domain).Msg("Domain is in walled garden, proxying request")
-		return p.proxyRequest(query, upstreamAddr)
-	}
-
-	p.logger.Debug().Str("domain", domain).Msg("Domain not in walled garden, redirecting to captive portal")
-	return p.forgeResponse(query), nil, nil
-}
-
-// proxyRequest sends the query to a real DNS server and returns the response.
-func (p *Proxy) proxyRequest(query *layers.DNS, upstreamAddr string) ([]byte, map[string]uint32, error) {
-	conn, err := net.Dial("udp", upstreamAddr)
+	// Pack the response message back into bytes
+	respBytes, err := resp.Pack()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to connect to upstream DNS: %w", err)
-	}
-	defer conn.Close()
-
-	buf := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{}
-	err = gopacket.SerializeLayers(buf, opts, query)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to serialize DNS query: %w", err)
+		return nil, fmt.Errorf("failed to pack dns response: %w", err)
 	}
 
-	if _, err := conn.Write(buf.Bytes()); err != nil {
-		return nil, nil, fmt.Errorf("failed to write DNS query to upstream: %w", err)
-	}
-
-	respBuf := make([]byte, 512)
-	n, err := conn.Read(respBuf)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to read DNS response from upstream: %w", err)
-	}
-
-	return respBuf[:n], nil, nil // No caching implemented yet
-}
-
-// forgeResponse creates a fake DNS response pointing to the captive portal.
-func (p *Proxy) forgeResponse(query *layers.DNS) []byte {
-	response := *query
-	response.QR = true
-	response.ANCount = 1
-	response.ResponseCode = layers.DNSResponseCodeNoErr
-
-	answer := layers.DNSResourceRecord{
-		Name:  query.Questions[0].Name,
-		Type:  layers.DNSTypeA,
-		Class: layers.DNSClassIN,
-		TTL:   60,
-		IP:    p.cfg.UAMListen,
-	}
-	response.Answers = []layers.DNSResourceRecord{answer}
-
-	buf := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{
-		FixLengths:       true,
-		ComputeChecksums: true,
-	}
-	// We only need to serialize the DNS layer, the upper layers will be reconstructed by the caller.
-	err := gopacket.SerializeLayers(buf, opts, &response)
-	if err != nil {
-		p.logger.Error().Err(err).Msg("Failed to serialize forged DNS response")
-		return nil
-	}
-
-	return buf.Bytes()
+	return respBytes, nil
 }

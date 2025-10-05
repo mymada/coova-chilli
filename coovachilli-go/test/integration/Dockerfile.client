@@ -1,0 +1,10 @@
+FROM alpine:latest
+
+# Install necessary tools for testing
+RUN apk update && apk add --no-cache curl bind-tools
+
+# Create a directory for the test scripts
+RUN mkdir -p /tests
+
+# Set the working directory
+WORKDIR /tests
