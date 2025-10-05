@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Session Status</title>
+</head>
+<body>
+    <h1>Session Active</h1>
+    <p>Welcome, {{.Username}}!</p>
+    <p>IP Address: {{.IPAddress}}</p>
+    <p>MAC Address: {{.MACAddress}}</p>
+    <p>Session Started: {{.StartTime}}</p>
+    <p>Session Duration: {{.SessionDuration}}</p>
+    <br>
+    <form action="/logout" method="post">
+        <input type="submit" value="Logout">
+    </form>
+</body>
+</html>

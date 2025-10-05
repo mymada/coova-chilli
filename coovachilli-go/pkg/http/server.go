@@ -5,8 +5,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"net"
 	"net/http"
+	"path/filepath"
 	"time"
 
 	"coovachilli-go/pkg/config"
@@ -16,46 +18,6 @@ import (
 	"github.com/rs/zerolog"
 )
 
-const loginPage = `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Captive Portal</title>
-</head>
-<body>
-    <h1>Welcome to the Captive Portal</h1>
-    <form action="/login" method="post">
-        <label for="username">Username:</label>
-        <input type="text" id="username" name="username"><br><br>
-        <label for="password">Password:</label>
-        <input type="password" id="password" name="password"><br><br>
-        <input type="submit" value="Login">
-    </form>
-</body>
-</html>
-`
-
-const statusPageTemplate = `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Session Status</title>
-</head>
-<body>
-    <h1>Session Active</h1>
-    <p>Welcome, %s!</p>
-    <p>IP Address: %s</p>
-    <p>MAC Address: %s</p>
-    <p>Session Started: %s</p>
-    <p>Session Duration: %s</p>
-    <br>
-    <form action="/logout" method="post">
-        <input type="submit" value="Logout">
-    </form>
-</body>
-</html>
-`
-
 // Server holds the state for the HTTP server.
 type Server struct {
 	cfg            *config.Config
@@ -64,13 +26,26 @@ type Server struct {
 	disconnecter   core.Disconnector
 	logger         zerolog.Logger
 	recorder       metrics.Recorder
+	templates      *template.Template
 }
 
 // NewServer creates a new HTTP server.
-func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<- *core.Session, disconnecter core.Disconnector, logger zerolog.Logger, recorder metrics.Recorder) *Server {
+func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<- *core.Session, disconnecter core.Disconnector, logger zerolog.Logger, recorder metrics.Recorder) (*Server, error) {
 	if recorder == nil {
 		recorder = metrics.NewNoopRecorder()
 	}
+
+	templateDir := cfg.TemplateDir
+	if templateDir == "" {
+		templateDir = "www/templates" // Default directory
+	}
+
+	templates, err := template.ParseGlob(filepath.Join(templateDir, "*.html"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse templates: %w", err)
+	}
+	logger.Info().Str("path", templateDir).Msg("HTML templates loaded")
+
 	return &Server{
 		cfg:            cfg,
 		sessionManager: sm,
@@ -78,7 +53,8 @@ func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<-
 		disconnecter:   disconnecter,
 		logger:         logger.With().Str("component", "http").Logger(),
 		recorder:       recorder,
-	}
+		templates:      templates,
+	}, nil
 }
 
 // Start starts the HTTP server.
@@ -145,7 +121,11 @@ func (s *Server) handlePortal(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	fmt.Fprint(w, loginPage)
+	err = s.templates.ExecuteTemplate(w, "login.html", nil)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Failed to execute login template")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -240,6 +220,14 @@ func generateSecureToken(length int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+type statusPageData struct {
+	Username        string
+	IPAddress       string
+	MACAddress      string
+	StartTime       string
+	SessionDuration string
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	ipStr, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -258,14 +246,19 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	defer session.RUnlock()
 
 	duration := time.Since(session.StartTime).Round(time.Second)
-	statusHTML := fmt.Sprintf(statusPageTemplate,
-		session.Redir.Username,
-		session.HisIP,
-		session.HisMAC,
-		session.StartTime.Format(time.RFC1123),
-		duration,
-	)
-	fmt.Fprint(w, statusHTML)
+	data := statusPageData{
+		Username:        session.Redir.Username,
+		IPAddress:       session.HisIP.String(),
+		MACAddress:      session.HisMAC.String(),
+		StartTime:       session.StartTime.Format(time.RFC1123),
+		SessionDuration: duration.String(),
+	}
+
+	err = s.templates.ExecuteTemplate(w, "status.html", data)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Failed to execute status template")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {

@@ -59,6 +59,7 @@ uamport: 8080
 certfile: "" # /etc/coovachilli/cert.pem
 keyfile: ""  # /etc/coovachilli/key.pem
 wwwdir: ""   # Directory for custom captive portal files, e.g., "/var/www/hotspot"
+templatedir: "" # Path to the directory containing custom HTML templates (login.html, status.html), e.g. "/etc/chilli/templates"
 wwwbin: ""   # Path to CGI binary for dynamic portal pages
 uamallowed:
   - "www.google.com"
