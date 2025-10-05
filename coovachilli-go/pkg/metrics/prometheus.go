@@ -31,7 +31,7 @@ func NewPrometheusRecorder() Recorder {
 }
 
 // metricKey generates a consistent key for a metric based on its name and label keys.
-func metricKey(name string, labels Labels) string {
+func metricKey(name string, labels map[string]string) string {
 	keys := make([]string, 0, len(labels))
 	for k := range labels {
 		keys = append(keys, k)
@@ -41,32 +41,32 @@ func metricKey(name string, labels Labels) string {
 }
 
 // IncCounter increments a counter by 1.
-func (r *PrometheusRecorder) IncCounter(name string, labels Labels) {
+func (r *PrometheusRecorder) IncCounter(name string, labels map[string]string) {
 	r.getCounter(name, labels).With(prometheus.Labels(labels)).Inc()
 }
 
 // AddToCounter adds a float64 value to a counter.
-func (r *PrometheusRecorder) AddToCounter(name string, labels Labels, value float64) {
+func (r *PrometheusRecorder) AddToCounter(name string, labels map[string]string, value float64) {
 	r.getCounter(name, labels).With(prometheus.Labels(labels)).Add(value)
 }
 
 // SetGauge sets the value of a gauge.
-func (r *PrometheusRecorder) SetGauge(name string, labels Labels, value float64) {
+func (r *PrometheusRecorder) SetGauge(name string, labels map[string]string, value float64) {
 	r.getGauge(name, labels).With(prometheus.Labels(labels)).Set(value)
 }
 
 // IncGauge increments a gauge by 1.
-func (r *PrometheusRecorder) IncGauge(name string, labels Labels) {
+func (r *PrometheusRecorder) IncGauge(name string, labels map[string]string) {
 	r.getGauge(name, labels).With(prometheus.Labels(labels)).Inc()
 }
 
 // DecGauge decrements a gauge by 1.
-func (r *PrometheusRecorder) DecGauge(name string, labels Labels) {
+func (r *PrometheusRecorder) DecGauge(name string, labels map[string]string) {
 	r.getGauge(name, labels).With(prometheus.Labels(labels)).Dec()
 }
 
 // ObserveHistogram records a new observation for a histogram.
-func (r *PrometheusRecorder) ObserveHistogram(name string, labels Labels, value float64) {
+func (r *PrometheusRecorder) ObserveHistogram(name string, labels map[string]string, value float64) {
 	r.getHistogram(name, labels).With(prometheus.Labels(labels)).Observe(value)
 }
 
@@ -76,7 +76,7 @@ func (r *PrometheusRecorder) Handler() http.Handler {
 }
 
 // getCounter finds or creates a counter vector.
-func (r *PrometheusRecorder) getCounter(name string, labels Labels) *prometheus.CounterVec {
+func (r *PrometheusRecorder) getCounter(name string, labels map[string]string) *prometheus.CounterVec {
 	key := metricKey(name, labels)
 	r.mu.RLock()
 	c, ok := r.counters[key]
@@ -104,7 +104,7 @@ func (r *PrometheusRecorder) getCounter(name string, labels Labels) *prometheus.
 }
 
 // getGauge finds or creates a gauge vector.
-func (r *PrometheusRecorder) getGauge(name string, labels Labels) *prometheus.GaugeVec {
+func (r *PrometheusRecorder) getGauge(name string, labels map[string]string) *prometheus.GaugeVec {
 	key := metricKey(name, labels)
 	r.mu.RLock()
 	g, ok := r.gauges[key]
@@ -131,7 +131,7 @@ func (r *PrometheusRecorder) getGauge(name string, labels Labels) *prometheus.Ga
 }
 
 // getHistogram finds or creates a histogram vector.
-func (r *PrometheusRecorder) getHistogram(name string, labels Labels) *prometheus.HistogramVec {
+func (r *PrometheusRecorder) getHistogram(name string, labels map[string]string) *prometheus.HistogramVec {
 	key := metricKey(name, labels)
 	r.mu.RLock()
 	h, ok := r.histograms[key]

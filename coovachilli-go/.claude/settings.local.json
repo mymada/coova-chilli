@@ -12,7 +12,9 @@
       "Bash(sort:*)",
       "Bash(go tool cover:*)",
       "Bash(chmod:*)",
-      "Bash(./verify_setup.sh:*)"
+      "Bash(./verify_setup.sh:*)",
+      "Bash(sed:*)",
+      "Bash(go doc:*)"
     ],
     "deny": [],
     "ask": []

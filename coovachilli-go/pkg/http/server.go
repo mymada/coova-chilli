@@ -185,7 +185,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	s.radiusReqChan <- session
 
 	now := time.Now()
-	labels := metrics.Labels{"type": "uam"} // UAM login
+	labels := map[string]string{"type": "uam"} // UAM login
 	s.recorder.IncCounter("chilli_http_logins_total", labels)
 
 	select {
@@ -375,7 +375,7 @@ func (s *Server) handleApiLogin(w http.ResponseWriter, r *http.Request) {
 	s.radiusReqChan <- session
 
 	now := time.Now()
-	labels := metrics.Labels{"type": "api"}
+	labels := map[string]string{"type": "api"}
 	s.recorder.IncCounter("chilli_http_logins_total", labels)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -635,7 +635,7 @@ func (s *Server) handleWISPrLogin(w http.ResponseWriter, r *http.Request) {
 	s.radiusReqChan <- session
 
 	now := time.Now()
-	labels := metrics.Labels{"type": "wispr"}
+	labels := map[string]string{"type": "wispr"}
 	s.recorder.IncCounter("chilli_http_logins_total", labels)
 
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")

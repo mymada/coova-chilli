@@ -65,8 +65,13 @@ type PeerManager interface {
 }
 
 // MetricsRecorder defines the interface for recording metrics.
+// This interface is compatible with pkg/metrics.Recorder.
 type MetricsRecorder interface {
 	IncCounter(name string, labels map[string]string)
+	AddToCounter(name string, labels map[string]string, value float64)
+	SetGauge(name string, labels map[string]string, value float64)
+	IncGauge(name string, labels map[string]string)
+	DecGauge(name string, labels map[string]string)
 	ObserveHistogram(name string, labels map[string]string, value float64)
 	Handler() http.Handler
 }

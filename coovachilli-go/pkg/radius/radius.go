@@ -173,7 +173,10 @@ func (c *Client) radsecExchange(packet *radius.Packet, serverAddr string) (*radi
 
 	var response *radius.Packet
 	parseErr := c.cfg.RadiusSecret.Access(func(secret []byte) (err error) {
-		response, err = radius.Parse(buf[:n], secret)
+		// Create a copy of the secret that will persist after this closure
+		secretCopy := make([]byte, len(secret))
+		copy(secretCopy, secret)
+		response, err = radius.Parse(buf[:n], secretCopy)
 		return
 	})
 	if parseErr != nil {
@@ -233,7 +236,7 @@ func (c *Client) exchangeWithFailover(packet *radius.Packet, auth bool) (*radius
 // executeRequest performs the actual RADIUS request and is wrapped by the circuit breaker.
 func (c *Client) executeRequest(packet *radius.Packet, serverAddr string, auth bool, requestType string) (*radius.Packet, error) {
 	now := time.Now()
-	labels := metrics.Labels{
+	labels := map[string]string{
 		"server": serverAddr,
 		"type":   requestType,
 	}
@@ -279,16 +282,19 @@ func (c *Client) executeRequest(packet *radius.Packet, serverAddr string, auth b
 func (c *Client) SendAccessRequest(session *core.Session, username, password string) (*radius.Packet, error) {
 	var packet *radius.Packet
 	err := c.cfg.RadiusSecret.Access(func(secret []byte) error {
-		packet = radius.New(radius.CodeAccessRequest, secret)
+		// Create a copy of the secret that will persist after this closure
+		secretCopy := make([]byte, len(secret))
+		copy(secretCopy, secret)
+		packet = radius.New(radius.CodeAccessRequest, secretCopy)
+
+		// Add standard attributes while the secret is still valid
+		rfc2865.UserName_SetString(packet, username)
+		rfc2865.UserPassword_SetString(packet, password)
 		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to access RADIUS secret for Access-Request: %w", err)
 	}
-
-	// Add standard attributes
-	rfc2865.UserName_SetString(packet, username)
-	rfc2865.UserPassword_SetString(packet, password)
 	rfc2865.NASIdentifier_SetString(packet, c.cfg.RadiusNASID)
 	rfc2865.NASIPAddress_Set(packet, c.cfg.RadiusListen)
 
@@ -327,7 +333,10 @@ func (c *Client) SendAccountingRequest(session *core.Session, statusType rfc2866
 	}
 
 	err := secretToUse.Access(func(secret []byte) error {
-		packet = radius.New(radius.CodeAccountingRequest, secret)
+		// Create a copy of the secret that will persist after this closure
+		secretCopy := make([]byte, len(secret))
+		copy(secretCopy, secret)
+		packet = radius.New(radius.CodeAccountingRequest, secretCopy)
 		return nil
 	})
 	if err != nil {
@@ -379,7 +388,10 @@ func (c *Client) SendAccountingRequest(session *core.Session, statusType rfc2866
 func (c *Client) SendEAPAccessRequest(session *core.Session, eapPayload []byte, state []byte) (*radius.Packet, []byte, error) {
 	var packet *radius.Packet
 	err := c.cfg.RadiusSecret.Access(func(secret []byte) error {
-		packet = radius.New(radius.CodeAccessRequest, secret)
+		// Create a copy of the secret that will persist after this closure
+		secretCopy := make([]byte, len(secret))
+		copy(secretCopy, secret)
+		packet = radius.New(radius.CodeAccessRequest, secretCopy)
 		return nil
 	})
 	if err != nil {
@@ -517,7 +529,10 @@ func (c *Client) listen(network, addr string, coaReqChan chan<- core.CoAContext)
 
 		var packet *radius.Packet
 		parseErr := c.cfg.RadiusSecret.Access(func(secret []byte) (err error) {
-			packet, err = radius.Parse(buf[:n], secret)
+			// Create a copy of the secret that will persist after this closure
+			secretCopy := make([]byte, len(secret))
+			copy(secretCopy, secret)
+			packet, err = radius.Parse(buf[:n], secretCopy)
 			return
 		})
 		if parseErr != nil {

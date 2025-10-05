@@ -102,7 +102,7 @@ func BenchmarkRemoveSession(b *testing.B) {
 		session := sm.CreateSession(ip, mac, 0)
 		b.StartTimer()
 
-		sm.RemoveSession(session)
+		sm.DeleteSession(session)
 	}
 }
 

@@ -77,7 +77,7 @@ func TestHandleQuery_DomainTrimming(t *testing.T) {
 		DNS2: net.ParseIP("8.8.4.4"),
 	}
 
-	proxy := NewProxy(cfg, zerolog.Nop(), garden)
+	_ = NewProxy(cfg, zerolog.Nop(), garden)
 
 	tests := []struct {
 		name           string

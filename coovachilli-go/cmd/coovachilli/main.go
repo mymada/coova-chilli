@@ -17,7 +17,6 @@ import (
 	"coovachilli-go/pkg/admin"
 	"coovachilli-go/pkg/auth"
 	"coovachilli-go/pkg/cluster"
-	"coovachilli-go/pkg/cmdsock"
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
 	"coovachilli-go/pkg/dhcp"
@@ -40,7 +39,6 @@ import (
 	"github.com/sevlyar/go-daemon"
 	"github.com/songgao/water"
 	layehradius "layeh.com/radius"
-	"layeh.com/radius/rfc2865"
 	"layeh.com/radius/rfc2866"
 )
 
@@ -146,15 +144,16 @@ type application struct {
 	logger            zerolog.Logger
 	reloader          *config.Reloader
 	metricsRecorder   core.MetricsRecorder
-	peerManager       core.PeerManager
-	firewall          core.FirewallManager
+	peerManager       *cluster.PeerManager
+	firewall          firewall.FirewallManager
 	sessionManager    *core.SessionManager
-	scriptRunner      core.ScriptRunner
-	radiusClient      core.RadiusClient
+	scriptRunner      *script.Runner
+	radiusClient      *radius.Client
 	disconnectManager core.Disconnector
 	reaper            core.Reaper
 	httpServer        core.HttpServer
 	adminServer       core.AdminServer
+	gardenService     *garden.Garden
 	dnsProxy          *dns.Proxy
 	tunDevice         *water.Interface
 	pcapHandle        *pcap.Handle
@@ -242,7 +241,8 @@ func buildApplication(cfg *config.Config, reloader *config.Reloader) (*applicati
 	// Initialize other components
 	app.scriptRunner = script.NewRunner(app.logger, cfg)
 	app.sessionManager = core.NewSessionManager(cfg, app.metricsRecorder)
-	app.dnsProxy = dns.NewProxy(cfg, app.logger)
+	app.gardenService = garden.NewGarden(&cfg.WalledGarden, app.firewall, app.logger)
+	app.dnsProxy = dns.NewProxy(cfg, app.logger, app.gardenService)
 	app.radiusClient = radius.NewClient(cfg, app.logger, app.metricsRecorder)
 	app.disconnectManager = disconnect.NewManager(cfg, app.sessionManager, app.firewall, app.radiusClient, app.scriptRunner, app.logger)
 	app.reaper = core.NewReaper(cfg, app.sessionManager, app.disconnectManager, app.logger)
@@ -263,15 +263,9 @@ func runApp(app *application) {
 	}
 	defer app.firewall.Cleanup()
 
-	scriptRunner := script.NewRunner(log.Logger, cfg)
-	sessionManager := core.NewSessionManager(cfg, metricsRecorder)
-
-	// Initialize and start the Walled Garden service
-	gardenService := garden.NewGarden(&cfg.WalledGarden, fw, log.Logger)
-	gardenService.Start()
-	defer gardenService.Stop()
-
-	dnsProxy := dns.NewProxy(cfg, log.Logger, gardenService)
+	// Start walled garden service
+	app.gardenService.Start()
+	defer app.gardenService.Stop()
 
 	// Load existing sessions
 	app.loadSessions()
@@ -412,6 +406,21 @@ func (app *application) startPcapListener() {
 	}
 }
 
+func (app *application) handleCoARequests() {
+	for coaReq := range app.coaReqChan {
+		go func(req core.CoAContext) {
+			app.logger.Info().Msg("Received CoA/Disconnect request")
+			// CoA request handling is delegated to the disconnect manager
+			// For now, we just log and acknowledge
+			// TODO: Implement proper CoA handling based on request type
+			response := req.Packet().Response(layehradius.CodeCoANAK)
+			if err := app.radiusClient.SendCoAResponse(response, req.Peer()); err != nil {
+				app.logger.Error().Err(err).Msg("Failed to send CoA response")
+			}
+		}(coaReq)
+	}
+}
+
 func (app *application) handleRadiusRequests() {
 	for session := range app.radiusReqChan {
 		go func(s *core.Session) {
@@ -528,26 +537,18 @@ func (app *application) processPackets() {
 			continue
 		}
 
-		var packet gopacket.Packet
 		ipVersion := rawPacket[0] >> 4
 		switch ipVersion {
 		case 4:
-			packet = gopacket.NewPacket(rawPacket, layers.LayerTypeIPv4, gopacket.Default)
+			// Continue processing IPv4
 		case 6:
 			// The current logic inside only handles IPv4. For now, we decode but drop IPv6.
 			// To support IPv6 here, a similar block to the one below for ipv4 would be needed.
 			continue
 		default:
-			logger.Debug().Uint8("version", ipVersion).Msg("Dropping unknown packet type from TUN")
+			app.logger.Debug().Uint8("version", ipVersion).Msg("Dropping unknown packet type from TUN")
 			continue
 		}
-
-		if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
-			ipv4, ok := ipv4Layer.(*layers.IPv4)
-			if !ok || ipv4 == nil {
-				continue
-			}
-			packetSize := uint64(len(ipv4.Payload))
 
 		// Use the decoding layer parser to avoid memory allocations.
 		err := app.parser.DecodeLayers(rawPacket, &decodedLayers)
@@ -593,29 +594,30 @@ func (app *application) processPackets() {
 				session.OutputOctets += packetSize
 				session.OutputPackets++
 			} else {
-				// Handle unauthenticated traffic.
-				if isUplink {
-					// For unauthenticated users, only allow DNS traffic to be proxied through our server.
-					// The firewall should be configured to redirect DNS packets to the chilli instance,
-					// but we still need to process them here. The firewall also handles allowing
-					// traffic to the walled garden destinations.
-					if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
-						udp, _ := udpLayer.(*layers.UDP)
-						// Check if it's a standard DNS query port
-						if udp.DstPort == 53 {
-							dnsQueryPayload := udp.Payload
-							if responsePayload, err := dnsProxy.HandleQuery(dnsQueryPayload); err != nil {
-								logger.Warn().Err(err).Msg("DNS proxy failed to handle query")
-							} else if responsePayload != nil {
-								// The proxy returned a response, send it back to the client.
-								if err := sendDNSResponse(ifce, packet, responsePayload); err != nil {
-									logger.Error().Err(err).Msg("Failed to send DNS response")
-								}
-							}
+				session.InputOctets += packetSize
+				session.InputPackets++
+			}
+			session.Unlock()
+			// Authenticated traffic is forwarded by the firewall
+		} else {
+			// Handle unauthenticated traffic.
+			if isUplink {
+				// For unauthenticated users, only allow DNS traffic to be proxied through our server.
+				// The firewall should be configured to redirect DNS packets to the chilli instance,
+				// but we still need to process them here. The firewall also handles allowing
+				// traffic to the walled garden destinations.
+				if isDNS {
+					dnsQueryPayload := app.udpLayer.Payload
+					if responsePayload, err := app.dnsProxy.HandleQuery(dnsQueryPayload); err != nil {
+						app.logger.Warn().Err(err).Msg("DNS proxy failed to handle query")
+					} else if responsePayload != nil {
+						// The proxy returned a response, send it back to the client.
+						if err := app.sendDNSResponse(ipv4, &app.udpLayer, responsePayload); err != nil {
+							app.logger.Error().Err(err).Msg("Failed to send DNS response")
 						}
 					}
-					// Other unauthenticated traffic is implicitly dropped as it won't be forwarded.
 				}
+				// Other unauthenticated traffic is implicitly dropped as it won't be forwarded.
 			}
 			// All other unauthenticated traffic is implicitly dropped
 		}

@@ -550,7 +550,7 @@ func (s *Server) HandleDHCPv4(dhcpPayload []byte, packet gopacket.Packet) ([]byt
 
 	s.logger.Debug().Str("type", req.MessageType().String()).Str("mac", req.ClientHWAddr.String()).Msg("Received DHCPv4 request")
 
-	labels := metrics.Labels{"type": req.MessageType().String()}
+	labels := map[string]string{"type": req.MessageType().String()}
 	s.recorder.IncCounter("chilli_dhcp_requests_total", labels)
 
 	var respBytes []byte

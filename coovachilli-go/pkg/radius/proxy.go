@@ -52,8 +52,11 @@ func (s *ProxyServer) Start() {
 
 		var packet *radius.Packet
 		err = s.cfg.ProxySecret.Access(func(secret []byte) error {
+			// Create a copy of the secret that will persist after this closure
+			secretCopy := make([]byte, len(secret))
+			copy(secretCopy, secret)
 			var parseErr error
-			packet, parseErr = radius.Parse(buf[:n], secret)
+			packet, parseErr = radius.Parse(buf[:n], secretCopy)
 			return parseErr
 		})
 		if err != nil {
@@ -99,7 +102,10 @@ func (s *ProxyServer) handleProxyRequest(pc net.PacketConn, peer net.Addr, reque
 		// We create a new packet and copy all attributes.
 		var upstreamPacket *radius.Packet
 		err = s.radiusClient.cfg.RadiusSecret.Access(func(secret []byte) error {
-			upstreamPacket = radius.New(request.Code, secret)
+			// Create a copy of the secret that will persist after this closure
+			secretCopy := make([]byte, len(secret))
+			copy(secretCopy, secret)
+			upstreamPacket = radius.New(request.Code, secretCopy)
 			upstreamPacket.Attributes = request.Attributes
 			upstreamPacket.Authenticator = request.Authenticator
 			return nil
