@@ -49,6 +49,24 @@ cluster:
   interface: "eth1" # The dedicated interface for cluster communication
 ```
 
+## Content Filtering (SNI)
+
+The application supports Layer 7 content filtering for authenticated users by inspecting the Server Name Indication (SNI) in TLS `ClientHello` messages. This allows you to block access to specific HTTPS websites without needing to perform full TLS decryption.
+
+**How it works:**
+- When an authenticated user attempts to connect to an HTTPS site, the application inspects the initial TLS handshake.
+- It extracts the requested domain name (SNI) from the `ClientHello` message.
+- If the domain is found in the SNI blocklist, the packet is dropped, preventing the TLS session from being established.
+
+**Configuration:**
+To enable SNI filtering, add the following section to your `config.yaml`:
+```yaml
+l7filtering:
+  sni_filtering_enabled: true
+  sni_blocklist_path: "/path/to/your/sni_blocklist.txt"
+```
+The `sni_blocklist.txt` file should contain one domain per line.
+
 ## Getting Started
 
 ### Prerequisites

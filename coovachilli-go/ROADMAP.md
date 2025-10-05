@@ -2,6 +2,8 @@
 
 Ce document suit la progression du développement de CoovaChilli-Go.
 
+**Note sur les problèmes connus :** Pour une liste des problèmes techniques actuellement en cours d'investigation, veuillez consulter le fichier [test/KNOWN_ISSUES.md](./test/KNOWN_ISSUES.md).
+
 ## 0. Stabilisation de la base de code (Terminé)
 - [x] **Refactoring des interfaces :** Géré (utilisation d'une interface locale dans `pkg/core` pour casser la dépendance).
 - [x] **Correction des crashs (Panics) :** Terminé (tous les tests passent).
@@ -17,7 +19,7 @@ Ce document suit la progression du développement de CoovaChilli-Go.
 ## 2. Sécurité et conformité (En cours)
 - [ ] **Filtrage avancé des URL et DNS :** À faire.
 - [ ] **Export des journaux :** À faire.
-- [ ] **Filtrage de contenu et de protocoles :** À faire.
+- [x] **Filtrage de contenu et de protocoles :** Terminé (filtrage SNI pour le trafic HTTPS).
 - [ ] **Intégration antivirus/antimalware :** À faire.
 - [ ] **Surveillance d'intrusion en temps réel :** À faire.
 - [ ] **Chiffrement SSL/TLS complet :** À faire.

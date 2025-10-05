@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/gopacket/gopacket"
-	"github.com/gopacket/gopacket/layers"
-	"github.com/gopacket/gopacket/pcap"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
 	"github.com/rs/zerolog"
 	layehradius "layeh.com/radius"
 	"layeh.com/radius/rfc2865"

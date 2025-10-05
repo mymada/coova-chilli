@@ -154,6 +154,14 @@ type Config struct {
 	AdminAPI AdminAPIConfig `yaml:"admin_api"`
 	// Walled Garden settings
 	WalledGarden WalledGardenConfig `yaml:"walledgarden"`
+	// L7 Filtering settings
+	L7Filtering L7FilteringConfig `yaml:"l7filtering"`
+}
+
+// L7FilteringConfig holds the configuration for Layer 7 filtering, such as SNI-based blocking.
+type L7FilteringConfig struct {
+	SNIFilteringEnabled bool   `yaml:"sni_filtering_enabled" envconfig:"SNI_FILTERING_ENABLED"`
+	SNIBlocklistPath    string `yaml:"sni_blocklist_path" envconfig:"SNI_BLOCKLIST_PATH"`
 }
 
 // AdminAPIConfig holds the configuration for the admin API.
