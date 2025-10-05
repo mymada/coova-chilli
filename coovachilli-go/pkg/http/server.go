@@ -12,6 +12,7 @@ import (
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
 	"coovachilli-go/pkg/metrics"
+	"coovachilli-go/pkg/wispr"
 	"github.com/rs/zerolog"
 )
 
@@ -93,6 +94,10 @@ func (s *Server) Start() {
 	mux.HandleFunc("/api/v1/login", s.handleApiLogin)
 	mux.HandleFunc("/api/v1/logout", s.handleApiLogout)
 	mux.HandleFunc("/json/status", s.handleJsonpStatus)
+
+	// WISPr endpoints
+	http.HandleFunc("/wispr", s.handleWISPr)
+	http.HandleFunc("/wispr/login", s.handleWISPrLogin)
 
 	addr := fmt.Sprintf(":%d", s.cfg.UAMPort)
 
@@ -514,4 +519,128 @@ func (s *Server) handleJsonpStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/javascript")
 	fmt.Fprintf(w, "%s(%s);", callback, string(jsonBytes))
+}
+
+// --- WISPr Handlers ---
+
+func (s *Server) handleWISPr(w http.ResponseWriter, r *http.Request) {
+	ipStr, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		ipStr = r.RemoteAddr
+	}
+	ip := net.ParseIP(ipStr)
+
+	session, ok := s.sessionManager.GetSessionByIP(ip)
+
+	// Check if client supports WISPr
+	userAgent := r.Header.Get("User-Agent")
+	accept := r.Header.Get("Accept")
+	isWISPrClient := wispr.DetectWISPrClient(userAgent, accept)
+
+	if !isWISPrClient {
+		// Not a WISPr client, redirect to regular portal
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+
+	// Generate WISPr XML
+	includeSessionParams := ok && session.Authenticated
+	wsprXML, err := wispr.GenerateWISPrXML(s.cfg, session, includeSessionParams)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Failed to generate WISPr XML")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	fmt.Fprint(w, wsprXML)
+}
+
+func (s *Server) handleWISPrLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "Failed to parse form", http.StatusBadRequest)
+		return
+	}
+
+	username := r.FormValue("UserName")
+	password := r.FormValue("Password")
+
+	if username == "" || password == "" {
+		wsprXML, _ := wispr.GenerateWISPrLoginResponse(s.cfg, nil, false, "Username and password required")
+		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, wsprXML)
+		return
+	}
+
+	s.logger.Info().Str("user", username).Str("remote_addr", r.RemoteAddr).Msg("WISPr login attempt")
+
+	ipStr, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		ipStr = r.RemoteAddr
+	}
+	ip := net.ParseIP(ipStr)
+
+	session, ok := s.sessionManager.GetSessionByIP(ip)
+	if !ok {
+		wsprXML, _ := wispr.GenerateWISPrLoginResponse(s.cfg, nil, false, "Session not found")
+		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, wsprXML)
+		return
+	}
+
+	session.Lock()
+	session.Redir.Username = username
+	session.Redir.Password = password
+	session.Unlock()
+
+	s.radiusReqChan <- session
+
+	now := time.Now()
+	labels := metrics.Labels{"type": "wispr"}
+	s.recorder.IncCounter("chilli_http_logins_total", labels)
+
+	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	select {
+	case authOK := <-session.AuthResult:
+		duration := time.Since(now).Seconds()
+		s.recorder.ObserveHistogram("chilli_http_login_duration_seconds", labels, duration)
+
+		if authOK {
+			labels["status"] = "success"
+			s.recorder.IncCounter("chilli_http_login_outcomes_total", labels)
+
+			wsprXML, err := wispr.GenerateWISPrLoginResponse(s.cfg, session, true, "")
+			if err != nil {
+				s.logger.Error().Err(err).Msg("Failed to generate WISPr login response")
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
+
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, wsprXML)
+		} else {
+			labels["status"] = "failure"
+			s.recorder.IncCounter("chilli_http_login_outcomes_total", labels)
+
+			wsprXML, _ := wispr.GenerateWISPrLoginResponse(s.cfg, nil, false, "Invalid username or password")
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, wsprXML)
+		}
+	case <-time.After(10 * time.Second):
+		duration := time.Since(now).Seconds()
+		s.recorder.ObserveHistogram("chilli_http_login_duration_seconds", labels, duration)
+		labels["status"] = "timeout"
+		s.recorder.IncCounter("chilli_http_login_outcomes_total", labels)
+
+		wsprXML, _ := wispr.GenerateWISPrLoginResponse(s.cfg, nil, false, "Login request timed out")
+		w.WriteHeader(http.StatusGatewayTimeout)
+		fmt.Fprint(w, wsprXML)
+	}
 }

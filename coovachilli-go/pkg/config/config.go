@@ -56,10 +56,10 @@ type Config struct {
 	DHCPStartV6    net.IP `yaml:"dhcpstart_v6"`
 	DHCPEndV6      net.IP `yaml:"dhcpend_v6"`
 	Lease          time.Duration `yaml:"lease"`
-	DNS1           net.IP `yaml:"dns1"`
-	DNS2           net.IP `yaml:"dns2"`
-	DNS1V6         net.IP `yaml:"dns1_v6"`
-	DNS2V6         net.IP `yaml:"dns2_v6"`
+	DNS1           net.IP   `yaml:"dns1"`
+	DNS2           net.IP   `yaml:"dns2"`
+	DNS1V6         net.IP   `yaml:"dns1_v6"`
+	DNS2V6         net.IP   `yaml:"dns2_v6"`
 
 	// RADIUS settings
 	RadiusListen       net.IP `yaml:"radiuslisten"`
@@ -97,6 +97,8 @@ type Config struct {
 	LocalUsersFile      string   `yaml:"localusersfile"`
 	CertFile            string   `yaml:"certfile"`
 	KeyFile             string   `yaml:"keyfile"`
+	WWWDir              string   `yaml:"wwwdir"`
+	WWWBin              string   `yaml:"wwwbin"`
 	UAMAllowed          []string `yaml:"uamallowed"`
 	UAMAllowedV6        []string `yaml:"uamallowed_v6"`
 	UAMDomains          []string `yaml:"uamdomains"`
@@ -137,9 +139,12 @@ type Config struct {
 	// Scripts
 	ConUp   string `yaml:"conup"`
 	ConDown string `yaml:"condown"`
+	IPUp    string `yaml:"ipup"`
+	IPDown  string `yaml:"ipdown"`
 
 	// Management
 	StateFile   string `yaml:"statefile"`
+	CmdSocket   string `yaml:"cmdsocket"`
 
 	// Cluster settings
 	Cluster ClusterConfig `yaml:"cluster"`

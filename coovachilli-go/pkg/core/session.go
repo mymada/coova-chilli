@@ -111,6 +111,12 @@ const (
 	MaxSessions = 10000
 )
 
+// SessionHooks defines callbacks for session lifecycle events
+type SessionHooks struct {
+	OnIPUp   func(*Session)
+	OnIPDown func(*Session)
+}
+
 // SessionManager manages all active sessions.
 type SessionManager struct {
 	sync.RWMutex
@@ -121,6 +127,7 @@ type SessionManager struct {
 	recorder        metrics.Recorder
 	cfg             *config.Config
 	sessionCount    int // Track total sessions
+	hooks           SessionHooks
 }
 
 // NewSessionManager creates a new SessionManager.
@@ -136,6 +143,13 @@ func NewSessionManager(cfg *config.Config, recorder metrics.Recorder) *SessionMa
 		recorder:        recorder,
 		cfg:             cfg,
 	}
+}
+
+// SetHooks sets the session lifecycle hooks
+func (sm *SessionManager) SetHooks(hooks SessionHooks) {
+	sm.Lock()
+	defer sm.Unlock()
+	sm.hooks = hooks
 }
 
 // StateData is the container for serializing persistent state.
@@ -185,6 +199,11 @@ func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID 
 
 	sm.sessionCount++
 	sm.recorder.IncGauge("chilli_sessions_active_total", nil)
+
+	// Call ipup hook if configured
+	if sm.hooks.OnIPUp != nil {
+		go sm.hooks.OnIPUp(session)
+	}
 
 	return session
 }
@@ -259,6 +278,15 @@ func (sm *SessionManager) AssociateToken(session *Session) {
 func (sm *SessionManager) DeleteSession(session *Session) {
 	if session == nil {
 		return
+	}
+
+	// Call ipdown hook before deleting session
+	sm.RLock()
+	ipdownHook := sm.hooks.OnIPDown
+	sm.RUnlock()
+
+	if ipdownHook != nil {
+		ipdownHook(session)
 	}
 
 	sm.Lock()

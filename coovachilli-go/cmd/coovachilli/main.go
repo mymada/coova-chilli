@@ -17,6 +17,7 @@ import (
 	"coovachilli-go/pkg/admin"
 	"coovachilli-go/pkg/auth"
 	"coovachilli-go/pkg/cluster"
+	"coovachilli-go/pkg/cmdsock"
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
 	"coovachilli-go/pkg/dhcp"
