@@ -11,9 +11,9 @@ import (
 	"coovachilli-go/pkg/core"
 	"coovachilli-go/pkg/eapol"
 	"coovachilli-go/pkg/metrics"
-	"github.com/gopacket/gopacket"
-	"github.com/gopacket/gopacket/layers"
-	"github.com/gopacket/gopacket/pcap"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv6"
 	"github.com/insomniacslk/dhcp/iana"
@@ -253,18 +253,11 @@ func (s *Server) sendDHCPv6Response(respBytes []byte, reqPacket gopacket.Packet)
 }
 
 func (s *Server) relayDHCPv4(packet gopacket.Packet) error {
-	var dhcpPayload []byte
-	if dhcpLayer := packet.Layer(layers.LayerTypeDHCPv4); dhcpLayer != nil {
-		dhcpPayload = dhcpLayer.LayerContents()
-	} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
-		// Fallback for test packets where gopacket might not decode the DHCP layer
-		udp, _ := udpLayer.(*layers.UDP)
-		dhcpPayload = udp.Payload
+	dhcpLayer := packet.Layer(layers.LayerTypeDHCPv4)
+	if dhcpLayer == nil {
+		return fmt.Errorf("cannot relay packet without a DHCPv4 layer")
 	}
-
-	if len(dhcpPayload) == 0 {
-		return fmt.Errorf("cannot relay packet without DHCPv4 layer or payload")
-	}
+	dhcpPayload := dhcpLayer.LayerContents()
 
 	dhcpPacket, err := dhcpv4.FromBytes(dhcpPayload)
 	if err != nil {
