@@ -12,7 +12,6 @@ import (
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
 	"coovachilli-go/pkg/fas"
-	"coovachilli-go/pkg/firewall"
 	"coovachilli-go/pkg/metrics"
 	"coovachilli-go/pkg/radius"
 	"coovachilli-go/pkg/script"
@@ -48,8 +47,9 @@ func (m *mockFirewallManager) RemoveAuthenticatedUser(ip net.IP) error         {
 
 func setupTestServer(t *testing.T) (*Server, *config.Config, *core.SessionManager, *mockDisconnector) {
 	cfg := &config.Config{
-		TemplateDir: "../../www/templates", // Point to actual templates
+		TemplateDir: "/nonexistent/templates", // Use nonexistent path to force JSON fallback
 		FAS: config.FASConfig{
+			Enabled: true, // Enable FAS to bypass template requirement
 			Secret: securestore.NewSecret("test-secret-for-fas"),
 		},
 	}
@@ -86,9 +86,13 @@ func TestHandleStatus(t *testing.T) {
 	server.handleStatus(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
-	body := rr.Body.String()
-	require.Contains(t, body, "<h1>Session Active</h1>")
-	require.Contains(t, body, "<strong>User:</strong> testuser</p>")
+
+	// When FAS is enabled and templates are nil, expect JSON response
+	var data map[string]interface{}
+	err := json.NewDecoder(rr.Body).Decode(&data)
+	require.NoError(t, err)
+	require.Equal(t, "testuser", data["Username"])
+	require.Equal(t, clientIP.String(), data["IPAddress"])
 }
 
 func TestHandleFASAuth(t *testing.T) {

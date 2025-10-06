@@ -153,6 +153,8 @@ type Config struct {
 	Metrics MetricsConfig `yaml:"metrics"`
 	// Admin API settings
 	AdminAPI AdminAPIConfig `yaml:"admin_api"`
+	// Management settings
+	Management ManagementConfig `yaml:"management"`
 	// LDAP settings
 	LDAP LDAPConfig `yaml:"ldap"`
 	// Walled Garden settings
@@ -175,6 +177,16 @@ type Config struct {
 	VLAN VLANConfig `yaml:"vlan"`
 	// GDPR settings
 	GDPR GDPRConfig `yaml:"gdpr"`
+	// SSO settings
+	SSO SSOConfig `yaml:"sso"`
+	// QR Code authentication settings
+	QRCode QRCodeAuthConfig `yaml:"qrcode"`
+	// SMS authentication settings
+	SMS SMSAuthConfig `yaml:"sms"`
+	// Guest code settings
+	Guest GuestCodeConfig `yaml:"guest"`
+	// Role management settings
+	Roles RoleManagementConfig `yaml:"roles"`
 }
 
 // L7FilteringConfig holds the configuration for Layer 7 filtering, such as SNI-based blocking.
@@ -341,6 +353,98 @@ type ClusterConfig struct {
 	PeerID    int    `yaml:"peerid" envconfig:"PEERID"`
 	PeerKey   string `yaml:"peerkey" envconfig:"PEERKEY"`
 	Interface string `yaml:"interface" envconfig:"INTERFACE"`
+}
+
+// SSOConfig holds SSO configuration
+type SSOConfig struct {
+	Enabled bool       `yaml:"enabled" envconfig:"SSO_ENABLED"`
+	SAML    SAMLConfig `yaml:"saml"`
+	OIDC    OIDCConfig `yaml:"oidc"`
+}
+
+// SAMLConfig holds SAML 2.0 configuration
+type SAMLConfig struct {
+	Enabled                 bool          `yaml:"enabled" envconfig:"SAML_ENABLED"`
+	IDPEntityID             string        `yaml:"idp_entity_id" envconfig:"SAML_IDP_ENTITY_ID"`
+	IDPSSOURL               string        `yaml:"idp_sso_url" envconfig:"SAML_IDP_SSO_URL"`
+	IDPCertificate          string        `yaml:"idp_certificate" envconfig:"SAML_IDP_CERTIFICATE"`
+	IDPCertificateRaw       string        `yaml:"idp_certificate_raw" envconfig:"SAML_IDP_CERT_RAW"`
+	SPEntityID              string        `yaml:"sp_entity_id" envconfig:"SAML_SP_ENTITY_ID"`
+	SPAssertionConsumerURL  string        `yaml:"sp_assertion_consumer_url" envconfig:"SAML_SP_ACS_URL"`
+	SPPrivateKey            string        `yaml:"sp_private_key" envconfig:"SAML_SP_PRIVATE_KEY"`
+	SPCertificate           string        `yaml:"sp_certificate" envconfig:"SAML_SP_CERTIFICATE"`
+	NameIDFormat            string        `yaml:"name_id_format" envconfig:"SAML_NAME_ID_FORMAT"`
+	SignRequests            bool          `yaml:"sign_requests" envconfig:"SAML_SIGN_REQUESTS"`
+	RequireSignedResponse   bool          `yaml:"require_signed_response" envconfig:"SAML_REQUIRE_SIGNED_RESPONSE"`
+	MaxClockSkew            time.Duration `yaml:"max_clock_skew" envconfig:"SAML_MAX_CLOCK_SKEW"`
+	UsernameAttribute       string        `yaml:"username_attribute" envconfig:"SAML_USERNAME_ATTR"`
+	EmailAttribute          string        `yaml:"email_attribute" envconfig:"SAML_EMAIL_ATTR"`
+	GroupsAttribute         string        `yaml:"groups_attribute" envconfig:"SAML_GROUPS_ATTR"`
+}
+
+// OIDCConfig holds OpenID Connect configuration
+type OIDCConfig struct {
+	Enabled          bool          `yaml:"enabled" envconfig:"OIDC_ENABLED"`
+	ProviderURL      string        `yaml:"provider_url" envconfig:"OIDC_PROVIDER_URL"`
+	ClientID         string        `yaml:"client_id" envconfig:"OIDC_CLIENT_ID"`
+	ClientSecret     string        `yaml:"client_secret" envconfig:"OIDC_CLIENT_SECRET"`
+	RedirectURL      string        `yaml:"redirect_url" envconfig:"OIDC_REDIRECT_URL"`
+	Scopes           []string      `yaml:"scopes" envconfig:"OIDC_SCOPES"`
+	UsernameClai     string        `yaml:"username_claim" envconfig:"OIDC_USERNAME_CLAIM"`
+	EmailClaim       string        `yaml:"email_claim" envconfig:"OIDC_EMAIL_CLAIM"`
+	GroupsClaim      string        `yaml:"groups_claim" envconfig:"OIDC_GROUPS_CLAIM"`
+	VerifyIssuer     bool          `yaml:"verify_issuer" envconfig:"OIDC_VERIFY_ISSUER"`
+	MaxClockSkew     time.Duration `yaml:"max_clock_skew" envconfig:"OIDC_MAX_CLOCK_SKEW"`
+	InsecureSkipTLS  bool          `yaml:"insecure_skip_tls" envconfig:"OIDC_INSECURE_SKIP_TLS"`
+}
+
+// QRCodeAuthConfig holds QR code authentication configuration
+type QRCodeAuthConfig struct {
+	Enabled         bool          `yaml:"enabled" envconfig:"QRCODE_ENABLED"`
+	TokenExpiry     time.Duration `yaml:"token_expiry" envconfig:"QRCODE_TOKEN_EXPIRY"`
+	CleanupInterval time.Duration `yaml:"cleanup_interval" envconfig:"QRCODE_CLEANUP_INTERVAL"`
+	QRSize          int           `yaml:"qr_size" envconfig:"QRCODE_SIZE"`
+	BaseURL         string        `yaml:"base_url" envconfig:"QRCODE_BASE_URL"`
+}
+
+// SMSAuthConfig holds SMS authentication configuration
+type SMSAuthConfig struct {
+	Enabled         bool          `yaml:"enabled" envconfig:"SMS_ENABLED"`
+	Provider        string        `yaml:"provider" envconfig:"SMS_PROVIDER"`
+	CodeLength      int           `yaml:"code_length" envconfig:"SMS_CODE_LENGTH"`
+	CodeExpiry      time.Duration `yaml:"code_expiry" envconfig:"SMS_CODE_EXPIRY"`
+	MaxAttempts     int           `yaml:"max_attempts" envconfig:"SMS_MAX_ATTEMPTS"`
+	RateLimitWindow time.Duration `yaml:"rate_limit_window" envconfig:"SMS_RATE_LIMIT_WINDOW"`
+	MaxPerWindow    int           `yaml:"max_per_window" envconfig:"SMS_MAX_PER_WINDOW"`
+
+	// Twilio
+	TwilioAccountSID string `yaml:"twilio_account_sid" envconfig:"TWILIO_ACCOUNT_SID"`
+	TwilioAuthToken  string `yaml:"twilio_auth_token" envconfig:"TWILIO_AUTH_TOKEN"`
+	TwilioFromNumber string `yaml:"twilio_from_number" envconfig:"TWILIO_FROM_NUMBER"`
+
+	// Nexmo/Vonage
+	NexmoAPIKey    string `yaml:"nexmo_api_key" envconfig:"NEXMO_API_KEY"`
+	NexmoAPISecret string `yaml:"nexmo_api_secret" envconfig:"NEXMO_API_SECRET"`
+	NexmoFromName  string `yaml:"nexmo_from_name" envconfig:"NEXMO_FROM_NAME"`
+}
+
+// GuestCodeConfig holds guest code configuration
+type GuestCodeConfig struct {
+	Enabled          bool          `yaml:"enabled" envconfig:"GUEST_ENABLED"`
+	CodeLength       int           `yaml:"code_length" envconfig:"GUEST_CODE_LENGTH"`
+	CodePrefix       string        `yaml:"code_prefix" envconfig:"GUEST_CODE_PREFIX"`
+	DefaultDuration  time.Duration `yaml:"default_duration" envconfig:"GUEST_DEFAULT_DURATION"`
+	MaxConcurrent    int           `yaml:"max_concurrent" envconfig:"GUEST_MAX_CONCURRENT"`
+	CleanupInterval  time.Duration `yaml:"cleanup_interval" envconfig:"GUEST_CLEANUP_INTERVAL"`
+	RequireApproval  bool          `yaml:"require_approval" envconfig:"GUEST_REQUIRE_APPROVAL"`
+	AllowSelfService bool          `yaml:"allow_self_service" envconfig:"GUEST_ALLOW_SELF_SERVICE"`
+}
+
+// RoleManagementConfig holds role management configuration
+type RoleManagementConfig struct {
+	Enabled     bool   `yaml:"enabled" envconfig:"ROLES_ENABLED"`
+	RolesDir    string `yaml:"roles_dir" envconfig:"ROLES_DIR"`
+	DefaultRole string `yaml:"default_role" envconfig:"DEFAULT_ROLE"`
 }
 
 // Load loads the configuration from a YAML file, and then overrides with environment variables.

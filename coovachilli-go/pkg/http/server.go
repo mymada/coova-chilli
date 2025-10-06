@@ -330,6 +330,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		SessionDuration: duration.String(),
 	}
 
+	// If templates are not loaded (e.g., FAS mode), return JSON response
+	if s.templates == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(data)
+		return
+	}
+
 	err = s.templates.ExecuteTemplate(w, "status.html", data)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("Failed to execute status template")

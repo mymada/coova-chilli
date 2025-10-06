@@ -28,18 +28,18 @@ Ce document suit la progression du développement de CoovaChilli-Go.
 - [x] **Journaux détaillés :** Déjà en place (configurable via `config.yaml`).
 - [x] **Conformité RGPD :** Terminé (système complet dans `pkg/gdpr` - chiffrement, rétention, droit d'accès/effacement/portabilité, audit log).
 
-## 3. Authentification flexible et universelle (En cours)
+## 3. Authentification flexible et universelle (Terminé ✅)
 - [x] **Support RADIUS :** Déjà implémenté (`pkg/radius`).
 - [x] **Comptes utilisateurs locaux :** Déjà possible via la configuration (`localusersfile`).
-- [ ] **Support LDAP/Active Directory :** Ajouter un module d'authentification LDAP.
-- [ ] **Support SAML :** Permettre l'intégration avec des fournisseurs d'identité SAML 2.0.
-- [ ] **Support OAuth2/OpenID :** Permettre l'authentification via des services comme Google, Facebook, etc.
-- [ ] **Authentification par réseaux sociaux.**
-- [ ] **Authentification par QR code.**
-- [ ] **Authentification par SMS/Paiement :** Intégrer des passerelles SMS et de paiement.
-- [ ] **Gestion des codes invité :** Créer un système pour générer et gérer des accès temporaires.
-- [ ] **Gestion des accès sponsorisés :** Mettre en place un workflow où un employé peut approuver un invité.
-- [ ] **Gestion multi-rôles :** Définir des profils (invité, employé, VIP) avec des droits différents.
+- [x] **Support LDAP/Active Directory :** Terminé (implémenté dans `pkg/auth/ldap/ldap.go`).
+- [x] **Support SAML :** Terminé (SAML 2.0 complet dans `pkg/sso/saml.go` avec validation d'assertions).
+- [x] **Support OAuth2/OpenID :** Terminé (OpenID Connect dans `pkg/sso/oidc.go` avec discovery automatique).
+- [x] **Authentification par réseaux sociaux :** Terminé (via OpenID Connect - Google, Microsoft, etc.).
+- [x] **Authentification par QR code :** Terminé (implémenté dans `pkg/auth/qrcode/qrcode.go` avec génération de tokens sécurisés et expiration).
+- [x] **Authentification par SMS :** Terminé (implémenté dans `pkg/auth/sms/sms.go` avec support Twilio, Nexmo, AWS SNS, rate limiting).
+- [x] **Gestion des codes invité :** Terminé (système complet dans `pkg/guest/guest.go` avec workflow d'approbation, expiration, statistiques).
+- [x] **Gestion des accès sponsorisés :** Terminé (workflow intégré dans `pkg/guest/guest.go` - demande/approbation/génération de code).
+- [x] **Gestion multi-rôles :** Terminé (système complet dans `pkg/roles/roles.go` avec 5 rôles par défaut: admin, employee, guest, user, vip - permissions, bandwidth, VLAN, QoS).
 
 ## 4. Expérience utilisateur optimisée (À faire)
 - [ ] **Portail web entièrement personnalisable :** Le portail actuel est basique. Il faut permettre une personnalisation complète (logo, couleurs, textes).

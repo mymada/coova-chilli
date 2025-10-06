@@ -4,13 +4,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/gorilla/mux"
 )
 
+// AuthManager interface to avoid circular dependency
+type AuthManager interface {
+	CreateSSOSession(username, email string, method string, groups []string, attributes map[string]interface{}) (sessionToken string, expiresAt time.Time, err error)
+}
+
 // SSOHandlers provides HTTP handlers for SSO endpoints
 type SSOHandlers struct {
-	manager *SSOManager
+	manager     *SSOManager
+	authManager AuthManager // Integration with unified auth
 }
 
 // NewSSOHandlers creates new SSO handlers
@@ -18,6 +25,11 @@ func NewSSOHandlers(manager *SSOManager) *SSOHandlers {
 	return &SSOHandlers{
 		manager: manager,
 	}
+}
+
+// SetAuthManager sets the auth manager for session creation
+func (h *SSOHandlers) SetAuthManager(am AuthManager) {
+	h.authManager = am
 }
 
 // RegisterRoutes registers SSO routes with the router
@@ -95,7 +107,44 @@ func (h *SSOHandlers) handleSAMLCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Return user info as JSON (in production, this should create a session)
+	// ✅ NEW: Create unified session via AuthManager
+	if h.authManager != nil {
+		sessionToken, expiresAt, err := h.authManager.CreateSSOSession(
+			user.Username,
+			user.Email,
+			"saml",
+			user.Groups,
+			user.Attributes,
+		)
+
+		if err != nil {
+			h.manager.logger.Error().Err(err).Msg("Failed to create SSO session")
+			http.Error(w, "Failed to create session", http.StatusInternalServerError)
+			return
+		}
+
+		// Set secure cookie
+		http.SetCookie(w, &http.Cookie{
+			Name:     "coova_session",
+			Value:    sessionToken,
+			Expires:  expiresAt,
+			HttpOnly: true,
+			Secure:   true, // ✅ HTTPS only
+			SameSite: http.SameSiteStrictMode, // ✅ CSRF protection
+			Path:     "/",
+		})
+
+		h.manager.logger.Info().
+			Str("username", user.Username).
+			Str("method", "saml").
+			Msg("SSO session created successfully")
+
+		// Redirect to status page
+		http.Redirect(w, r, "/status", http.StatusFound)
+		return
+	}
+
+	// Fallback: Return JSON (legacy behavior)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":  true,

@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Session Status</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 500px;
+            width: 100%;
+            padding: 40px;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .header h1 {
+            color: #27ae60;
+            font-size: 28px;
+            font-weight: 700;
+            margin-bottom: 10px;
+        }
+        .status-icon {
+            font-size: 64px;
+            margin-bottom: 15px;
+        }
+        .info-grid {
+            display: grid;
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+        .info-item {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .info-label {
+            color: #666;
+            font-weight: 500;
+        }
+        .info-value {
+            color: #333;
+            font-weight: 600;
+        }
+        .btn {
+            width: 100%;
+            padding: 14px;
+            background: #e74c3c;
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .btn:hover {
+            background: #c0392b;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(231, 76, 60, 0.4);
+        }
+        .stats {
+            margin-top: 20px;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%);
+            border-radius: 10px;
+        }
+        .stats h3 {
+            color: #333;
+            margin-bottom: 15px;
+            font-size: 18px;
+        }
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        .stat-row:last-child {
+            border-bottom: none;
+        }
+        .stat-label {
+            color: #666;
+        }
+        .stat-value {
+            color: #333;
+            font-weight: 600;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="status-icon">✅</div>
+            <h1>Session Active</h1>
+            <p style="color: #666;">You are connected to the internet</p>
+        </div>
+
+        <div class="info-grid">
+            <div class="info-item">
+                <span class="info-label">User:</span>
+                <span class="info-value">{{.Username}}</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">IP Address:</span>
+                <span class="info-value">{{.IPAddress}}</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">MAC Address:</span>
+                <span class="info-value">{{.MACAddress}}</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Connected Since:</span>
+                <span class="info-value">{{.StartTime}}</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Session Duration:</span>
+                <span class="info-value">{{.SessionDuration}}</span>
+            </div>
+        </div>
+
+        <form method="POST" action="/logout">
+            <button type="submit" class="btn">Disconnect</button>
+        </form>
+
+        <div class="stats">
+            <h3>📊 Session Statistics</h3>
+            <div class="stat-row">
+                <span class="stat-label">Status:</span>
+                <span class="stat-value" style="color: #27ae60;">Connected</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Connection Type:</span>
+                <span class="stat-value">WiFi</span>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

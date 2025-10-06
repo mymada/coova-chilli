@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"coovachilli-go/pkg/admin"
 	"coovachilli-go/pkg/auth"
@@ -27,11 +28,15 @@ import (
 	"coovachilli-go/pkg/eapol"
 	"coovachilli-go/pkg/firewall"
 	"coovachilli-go/pkg/garden"
+	"coovachilli-go/pkg/gdpr"
 	"coovachilli-go/pkg/http"
 	"coovachilli-go/pkg/metrics"
 	"coovachilli-go/pkg/radius"
 	"coovachilli-go/pkg/script"
+	"coovachilli-go/pkg/security"
+	"coovachilli-go/pkg/sso"
 	"coovachilli-go/pkg/tun"
+	"coovachilli-go/pkg/vlan"
 
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
@@ -168,6 +173,18 @@ type application struct {
 	tcpLayer          layers.TCP
 	dnsLayer          layers.DNS
 
+	// Security modules
+	antiMalware       *security.AntiMalware
+	ids               *security.IDS
+	vlanManager       *vlan.VLANManager
+	gdprManager       *gdpr.GDPRManager
+	ssoManager        *sso.SSOManager
+
+	// Admin modules
+	dashboard         *admin.Dashboard
+	multiSiteManager  *admin.MultiSiteManager
+	policyManager     *admin.PolicyManager
+
 	// Channels
 	radiusReqChan chan *core.Session
 	coaReqChan    chan core.CoAContext
@@ -295,8 +312,82 @@ func buildApplication(cfg *config.Config, reloader *config.Reloader) (*applicati
 	app.radiusClient = radius.NewClient(cfg, app.logger, app.metricsRecorder)
 	app.disconnectManager = disconnect.NewManager(cfg, app.sessionManager, app.firewall, app.radiusClient, app.scriptRunner, app.logger)
 	app.reaper = core.NewReaper(cfg, app.sessionManager, app.disconnectManager, app.logger)
-	app.httpServer = http.NewServer(cfg, app.sessionManager, app.radiusReqChan, app.disconnectManager, app.logger, app.metricsRecorder)
+
+	app.httpServer, err = http.NewServer(cfg, app.sessionManager, app.radiusReqChan, app.disconnectManager, app.logger, app.metricsRecorder, app.firewall, app.scriptRunner, app.radiusClient)
+	if err != nil {
+		return nil, fmt.Errorf("error creating HTTP server: %w", err)
+	}
 	app.adminServer = admin.NewServer(cfg, app.sessionManager, app.disconnectManager, app.logger)
+
+	// Initialize security modules
+	if cfg.AntiMalware.Enabled {
+		app.antiMalware, err = security.NewAntiMalware(&cfg.AntiMalware, app.logger)
+		if err != nil {
+			app.logger.Warn().Err(err).Msg("Failed to initialize AntiMalware, continuing without it")
+		} else {
+			app.logger.Info().Msg("AntiMalware initialized")
+		}
+	}
+
+	if cfg.IDS.Enabled {
+		app.ids, err = security.NewIDS(&cfg.IDS, app.logger)
+		if err != nil {
+			app.logger.Warn().Err(err).Msg("Failed to initialize IDS, continuing without it")
+		} else {
+			app.logger.Info().Msg("IDS initialized")
+		}
+	}
+
+	// Initialize VLAN manager
+	if cfg.VLAN.Enabled {
+		app.vlanManager, err = vlan.NewVLANManager(&cfg.VLAN, app.logger)
+		if err != nil {
+			app.logger.Warn().Err(err).Msg("Failed to initialize VLAN manager, continuing without it")
+		} else {
+			app.logger.Info().Msg("VLAN manager initialized")
+		}
+	}
+
+	// Initialize GDPR compliance
+	if cfg.GDPR.Enabled {
+		app.gdprManager, err = gdpr.NewGDPRManager(&cfg.GDPR, app.logger)
+		if err != nil {
+			app.logger.Warn().Err(err).Msg("Failed to initialize GDPR manager, continuing without it")
+		} else {
+			app.logger.Info().Msg("GDPR manager initialized")
+		}
+	}
+
+	// Initialize SSO manager
+	if cfg.SSO.Enabled {
+		ssoConfig := sso.SSOConfig{
+			Enabled: cfg.SSO.Enabled,
+			SAML:    convertToSSOSAMLConfig(&cfg.SSO.SAML),
+			OIDC:    convertToSSOOIDCConfig(&cfg.SSO.OIDC),
+		}
+		app.ssoManager, err = sso.NewSSOManager(&ssoConfig, app.logger)
+		if err != nil {
+			app.logger.Warn().Err(err).Msg("Failed to initialize SSO manager, continuing without it")
+		} else {
+			app.logger.Info().Msg("SSO manager initialized")
+		}
+	}
+
+	// Initialize admin modules
+	app.dashboard = admin.NewDashboard(app.sessionManager)
+	app.logger.Info().Msg("Dashboard initialized")
+
+	if cfg.AdminAPI.Enabled {
+		app.multiSiteManager = admin.NewMultiSiteManager(app.logger, true)
+		app.logger.Info().Msg("Multi-site manager initialized")
+
+		app.policyManager, err = admin.NewPolicyManager("./policies", app.logger)
+		if err != nil {
+			app.logger.Warn().Err(err).Msg("Failed to initialize Policy manager, continuing without it")
+		} else {
+			app.logger.Info().Msg("Policy manager initialized")
+		}
+	}
 
 	// Register reconfigurable components
 	reloader.Register(app.firewall)
@@ -376,6 +467,22 @@ func (app *application) startServices() {
 	// Start admin API server
 	go app.adminServer.Start()
 
+	// Start dashboard collection
+	if app.dashboard != nil {
+		app.dashboard.Start(30 * time.Second)
+		app.logger.Info().Msg("Dashboard collection started")
+	}
+
+	// Multi-site manager is available but sync is manual
+	if app.multiSiteManager != nil {
+		app.logger.Info().Msg("Multi-site manager ready")
+	}
+
+	// IDS monitoring is passive (no active Start method)
+	if app.ids != nil {
+		app.logger.Info().Msg("IDS monitoring ready")
+	}
+
 	// Start RADIUS listeners (CoA, Proxy)
 	go app.radiusClient.StartCoAListener(app.coaReqChan)
 	if app.cfg.ProxyEnable {
@@ -391,6 +498,22 @@ func (app *application) startServices() {
 }
 
 func (app *application) shutdown() {
+	// Stop admin services
+	if app.dashboard != nil {
+		app.dashboard.Stop()
+		app.logger.Info().Msg("Dashboard stopped")
+	}
+
+	// Multi-site manager cleanup (no explicit Stop method needed)
+	if app.multiSiteManager != nil {
+		app.logger.Info().Msg("Multi-site manager cleanup")
+	}
+
+	// IDS cleanup (no explicit Stop method needed)
+	if app.ids != nil {
+		app.logger.Info().Msg("IDS cleanup")
+	}
+
 	// Close channels to signal goroutines to stop
 	close(app.radiusReqChan)
 	close(app.coaReqChan)
@@ -772,4 +895,50 @@ func (app *application) sendDNSResponse(reqIPv4 *layers.IPv4, reqUDP *layers.UDP
 	}
 
 	return nil
+}
+
+// convertToSSOSAMLConfig converts config.SAMLConfig to sso.SAMLConfig
+func convertToSSOSAMLConfig(cfg *config.SAMLConfig) *sso.SAMLConfig {
+	if cfg == nil {
+		return nil
+	}
+	return &sso.SAMLConfig{
+		Enabled:                 cfg.Enabled,
+		IDPEntityID:             cfg.IDPEntityID,
+		IDPSSOURL:               cfg.IDPSSOURL,
+		IDPCertificate:          cfg.IDPCertificate,
+		IDPCertificateRaw:       cfg.IDPCertificateRaw,
+		SPEntityID:              cfg.SPEntityID,
+		SPAssertionConsumerURL:  cfg.SPAssertionConsumerURL,
+		SPPrivateKey:            cfg.SPPrivateKey,
+		SPCertificate:           cfg.SPCertificate,
+		NameIDFormat:            cfg.NameIDFormat,
+		SignRequests:            cfg.SignRequests,
+		RequireSignedResponse:   cfg.RequireSignedResponse,
+		MaxClockSkew:            cfg.MaxClockSkew,
+		UsernameAttribute:       cfg.UsernameAttribute,
+		EmailAttribute:          cfg.EmailAttribute,
+		GroupsAttribute:         cfg.GroupsAttribute,
+	}
+}
+
+// convertToSSOOIDCConfig converts config.OIDCConfig to sso.OIDCConfig
+func convertToSSOOIDCConfig(cfg *config.OIDCConfig) *sso.OIDCConfig {
+	if cfg == nil {
+		return nil
+	}
+	return &sso.OIDCConfig{
+		Enabled:          cfg.Enabled,
+		ProviderURL:      cfg.ProviderURL,
+		ClientID:         cfg.ClientID,
+		ClientSecret:     cfg.ClientSecret,
+		RedirectURL:      cfg.RedirectURL,
+		Scopes:           cfg.Scopes,
+		UsernameClai:     cfg.UsernameClai,
+		EmailClaim:       cfg.EmailClaim,
+		GroupsClaim:      cfg.GroupsClaim,
+		VerifyIssuer:     cfg.VerifyIssuer,
+		MaxClockSkew:     cfg.MaxClockSkew,
+		InsecureSkipTLS:  cfg.InsecureSkipTLS,
+	}
 }

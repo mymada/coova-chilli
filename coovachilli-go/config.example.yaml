@@ -1,0 +1,224 @@
+# CoovaChilli-Go Configuration Example
+# Complete configuration with all features enabled
+
+# General Settings
+foreground: true
+pidfile: /var/run/coovachilli.pid
+statefile: /var/lib/coovachilli/sessions.json
+user: chilli
+group: chilli
+
+# Logging
+logging:
+  dest: stdout
+  level: info
+  syslog_tag: coovachilli
+
+# Network Configuration
+net: 10.1.0.0/24
+dhcpif: eth1
+dhcplisten: 10.1.0.1
+dhcpstart: 10.1.0.10
+dhcpend: 10.1.0.254
+lease: 600s
+dns1: 8.8.8.8
+dns2: 8.8.4.4
+
+# UAM Portal Configuration
+uamlisten: 10.1.0.1
+uamport: 3990
+wwwdir: /var/www/coovachilli
+templatedir: ./www/templates
+uamsecret: ChangeThisSecret
+uamurl: https://portal.example.com
+
+# RADIUS Configuration
+radiusserver1: 127.0.0.1
+radiusserver2: 127.0.0.1
+radiusauthport: 1812
+radiusacctport: 1813
+radiussecret: testing123
+radiusnasid: nas01
+radiustimeout: 5s
+coaport: 3799
+
+# Firewall Configuration
+firewallbackend: iptables
+extif: eth0
+clientisolation: true
+
+# Metrics & Monitoring
+metrics:
+  enabled: true
+  backend: prometheus
+  listen: :9090
+
+# Admin API
+admin_api:
+  enabled: true
+  listen: :8080
+  auth_token: your-secure-admin-token-here
+
+# Management (Remote)
+management:
+  enabled: false
+  server_url: https://management.example.com
+  instance_id: site-001
+  auth_token: your-management-token
+  sync_interval: 5m
+
+# SSO Configuration
+sso:
+  enabled: true
+
+  # SAML 2.0
+  saml:
+    enabled: true
+    idp_entity_id: https://idp.example.com/saml
+    idp_sso_url: https://idp.example.com/sso
+    idp_certificate: /etc/coovachilli/saml/idp-cert.pem
+    sp_entity_id: https://portal.example.com/saml
+    sp_assertion_consumer_url: https://portal.example.com/saml/acs
+    sp_private_key: /etc/coovachilli/saml/sp-key.pem
+    sp_certificate: /etc/coovachilli/saml/sp-cert.pem
+    username_attribute: uid
+    email_attribute: mail
+    groups_attribute: groups
+
+  # OpenID Connect
+  oidc:
+    enabled: true
+    provider_url: https://accounts.google.com
+    client_id: your-client-id
+    client_secret: your-client-secret
+    redirect_url: https://portal.example.com/oidc/callback
+    scopes:
+      - openid
+      - profile
+      - email
+    username_claim: preferred_username
+    email_claim: email
+
+# LDAP Authentication
+ldap:
+  enabled: true
+  server: ldap.example.com
+  port: 389
+  use_tls: true
+  bind_dn: cn=readonly,dc=example,dc=com
+  bind_password: readonly-password
+  base_dn: ou=users,dc=example,dc=com
+  user_filter: "(uid=%s)"
+
+# Security Features
+antimalware:
+  enabled: true
+  scanners:
+    - virustotal
+    - clamav
+  virustotal_api_key: your-virustotal-api-key
+  clamav_socket: /var/run/clamav/clamd.ctl
+  scan_uploads: true
+  quarantine_path: /var/quarantine
+
+ids:
+  enabled: true
+  port_scan_threshold: 10
+  brute_force_threshold: 5
+  ddos_threshold: 100
+  sql_injection_detection: true
+  xss_detection: true
+  alert_webhook: https://alerts.example.com/webhook
+
+tls:
+  enabled: true
+  min_version: "1.2"
+  cipher_suites:
+    - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+    - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+  cert_file: /etc/coovachilli/tls/cert.pem
+  key_file: /etc/coovachilli/tls/key.pem
+
+# VLAN Management
+vlan:
+  enabled: true
+  default_vlan: 100
+  vlans:
+    - id: 100
+      name: guests
+      description: Guest users
+      isolated: true
+    - id: 200
+      name: employees
+      description: Employee network
+      isolated: false
+    - id: 300
+      name: vip
+      description: VIP users
+      isolated: false
+  role_vlans:
+    guest: 100
+    employee: 200
+    admin: 300
+
+# GDPR Compliance
+gdpr:
+  enabled: true
+  data_retention_days: 90
+  encryption_enabled: true
+  encryption_key_file: /etc/coovachilli/gdpr/master.key
+  audit_log_path: /var/log/coovachilli/gdpr-audit.log
+  consent_required: true
+  anonymization_enabled: true
+
+# URL/DNS Filtering
+urlfilter:
+  enabled: true
+  domain_blocklist_path: /etc/coovachilli/blocklists/domains.txt
+  ip_blocklist_path: /etc/coovachilli/blocklists/ips.txt
+  default_action: allow
+
+# Log Export
+logexport:
+  enabled: true
+  exporters:
+    - syslog
+    - file
+  syslog_addr: syslog.example.com:514
+  syslog_proto: udp
+  file_path: /var/log/coovachilli/export.log
+  file_max_size_mb: 100
+  file_max_backups: 5
+
+# Walled Garden
+walledgarden:
+  allowedDomains:
+    - google.com
+    - facebook.com
+    - microsoft.com
+  allowedNetworks:
+    - 8.8.8.8/32
+    - 1.1.1.1/32
+
+# FAS (Forwarding Authentication Service)
+fas:
+  enabled: false
+  url: https://fas.example.com
+  secret: your-fas-secret
+
+# Cluster Configuration (HA)
+cluster:
+  enabled: false
+  peerid: 1
+  peerkey: cluster-secret-key
+  interface: eth0
+
+# Scripts
+conup: /etc/coovachilli/scripts/up.sh
+condown: /etc/coovachilli/scripts/down.sh
+
+# Performance Tuning
+defbandwidthmaxdown: 10485760  # 10 Mbps
+defbandwidthmaxup: 2097152      # 2 Mbps
+defsessiontimeout: 3600         # 1 hour
+defidletimeout: 300             # 5 minutes
