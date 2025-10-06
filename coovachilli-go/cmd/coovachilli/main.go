@@ -17,6 +17,7 @@ import (
 
 	"coovachilli-go/pkg/admin"
 	"coovachilli-go/pkg/auth"
+	ldapauth "coovachilli-go/pkg/auth/ldap"
 	"coovachilli-go/pkg/cluster"
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
@@ -157,9 +158,11 @@ type application struct {
 	gardenService     *garden.Garden
 	dnsProxy          *dns.Proxy
 	tunDevice         *water.Interface
+	tunMAC            net.HardwareAddr
 	pcapHandle        *pcap.Handle
 	parser            *gopacket.DecodingLayerParser
 	ethLayer          layers.Ethernet
+	arpLayer          layers.ARP
 	ip4Layer          layers.IPv4
 	udpLayer          layers.UDP
 	tcpLayer          layers.TCP
@@ -236,7 +239,7 @@ func buildApplication(cfg *config.Config, reloader *config.Reloader) (*applicati
 		packetChan:    make(chan []byte),
 		shutdownChan:  make(chan os.Signal, 1),
 	}
-	app.parser = gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &app.ethLayer, &app.ip4Layer, &app.tcpLayer, &app.udpLayer, &app.dnsLayer)
+	app.parser = gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &app.ethLayer, &app.arpLayer, &app.ip4Layer, &app.tcpLayer, &app.udpLayer, &app.dnsLayer)
 
 	// Initialize metrics recorder
 	if cfg.Metrics.Enabled {
@@ -276,6 +279,13 @@ func buildApplication(cfg *config.Config, reloader *config.Reloader) (*applicati
 		return nil, fmt.Errorf("error creating TUN interface: %w", err)
 	}
 	app.tunDevice = ifce
+
+	// Get the TUN interface's hardware address and store it
+	netIface, err := net.InterfaceByName(ifce.Name())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get TUN network interface by name '%s': %w", ifce.Name(), err)
+	}
+	app.tunMAC = netIface.HardwareAddr
 
 	// Initialize other components
 	app.scriptRunner = script.NewRunner(app.logger, cfg)
@@ -509,6 +519,29 @@ func (app *application) handleRadiusRequests() {
 				}
 			}
 
+			// Try LDAP authentication if enabled
+			if app.cfg.LDAP.Enabled {
+				ldapAuthenticated, err := ldapauth.Authenticate(&app.cfg.LDAP, username, password, app.logger)
+				if err != nil {
+					// Log the error but fall through to RADIUS as a fallback
+					app.logger.Error().Err(err).Str("user", username).Msg("Error during LDAP authentication")
+				} else if ldapAuthenticated {
+					app.logger.Info().Str("user", username).Msg("User authenticated successfully via LDAP")
+					s.Lock()
+					s.Authenticated = true
+					s.InitializeShaper(app.cfg)
+					if err := app.firewall.AddAuthenticatedUser(s.HisIP); err != nil {
+						app.logger.Error().Err(err).Str("user", s.Redir.Username).Msg("Error adding firewall/TC rules for LDAP user")
+					}
+					s.Unlock()
+					go app.radiusClient.SendAccountingRequest(s, rfc2866.AcctStatusType(1)) // 1 = Start
+					app.scriptRunner.RunScript(app.cfg.ConUp, s, 0)
+					s.AuthResult <- true
+					return
+				}
+			}
+
+			// Fallback to RADIUS
 			resp, err := app.radiusClient.SendAccessRequest(s, username, password)
 			if err != nil {
 				app.logger.Error().Err(err).Str("user", username).Msg("Error sending RADIUS Access-Request")
@@ -583,19 +616,6 @@ func (app *application) processPackets() {
 			continue
 		}
 
-		ipVersion := rawPacket[0] >> 4
-		switch ipVersion {
-		case 4:
-			// Continue processing IPv4
-		case 6:
-			// The current logic inside only handles IPv4. For now, we decode but drop IPv6.
-			// To support IPv6 here, a similar block to the one below for ipv4 would be needed.
-			continue
-		default:
-			app.logger.Debug().Uint8("version", ipVersion).Msg("Dropping unknown packet type from TUN")
-			continue
-		}
-
 		// Use the decoding layer parser to avoid memory allocations.
 		err := app.parser.DecodeLayers(rawPacket, &decodedLayers)
 		if err != nil {
@@ -603,70 +623,126 @@ func (app *application) processPackets() {
 			continue
 		}
 
-		isIPv4 := false
-		isDNS := false
 		for _, layerType := range decodedLayers {
 			switch layerType {
+			case layers.LayerTypeARP:
+				app.handleARPRequest(&app.ethLayer, &app.arpLayer, app.tunDevice)
 			case layers.LayerTypeIPv4:
-				isIPv4 = true
-			case layers.LayerTypeDNS:
-				isDNS = true
-			}
-		}
-
-		if !isIPv4 {
-			continue
-		}
-
-		ipv4 := &app.ip4Layer
-		packetSize := uint64(len(ipv4.Payload))
-
-		session, isUplink := app.sessionManager.GetSessionByIPs(ipv4.SrcIP, ipv4.DstIP)
-		if session == nil {
-			continue // No session found for this packet, drop it
-		}
-
-		session.RLock()
-		isAuthenticated := session.Authenticated
-		session.RUnlock()
-
-		if isAuthenticated {
-			if session.ShouldDropPacket(packetSize, isUplink) {
-				app.logger.Debug().Str("user", session.Redir.Username).Bool("isUplink", isUplink).Msg("Dropping packet due to bandwidth limit")
+				app.handleIPPacket(&app.ip4Layer, decodedLayers)
+			case layers.LayerTypeIPv6:
+				// The current logic inside only handles IPv4. For now, we decode but drop IPv6.
+				// To support IPv6 here, a similar block to the one below for ipv4 would be needed.
 				continue
 			}
-			session.Lock()
-			if isUplink {
-				session.OutputOctets += packetSize
-				session.OutputPackets++
-			} else {
-				session.InputOctets += packetSize
-				session.InputPackets++
-			}
-			session.Unlock()
-			// Authenticated traffic is forwarded by the firewall
+		}
+	}
+}
+
+func (app *application) handleARPRequest(eth *layers.Ethernet, arp *layers.ARP, writer io.Writer) {
+	// We only care about ARP requests
+	if arp.Operation != layers.ARPRequest {
+		return
+	}
+
+	// Check if the requested IP is one that we manage
+	targetIP := net.IP(arp.DstProtAddress)
+	if !app.sessionManager.HasSessionByIP(targetIP) && targetIP.String() != app.cfg.DHCPListen.String() {
+		return
+	}
+
+	app.logger.Debug().
+		Str("targetIP", targetIP.String()).
+		Str("senderIP", net.IP(arp.SourceProtAddress).String()).
+		Str("senderMAC", net.HardwareAddr(arp.SourceHwAddress).String()).
+		Msg("ARP Request for managed IP, sending reply")
+
+	// Construct the ARP reply
+	replyEth := &layers.Ethernet{
+		SrcMAC:       app.tunMAC,
+		DstMAC:       eth.SrcMAC,
+		EthernetType: layers.EthernetTypeARP,
+	}
+	replyArp := &layers.ARP{
+		AddrType:          layers.LinkTypeEthernet,
+		Protocol:          layers.EthernetTypeIPv4,
+		HwAddressSize:     6,
+		ProtAddressSize:   4,
+		Operation:         layers.ARPReply,
+		SourceHwAddress:   app.tunMAC,
+		SourceProtAddress: arp.DstProtAddress, // The IP we are replying for
+		DstHwAddress:      arp.SourceHwAddress,
+		DstProtAddress:    arp.SourceProtAddress,
+	}
+
+	buffer := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	err := gopacket.SerializeLayers(buffer, opts, replyEth, replyArp)
+	if err != nil {
+		app.logger.Error().Err(err).Msg("Failed to serialize ARP reply")
+		return
+	}
+
+	if _, err := writer.Write(buffer.Bytes()); err != nil {
+		app.logger.Error().Err(err).Msg("Failed to write ARP reply")
+	}
+}
+
+func (app *application) handleIPPacket(ipv4 *layers.IPv4, decodedLayers []gopacket.LayerType) {
+	isDNS := false
+	for _, layerType := range decodedLayers {
+		if layerType == layers.LayerTypeDNS {
+			isDNS = true
+			break
+		}
+	}
+
+	packetSize := uint64(len(ipv4.Payload))
+
+	session, isUplink := app.sessionManager.GetSessionByIPs(ipv4.SrcIP, ipv4.DstIP)
+	if session == nil {
+		return // No session found for this packet, drop it
+	}
+
+	session.RLock()
+	isAuthenticated := session.Authenticated
+	session.RUnlock()
+
+	if isAuthenticated {
+		if session.ShouldDropPacket(packetSize, isUplink) {
+			app.logger.Debug().Str("user", session.Redir.Username).Bool("isUplink", isUplink).Msg("Dropping packet due to bandwidth limit")
+			return
+		}
+		session.Lock()
+		if isUplink {
+			session.OutputOctets += packetSize
+			session.OutputPackets++
 		} else {
-			// Handle unauthenticated traffic.
-			if isUplink {
-				// For unauthenticated users, only allow DNS traffic to be proxied through our server.
-				// The firewall should be configured to redirect DNS packets to the chilli instance,
-				// but we still need to process them here. The firewall also handles allowing
-				// traffic to the walled garden destinations.
-				if isDNS {
-					dnsQueryPayload := app.udpLayer.Payload
-					if responsePayload, err := app.dnsProxy.HandleQuery(dnsQueryPayload); err != nil {
-						app.logger.Warn().Err(err).Msg("DNS proxy failed to handle query")
-					} else if responsePayload != nil {
-						// The proxy returned a response, send it back to the client.
-						if err := app.sendDNSResponse(ipv4, &app.udpLayer, responsePayload); err != nil {
-							app.logger.Error().Err(err).Msg("Failed to send DNS response")
-						}
+			session.InputOctets += packetSize
+			session.InputPackets++
+		}
+		session.Unlock()
+		// Authenticated traffic is forwarded by the firewall
+	} else {
+		// Handle unauthenticated traffic.
+		if isUplink {
+			// For unauthenticated users, only allow DNS traffic to be proxied through our server.
+			// The firewall should be configured to redirect DNS packets to the chilli instance,
+			// but we still need to process them here. The firewall also handles allowing
+			// traffic to the walled garden destinations.
+			if isDNS {
+				dnsQueryPayload := app.udpLayer.Payload
+				if responsePayload, err := app.dnsProxy.HandleQuery(dnsQueryPayload); err != nil {
+					app.logger.Warn().Err(err).Msg("DNS proxy failed to handle query")
+				} else if responsePayload != nil {
+					// The proxy returned a response, send it back to the client.
+					if err := app.sendDNSResponse(ipv4, &app.udpLayer, responsePayload); err != nil {
+						app.logger.Error().Err(err).Msg("Failed to send DNS response")
 					}
 				}
-				// Other unauthenticated traffic is implicitly dropped as it won't be forwarded.
 			}
-			// All other unauthenticated traffic is implicitly dropped
+			// Other unauthenticated traffic is implicitly dropped as it won't be forwarded.
 		}
+		// All other unauthenticated traffic is implicitly dropped
 	}
 }
 

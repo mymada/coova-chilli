@@ -153,8 +153,8 @@ type Config struct {
 	Metrics MetricsConfig `yaml:"metrics"`
 	// Admin API settings
 	AdminAPI AdminAPIConfig `yaml:"admin_api"`
-	// Remote Management settings
-	Management ManagementConfig `yaml:"management"`
+	// LDAP settings
+	LDAP LDAPConfig `yaml:"ldap"`
 	// Walled Garden settings
 	WalledGarden WalledGardenConfig `yaml:"walledgarden"`
 	// FAS settings
@@ -274,6 +274,19 @@ type GDPRConfig struct {
 	SaltPath                string `yaml:"salt_path" envconfig:"SALT_PATH"` // Path to salt file for Argon2id
 }
 
+// LDAPConfig holds the configuration for LDAP authentication.
+type LDAPConfig struct {
+	Enabled          bool                `yaml:"enabled" envconfig:"ENABLED"`
+	Server           string              `yaml:"server" envconfig:"SERVER"`
+	Port             int                 `yaml:"port" envconfig:"PORT"`
+	UseTLS           bool                `yaml:"use_tls" envconfig:"USE_TLS"`
+	BindDN           string              `yaml:"bind_dn" envconfig:"BIND_DN"`
+	BindPasswordStr  string              `yaml:"bind_password" envconfig:"BIND_PASSWORD"`
+	BindPassword     *securestore.Secret `yaml:"-"`
+	BaseDN           string              `yaml:"base_dn" envconfig:"BASE_DN"`
+	UserFilter       string              `yaml:"user_filter" envconfig:"USER_FILTER"` // e.g., "(uid=%s)"
+}
+
 // AdminAPIConfig holds the configuration for the admin API.
 type AdminAPIConfig struct {
 	Enabled          bool                `yaml:"enabled" envconfig:"ENABLED"`
@@ -380,6 +393,10 @@ func Load(path string) (*Config, error) {
 	if cfg.RadiusAcctSecretStr != "" {
 		cfg.RadiusAcctSecret = securestore.NewSecret(cfg.RadiusAcctSecretStr)
 		cfg.RadiusAcctSecretStr = ""
+	}
+	if cfg.LDAP.BindPasswordStr != "" {
+		cfg.LDAP.BindPassword = securestore.NewSecret(cfg.LDAP.BindPasswordStr)
+		cfg.LDAP.BindPasswordStr = ""
 	}
 
 	// Compile UAM regexes
