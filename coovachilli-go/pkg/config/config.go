@@ -98,6 +98,7 @@ type Config struct {
 	CertFile            string            `yaml:"certfile" envconfig:"CERTFILE"`
 	KeyFile             string            `yaml:"keyfile" envconfig:"KEYFILE"`
 	WWWDir              string            `yaml:"wwwdir" envconfig:"WWWDIR"`
+	TemplateDir         string            `yaml:"templatedir" envconfig:"TEMPLATEDIR"`
 	WWWBin              string            `yaml:"wwwbin" envconfig:"WWWBIN"`
 	UAMAllowed          []string          `yaml:"uamallowed" envconfig:"UAMALLOWED"`
 	UAMAllowedV6        []string          `yaml:"uamallowed_v6" envconfig:"UAMALLOWED_V6"`
@@ -156,6 +157,8 @@ type Config struct {
 	LDAP LDAPConfig `yaml:"ldap"`
 	// Walled Garden settings
 	WalledGarden WalledGardenConfig `yaml:"walledgarden"`
+	// FAS settings
+	FAS FASConfig `yaml:"fas"`
 	// L7 Filtering settings
 	L7Filtering L7FilteringConfig `yaml:"l7filtering"`
 	// URL/DNS Filtering settings
@@ -290,6 +293,7 @@ type AdminAPIConfig struct {
 	Listen           string              `yaml:"listen" envconfig:"LISTEN"`
 	AuthTokenStr     string              `yaml:"auth_token" envconfig:"AUTH_TOKEN"`
 	AuthToken        *securestore.Secret `yaml:"-"`
+	SnapshotDir      string              `yaml:"snapshot_dir" envconfig:"SNAPSHOT_DIR"`
 	ReadTimeout      time.Duration       `yaml:"read_timeout" envconfig:"READ_TIMEOUT"`
 	WriteTimeout     time.Duration       `yaml:"write_timeout" envconfig:"WRITE_TIMEOUT"`
 	IdleTimeout      time.Duration       `yaml:"idle_timeout" envconfig:"IDLE_TIMEOUT"`
@@ -298,10 +302,30 @@ type AdminAPIConfig struct {
 	RateLimitBurst   int                 `yaml:"rate_limit_burst" envconfig:"RATE_LIMIT_BURST"`
 }
 
+// ManagementConfig holds the configuration for remote management (pull model).
+type ManagementConfig struct {
+	Enabled      bool                `yaml:"enabled" envconfig:"ENABLED"`
+	ServerURL    string              `yaml:"server_url" envconfig:"SERVER_URL"`
+	InstanceID   string              `yaml:"instance_id" envconfig:"INSTANCE_ID"`
+	AuthTokenStr string              `yaml:"auth_token" envconfig:"AUTH_TOKEN"`
+	AuthToken    *securestore.Secret `yaml:"-"`
+	SyncInterval time.Duration       `yaml:"sync_interval" envconfig:"SYNC_INTERVAL"`
+}
+
 // WalledGardenConfig holds the configuration for the walled garden.
 type WalledGardenConfig struct {
 	AllowedDomains  []string `yaml:"allowedDomains" envconfig:"ALLOWEDDOMAINS"`
 	AllowedNetworks []string `yaml:"allowedNetworks" envconfig:"ALLOWEDNETWORKS"`
+}
+
+// FASConfig holds the configuration for the Forwarding Authentication Service.
+type FASConfig struct {
+	Enabled       bool                `yaml:"enabled" envconfig:"ENABLED"`
+	URL           string              `yaml:"url" envconfig:"URL"`
+	SecretStr     string              `yaml:"secret" envconfig:"SECRET"`
+	Secret        *securestore.Secret `yaml:"-"`
+	RedirectURL   string              `yaml:"redirect_url" envconfig:"REDIRECT_URL"`
+	TokenValidity time.Duration       `yaml:"token_validity" envconfig:"TOKEN_VALIDITY"`
 }
 
 // MetricsConfig holds the configuration for the metrics system.
@@ -357,6 +381,14 @@ func Load(path string) (*Config, error) {
 	if cfg.AdminAPI.AuthTokenStr != "" {
 		cfg.AdminAPI.AuthToken = securestore.NewSecret(cfg.AdminAPI.AuthTokenStr)
 		cfg.AdminAPI.AuthTokenStr = ""
+	}
+	if cfg.Management.AuthTokenStr != "" {
+		cfg.Management.AuthToken = securestore.NewSecret(cfg.Management.AuthTokenStr)
+		cfg.Management.AuthTokenStr = ""
+	}
+	if cfg.FAS.SecretStr != "" {
+		cfg.FAS.Secret = securestore.NewSecret(cfg.FAS.SecretStr)
+		cfg.FAS.SecretStr = ""
 	}
 	if cfg.RadiusAcctSecretStr != "" {
 		cfg.RadiusAcctSecret = securestore.NewSecret(cfg.RadiusAcctSecretStr)

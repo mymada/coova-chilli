@@ -25,9 +25,89 @@ The project is divided into several packages, each with a specific responsibilit
 *   **Modular Design**: A clean, modular architecture makes the project easy to understand, maintain, and extend.
 *   **Dynamic Configuration**: Supports live reloading of the configuration without service interruption.
 *   **RADIUS Support**: Full support for RADIUS authentication, authorization, and accounting.
-*   **Captive Portal**: A built-in HTTP server for serving the captive portal page.
+*   **Customizable Portal**: A flexible, file-based template system allows for full customization of the captive portal's appearance.
+*   **Centralized Admin API**: A powerful REST API for managing multiple sites, configurations, and user sessions from a single point.
 *   **Firewall Management**: Manages firewall rules to control client access.
 *   **High Availability (Clustering)**: Active/Standby failover to prevent service interruptions.
+
+## Customizable Captive Portal
+
+The captive portal pages (login and status) are now fully customizable using a file-based template system. This allows administrators to completely change the look and feel of the portal to match their branding.
+
+**How it works:**
+- The application uses Go's standard `html/template` package to render HTML pages.
+- At startup, the server loads all `.html` files from a specified template directory.
+- This approach automatically provides context-aware escaping, which prevents Cross-Site Scripting (XSS) vulnerabilities.
+
+**Configuration:**
+To use your own custom templates, place them in a directory and specify the path in your `config.yaml`:
+```yaml
+templatedir: "/etc/chilli/my_templates"
+```
+The default directory is `www/templates`. For more details on how to create your own templates, see the `README.md` file inside that directory.
+
+## Forwarding Authentication Service (FAS)
+
+For maximum flexibility, CoovaChilli-Go supports delegating the entire authentication process to an external web service, known as a Forwarding Authentication Service (FAS). This architecture allows you to implement any authentication logic you need, such as social logins, payment gateways, or custom SAML/OAuth integrations.
+
+**How it works:**
+- When a new user connects, CoovaChilli-Go redirects them to your external FAS URL.
+- A secure JSON Web Token (JWT) is passed along, containing the client's details.
+- Your external service handles the user interaction (login, payment, etc.).
+- Once your service authenticates the user, it redirects them back to a specific callback URL on the CoovaChilli-Go instance, providing the original token.
+- CoovaChilli-Go validates the token and activates the user's session, applying any parameters (like bandwidth limits) sent back by your FAS.
+
+**Configuration:**
+To enable FAS, add the following section to your `config.yaml`:
+```yaml
+fas:
+  enabled: true
+  url: "https://auth.example.com/login"
+  secret: "your-very-long-and-secure-secret-for-jwt"
+  redirect_url: "https://www.example.com/welcome" # Optional default redirect
+  token_validity: 5m
+```
+For a complete technical guide on implementing a FAS server, please see the [FAS Protocol Specification](./docs/FAS_SPEC.md).
+
+## Centralized Admin API
+
+CoovaChilli-Go now includes a powerful REST API for administration, designed for managing multiple portal instances from a central location.
+
+**How it works:**
+- The API is exposed on a separate port and secured with a Bearer token.
+- It allows for programmatic management of "Sites," where each site represents a unique portal instance with its own configuration.
+- You can create, list, update, and delete sites, manage their configurations, view active sessions, and more.
+
+**Configuration:**
+To enable the admin API, add the following section to your `config.yaml`:
+```yaml
+admin_api:
+  enabled: true
+  listen: "127.0.0.1:8081"
+  auth_token: "your-secret-admin-token"
+  snapshot_dir: "/var/lib/coovachilli/snapshots"
+```
+For a complete list of available endpoints and their specifications, please see the [Admin API Specification](./docs/ADMIN_API_SPEC.md).
+
+## Remote Management (Pull Model)
+
+In addition to local configuration, CoovaChilli-Go can operate in a "managed" mode. When enabled, the instance acts as a client and fetches its configuration periodically from a central management server. This allows for centralized control of a fleet of CoovaChilli instances.
+
+**How it works:**
+- When enabled, CoovaChilli-Go will contact the configured `server_url` on startup to fetch its initial configuration.
+- It will then periodically poll the server at the specified `sync_interval` to check for updates.
+- If a new configuration is received, it will be applied on-the-fly without service interruption using the built-in hot-reloading mechanism.
+
+**Configuration:**
+To enable remote management, add the following section to your `config.yaml`. The local file will only be used to bootstrap the connection, after which the remote configuration takes precedence.
+```yaml
+management:
+  enabled: true
+  server_url: "http://your-central-server.com"
+  instance_id: "chilli-instance-01"
+  auth_token: "secret-token-for-this-instance"
+  sync_interval: 15m
+```
 
 ## High Availability (Clustering)
 
