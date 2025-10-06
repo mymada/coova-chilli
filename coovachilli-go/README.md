@@ -46,6 +46,29 @@ templatedir: "/etc/chilli/my_templates"
 ```
 The default directory is `www/templates`. For more details on how to create your own templates, see the `README.md` file inside that directory.
 
+## Forwarding Authentication Service (FAS)
+
+For maximum flexibility, CoovaChilli-Go supports delegating the entire authentication process to an external web service, known as a Forwarding Authentication Service (FAS). This architecture allows you to implement any authentication logic you need, such as social logins, payment gateways, or custom SAML/OAuth integrations.
+
+**How it works:**
+- When a new user connects, CoovaChilli-Go redirects them to your external FAS URL.
+- A secure JSON Web Token (JWT) is passed along, containing the client's details.
+- Your external service handles the user interaction (login, payment, etc.).
+- Once your service authenticates the user, it redirects them back to a specific callback URL on the CoovaChilli-Go instance, providing the original token.
+- CoovaChilli-Go validates the token and activates the user's session, applying any parameters (like bandwidth limits) sent back by your FAS.
+
+**Configuration:**
+To enable FAS, add the following section to your `config.yaml`:
+```yaml
+fas:
+  enabled: true
+  url: "https://auth.example.com/login"
+  secret: "your-very-long-and-secure-secret-for-jwt"
+  redirect_url: "https://www.example.com/welcome" # Optional default redirect
+  token_validity: 5m
+```
+For a complete technical guide on implementing a FAS server, please see the [FAS Protocol Specification](./docs/FAS_SPEC.md).
+
 ## Centralized Admin API
 
 CoovaChilli-Go now includes a powerful REST API for administration, designed for managing multiple portal instances from a central location.

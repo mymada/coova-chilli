@@ -5,56 +5,25 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"net"
 	"net/http"
+	"net/url"
+	"path/filepath"
+	"strconv"
 	"time"
 
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
+	"coovachilli-go/pkg/fas"
+	"coovachilli-go/pkg/firewall"
 	"coovachilli-go/pkg/metrics"
+	"coovachilli-go/pkg/radius"
+	"coovachilli-go/pkg/script"
 	"coovachilli-go/pkg/wispr"
 	"github.com/rs/zerolog"
+	"layeh.com/radius/rfc2866"
 )
-
-const loginPage = `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Captive Portal</title>
-</head>
-<body>
-    <h1>Welcome to the Captive Portal</h1>
-    <form action="/login" method="post">
-        <label for="username">Username:</label>
-        <input type="text" id="username" name="username"><br><br>
-        <label for="password">Password:</label>
-        <input type="password" id="password" name="password"><br><br>
-        <input type="submit" value="Login">
-    </form>
-</body>
-</html>
-`
-
-const statusPageTemplate = `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Session Status</title>
-</head>
-<body>
-    <h1>Session Active</h1>
-    <p>Welcome, %s!</p>
-    <p>IP Address: %s</p>
-    <p>MAC Address: %s</p>
-    <p>Session Started: %s</p>
-    <p>Session Duration: %s</p>
-    <br>
-    <form action="/logout" method="post">
-        <input type="submit" value="Logout">
-    </form>
-</body>
-</html>
-`
 
 // Server holds the state for the HTTP server.
 type Server struct {
@@ -64,13 +33,44 @@ type Server struct {
 	disconnecter   core.Disconnector
 	logger         zerolog.Logger
 	recorder       metrics.Recorder
+	firewall       firewall.FirewallManager
+	scriptRunner   *script.Runner
+	radiusClient   *radius.Client
+	templates      *template.Template
 }
 
 // NewServer creates a new HTTP server.
-func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<- *core.Session, disconnecter core.Disconnector, logger zerolog.Logger, recorder metrics.Recorder) *Server {
+func NewServer(
+	cfg *config.Config,
+	sm *core.SessionManager,
+	radiusReqChan chan<- *core.Session,
+	disconnecter core.Disconnector,
+	logger zerolog.Logger,
+	recorder metrics.Recorder,
+	fw firewall.FirewallManager,
+	sr *script.Runner,
+	rc *radius.Client,
+) (*Server, error) {
 	if recorder == nil {
 		recorder = metrics.NewNoopRecorder()
 	}
+
+	templateDir := cfg.TemplateDir
+	if templateDir == "" {
+		templateDir = "www/templates" // Default directory
+	}
+	templates, err := template.ParseGlob(filepath.Join(templateDir, "*.html"))
+	if err != nil {
+		// If templates fail to load, we can't serve the portal.
+		// However, we can proceed if FAS is enabled, as the local portal won't be used.
+		if !cfg.FAS.Enabled {
+			return nil, fmt.Errorf("failed to parse templates and FAS is not enabled: %w", err)
+		}
+		logger.Warn().Err(err).Msg("Failed to parse local templates, but proceeding because FAS is enabled")
+	} else {
+		logger.Info().Str("path", templateDir).Msg("HTML templates loaded")
+	}
+
 	return &Server{
 		cfg:            cfg,
 		sessionManager: sm,
@@ -78,7 +78,11 @@ func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<-
 		disconnecter:   disconnecter,
 		logger:         logger.With().Str("component", "http").Logger(),
 		recorder:       recorder,
-	}
+		firewall:       fw,
+		scriptRunner:   sr,
+		radiusClient:   rc,
+		templates:      templates,
+	}, nil
 }
 
 // Start starts the HTTP server.
@@ -90,6 +94,7 @@ func (s *Server) Start() {
 	mux.HandleFunc("/logout", s.handleLogout)
 
 	// API endpoints
+	mux.HandleFunc("/api/v1/fas/auth", s.handleFASAuth)
 	mux.HandleFunc("/api/v1/status", s.handleApiStatus)
 	mux.HandleFunc("/api/v1/login", s.handleApiLogin)
 	mux.HandleFunc("/api/v1/logout", s.handleApiLogout)
@@ -135,6 +140,7 @@ func (s *Server) Start() {
 const sessionCookieName = "coova_session"
 
 func (s *Server) handlePortal(w http.ResponseWriter, r *http.Request) {
+	// First, check for an existing valid session cookie to bypass login/FAS
 	cookie, err := r.Cookie(sessionCookieName)
 	if err == nil {
 		session, ok := s.sessionManager.GetSessionByToken(cookie.Value)
@@ -145,7 +151,57 @@ func (s *Server) handlePortal(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	fmt.Fprint(w, loginPage)
+	// If FAS is enabled, redirect to the external authentication service.
+	if s.cfg.FAS.Enabled {
+		ipStr, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			s.logger.Error().Err(err).Msg("Failed to get client IP for FAS redirect")
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+		ip := net.ParseIP(ipStr)
+		session, ok := s.sessionManager.GetSessionByIP(ip)
+		if !ok {
+			s.logger.Warn().Str("ip", ipStr).Msg("No session found for incoming client for FAS redirect")
+			http.Error(w, "Session not found", http.StatusNotFound)
+			return
+		}
+
+		// Generate the FAS token
+		tokenString, err := fas.GenerateToken(session, &s.cfg.FAS)
+		if err != nil {
+			s.logger.Error().Err(err).Msg("Failed to generate FAS token")
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		// Construct the redirection URL
+		fasURL, err := url.Parse(s.cfg.FAS.URL)
+		if err != nil {
+			s.logger.Error().Err(err).Str("url", s.cfg.FAS.URL).Msg("Failed to parse FAS URL")
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		q := fasURL.Query()
+		q.Set("token", tokenString)
+		q.Set("client_mac", session.HisMAC.String())
+		q.Set("client_ip", session.HisIP.String())
+		q.Set("nas_id", s.cfg.RadiusNASID)
+		q.Set("original_url", r.URL.String()) // Pass the originally requested URL
+		fasURL.RawQuery = q.Encode()
+
+		s.logger.Info().Str("user_ip", ipStr).Str("redirect_url", fasURL.String()).Msg("Redirecting user to FAS")
+		http.Redirect(w, r, fasURL.String(), http.StatusFound)
+		return
+	}
+
+	// Fallback to local login page if FAS is not enabled
+	err = s.templates.ExecuteTemplate(w, "login.html", nil)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Failed to execute login template")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -240,6 +296,14 @@ func generateSecureToken(length int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+type statusPageData struct {
+	Username        string
+	IPAddress       string
+	MACAddress      string
+	StartTime       string
+	SessionDuration string
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	ipStr, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -258,14 +322,19 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	defer session.RUnlock()
 
 	duration := time.Since(session.StartTime).Round(time.Second)
-	statusHTML := fmt.Sprintf(statusPageTemplate,
-		session.Redir.Username,
-		session.HisIP,
-		session.HisMAC,
-		session.StartTime.Format(time.RFC1123),
-		duration,
-	)
-	fmt.Fprint(w, statusHTML)
+	data := statusPageData{
+		Username:        session.Redir.Username,
+		IPAddress:       session.HisIP.String(),
+		MACAddress:      session.HisMAC.String(),
+		StartTime:       session.StartTime.Format(time.RFC1123),
+		SessionDuration: duration.String(),
+	}
+
+	err = s.templates.ExecuteTemplate(w, "status.html", data)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Failed to execute status template")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -675,4 +744,93 @@ func (s *Server) handleWISPrLogin(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusGatewayTimeout)
 		fmt.Fprint(w, wsprXML)
 	}
+}
+
+func (s *Server) handleFASAuth(w http.ResponseWriter, r *http.Request) {
+	s.logger.Debug().Msg("Received a FAS callback request")
+
+	// 1. Get the token from the query parameters
+	tokenString := r.URL.Query().Get("token")
+	if tokenString == "" {
+		http.Error(w, "Missing token", http.StatusBadRequest)
+		return
+	}
+
+	// 2. Validate the token
+	claims, err := fas.ValidateToken(tokenString, &s.cfg.FAS)
+	if err != nil {
+		s.logger.Warn().Err(err).Msg("FAS token validation failed")
+		http.Error(w, "Invalid or expired token", http.StatusForbidden)
+		return
+	}
+
+	// 3. Find the session using the MAC address from the token
+	clientMAC, err := net.ParseMAC(claims.ClientMAC)
+	if err != nil {
+		s.logger.Error().Err(err).Str("mac", claims.ClientMAC).Msg("Failed to parse MAC address from FAS token")
+		http.Error(w, "Invalid token claims", http.StatusBadRequest)
+		return
+	}
+
+	session, ok := s.sessionManager.GetSessionByMAC(clientMAC)
+	if !ok {
+		s.logger.Warn().Str("mac", clientMAC.String()).Msg("No session found for MAC address in FAS token")
+		http.Error(w, "Session not found", http.StatusNotFound)
+		return
+	}
+
+	// 4. Update session with parameters from FAS
+	session.Lock()
+	session.Authenticated = true
+	// The username is not provided by FAS, but we can set it to the MAC address for accounting purposes
+	if session.Redir.Username == "" {
+		session.Redir.Username = claims.ClientMAC
+	}
+
+	if timeoutStr := r.URL.Query().Get("session_timeout"); timeoutStr != "" {
+		if timeout, err := strconv.ParseUint(timeoutStr, 10, 32); err == nil {
+			session.SessionParams.SessionTimeout = uint32(timeout)
+		}
+	}
+	if idleTimeoutStr := r.URL.Query().Get("idle_timeout"); idleTimeoutStr != "" {
+		if idleTimeout, err := strconv.ParseUint(idleTimeoutStr, 10, 32); err == nil {
+			session.SessionParams.IdleTimeout = uint32(idleTimeout)
+		}
+	}
+	if downSpeedStr := r.URL.Query().Get("download_speed"); downSpeedStr != "" {
+		if downSpeed, err := strconv.ParseUint(downSpeedStr, 10, 64); err == nil {
+			session.SessionParams.BandwidthMaxDown = downSpeed * 1000 // Convert kbps to bps
+		}
+	}
+	if upSpeedStr := r.URL.Query().Get("upload_speed"); upSpeedStr != "" {
+		if upSpeed, err := strconv.ParseUint(upSpeedStr, 10, 64); err == nil {
+			session.SessionParams.BandwidthMaxUp = upSpeed * 1000 // Convert kbps to bps
+		}
+	}
+	session.Unlock()
+
+	// 5. Finalize the session (firewall, accounting, scripts)
+	s.logger.Info().Str("user", session.Redir.Username).Str("ip", session.HisIP.String()).Msg("User authenticated successfully via FAS")
+	if err := s.firewall.AddAuthenticatedUser(session.HisIP); err != nil {
+		s.logger.Error().Err(err).Msg("Failed to add firewall rules for FAS user")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	go s.radiusClient.SendAccountingRequest(session, rfc2866.AcctStatusType(1)) // 1 = Start
+	s.scriptRunner.RunScript(s.cfg.ConUp, session, 0)
+
+	// 6. Redirect the user to their final destination
+	continueURL := r.URL.Query().Get("continue_url")
+	if continueURL == "" {
+		continueURL = claims.OriginalURL
+	}
+	if continueURL == "" {
+		continueURL = s.cfg.FAS.RedirectURL // Fallback to a default redirect URL
+	}
+	if continueURL == "" {
+		continueURL = "/" // Ultimate fallback
+	}
+
+	http.Redirect(w, r, continueURL, http.StatusFound)
 }

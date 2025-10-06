@@ -116,3 +116,11 @@ walledgarden:
   allowedNetworks:
     - "10.0.0.0/24"
     - "192.168.1.10"
+
+# Forwarding Authentication Service (FAS) settings
+fas:
+  enabled: false # Set to true to delegate authentication to an external service.
+  url: "https://auth.example.com/login" # The URL of your external FAS server.
+  secret: "a-very-long-and-secure-secret-for-jwt" # Shared secret for signing JWTs.
+  redirect_url: "https://www.example.com/welcome" # Optional: A default URL to redirect users to after successful authentication.
+  token_validity: 5m # How long the token is valid for (e.g., 5m, 1h).

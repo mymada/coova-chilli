@@ -157,6 +157,8 @@ type Config struct {
 	Management ManagementConfig `yaml:"management"`
 	// Walled Garden settings
 	WalledGarden WalledGardenConfig `yaml:"walledgarden"`
+	// FAS settings
+	FAS FASConfig `yaml:"fas"`
 	// L7 Filtering settings
 	L7Filtering L7FilteringConfig `yaml:"l7filtering"`
 	// URL/DNS Filtering settings
@@ -303,6 +305,16 @@ type WalledGardenConfig struct {
 	AllowedNetworks []string `yaml:"allowedNetworks" envconfig:"ALLOWEDNETWORKS"`
 }
 
+// FASConfig holds the configuration for the Forwarding Authentication Service.
+type FASConfig struct {
+	Enabled       bool                `yaml:"enabled" envconfig:"ENABLED"`
+	URL           string              `yaml:"url" envconfig:"URL"`
+	SecretStr     string              `yaml:"secret" envconfig:"SECRET"`
+	Secret        *securestore.Secret `yaml:"-"`
+	RedirectURL   string              `yaml:"redirect_url" envconfig:"REDIRECT_URL"`
+	TokenValidity time.Duration       `yaml:"token_validity" envconfig:"TOKEN_VALIDITY"`
+}
+
 // MetricsConfig holds the configuration for the metrics system.
 type MetricsConfig struct {
 	Enabled bool   `yaml:"enabled" envconfig:"ENABLED"`
@@ -360,6 +372,10 @@ func Load(path string) (*Config, error) {
 	if cfg.Management.AuthTokenStr != "" {
 		cfg.Management.AuthToken = securestore.NewSecret(cfg.Management.AuthTokenStr)
 		cfg.Management.AuthTokenStr = ""
+	}
+	if cfg.FAS.SecretStr != "" {
+		cfg.FAS.Secret = securestore.NewSecret(cfg.FAS.SecretStr)
+		cfg.FAS.SecretStr = ""
 	}
 	if cfg.RadiusAcctSecretStr != "" {
 		cfg.RadiusAcctSecret = securestore.NewSecret(cfg.RadiusAcctSecretStr)
