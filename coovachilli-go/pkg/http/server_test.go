@@ -57,8 +57,8 @@ func TestHandleStatus(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	body := rr.Body.String()
 	require.Contains(t, body, "<h1>Session Active</h1>")
-	require.Contains(t, body, "Welcome, testuser!")
-	require.Contains(t, body, "IP Address: 10.0.0.15")
+	require.Contains(t, body, "<strong>User:</strong> testuser</p>")
+	require.Contains(t, body, "<strong>IP Address:</strong> 10.0.0.15</p>")
 }
 
 func TestHandleLogout(t *testing.T) {

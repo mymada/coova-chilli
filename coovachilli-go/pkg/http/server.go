@@ -60,6 +60,15 @@ func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<-
 // Start starts the HTTP server.
 func (s *Server) Start() {
 	mux := http.NewServeMux()
+
+	// Serve static files
+	staticDir := "www/static"
+	if s.cfg.WWWDir != "" {
+		staticDir = filepath.Join(s.cfg.WWWDir, "static")
+	}
+	fs := http.FileServer(http.Dir(staticDir))
+	mux.Handle("/static/", http.StripPrefix("/static/", fs))
+
 	mux.HandleFunc("/", s.handlePortal)
 	mux.HandleFunc("/login", s.handleLogin)
 	mux.HandleFunc("/status", s.handleStatus)

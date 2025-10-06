@@ -17,7 +17,6 @@ import (
 
 	"coovachilli-go/pkg/admin"
 	"coovachilli-go/pkg/auth"
-	ldapauth "coovachilli-go/pkg/auth/ldap"
 	"coovachilli-go/pkg/cluster"
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
@@ -300,7 +299,13 @@ func buildApplication(cfg *config.Config, reloader *config.Reloader) (*applicati
 		return nil, fmt.Errorf("failed to create http server: %w", err)
 	}
 	app.httpServer = httpServer
-	app.adminServer = admin.NewServer(cfg, app.sessionManager, app.disconnectManager, app.logger)
+
+	// Create the admin server
+	adminServer, err := admin.NewAPIServer(cfg, app.logger, app.sessionManager, app.disconnectManager)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create admin api server: %w", err)
+	}
+	app.adminServer = adminServer
 
 	// Register reconfigurable components
 	reloader.Register(app.firewall)
@@ -378,7 +383,9 @@ func (app *application) startServices() {
 	go app.processPackets()
 
 	// Start admin API server
-	go app.adminServer.Start()
+	if app.cfg.AdminAPI.Enabled {
+		go app.adminServer.Start()
+	}
 
 	// Start RADIUS listeners (CoA, Proxy)
 	go app.radiusClient.StartCoAListener(app.coaReqChan)
@@ -516,28 +523,6 @@ func (app *application) handleRadiusRequests() {
 					}
 					s.Unlock()
 					// Also send accounting start and run conup script for local users
-					go app.radiusClient.SendAccountingRequest(s, rfc2866.AcctStatusType(1)) // 1 = Start
-					app.scriptRunner.RunScript(app.cfg.ConUp, s, 0)
-					s.AuthResult <- true
-					return
-				}
-			}
-
-			// Try LDAP authentication if enabled
-			if app.cfg.LDAP.Enabled {
-				ldapAuthenticated, err := ldapauth.Authenticate(&app.cfg.LDAP, username, password, app.logger)
-				if err != nil {
-					// Log the error but fall through to RADIUS as a fallback
-					app.logger.Error().Err(err).Str("user", username).Msg("Error during LDAP authentication")
-				} else if ldapAuthenticated {
-					app.logger.Info().Str("user", username).Msg("User authenticated successfully via LDAP")
-					s.Lock()
-					s.Authenticated = true
-					s.InitializeShaper(app.cfg)
-					if err := app.firewall.AddAuthenticatedUser(s.HisIP); err != nil {
-						app.logger.Error().Err(err).Str("user", s.Redir.Username).Msg("Error adding firewall/TC rules for LDAP user")
-					}
-					s.Unlock()
 					go app.radiusClient.SendAccountingRequest(s, rfc2866.AcctStatusType(1)) // 1 = Start
 					app.scriptRunner.RunScript(app.cfg.ConUp, s, 0)
 					s.AuthResult <- true

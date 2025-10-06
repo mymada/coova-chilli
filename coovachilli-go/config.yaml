@@ -108,6 +108,7 @@ admin_api:
   enabled: true
   listen: "127.0.0.1:8081"
   auth_token: "your-secret-admin-token"
+  snapshot_dir: "/var/lib/coovachilli/snapshots" # Directory to store configuration snapshots.
 
 # Walled Garden settings
 walledgarden:

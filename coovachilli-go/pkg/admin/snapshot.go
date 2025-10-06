@@ -9,14 +9,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
 	"time"
 
-	"github.com/gorilla/mux"
 	"gopkg.in/yaml.v2"
 )
 
@@ -304,140 +302,4 @@ func copyFile(src, dst string) error {
 	return ioutil.WriteFile(dst, data, 0644)
 }
 
-// HTTP Handlers for snapshots
-
-func (s *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	if s.snapshotMgr == nil {
-		s.writeError(w, http.StatusServiceUnavailable, "Snapshot manager not initialized")
-		return
-	}
-
-	snapshots := s.snapshotMgr.ListSnapshots()
-	json.NewEncoder(w).Encode(snapshots)
-}
-
-type createSnapshotRequest struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-}
-
-func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	if s.snapshotMgr == nil {
-		s.writeError(w, http.StatusServiceUnavailable, "Snapshot manager not initialized")
-		return
-	}
-
-	var req createSnapshotRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "Invalid request body")
-		return
-	}
-
-	// Auto-generate name if empty
-	if req.Name == "" {
-		req.Name = "Snapshot " + time.Now().Format("2006-01-02 15:04:05")
-	}
-
-	// Validate name
-	if err := ValidateSnapshotName(req.Name); err != nil {
-		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid name: %v", err))
-		return
-	}
-
-	// Validate description
-	if err := ValidateDescription(req.Description); err != nil {
-		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid description: %v", err))
-		return
-	}
-
-	snapshot, err := s.snapshotMgr.CreateSnapshot(req.Name, req.Description)
-	if err != nil {
-		s.logger.Error().Err(err).Msg("Failed to create snapshot")
-		s.writeError(w, http.StatusInternalServerError, "Failed to create snapshot")
-		return
-	}
-
-	s.logger.Info().
-		Str("snapshot_id", snapshot.ID).
-		Str("name", snapshot.Name).
-		Msg("Snapshot created")
-
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(snapshot)
-}
-
-func (s *Server) handleGetSnapshot(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	if s.snapshotMgr == nil {
-		s.writeError(w, http.StatusServiceUnavailable, "Snapshot manager not initialized")
-		return
-	}
-
-	vars := mux.Vars(r)
-	id := vars["id"]
-
-	snapshot, err := s.snapshotMgr.GetSnapshot(id)
-	if err != nil {
-		s.writeError(w, http.StatusNotFound, err.Error())
-		return
-	}
-
-	json.NewEncoder(w).Encode(snapshot)
-}
-
-func (s *Server) handleRestoreSnapshot(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	if s.snapshotMgr == nil {
-		s.writeError(w, http.StatusServiceUnavailable, "Snapshot manager not initialized")
-		return
-	}
-
-	vars := mux.Vars(r)
-	id := vars["id"]
-
-	// Get config file path from environment or use default
-	configPath := os.Getenv("COOVACHILLI_CONFIG")
-	if configPath == "" {
-		configPath = "/etc/coovachilli/config.yaml"
-	}
-
-	if err := s.snapshotMgr.RestoreSnapshot(id, configPath); err != nil {
-		s.logger.Error().Err(err).Str("snapshot_id", id).Msg("Failed to restore snapshot")
-		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to restore snapshot: %v", err))
-		return
-	}
-
-	s.logger.Info().Str("snapshot_id", id).Msg("Snapshot restored")
-
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintln(w, `{"status":"ok", "message":"snapshot restored - restart required"}`)
-}
-
-func (s *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	if s.snapshotMgr == nil {
-		s.writeError(w, http.StatusServiceUnavailable, "Snapshot manager not initialized")
-		return
-	}
-
-	vars := mux.Vars(r)
-	id := vars["id"]
-
-	if err := s.snapshotMgr.DeleteSnapshot(id); err != nil {
-		s.logger.Error().Err(err).Str("snapshot_id", id).Msg("Failed to delete snapshot")
-		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to delete snapshot: %v", err))
-		return
-	}
-
-	s.logger.Info().Str("snapshot_id", id).Msg("Snapshot deleted")
-
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintln(w, `{"status":"ok", "message":"snapshot deleted"}`)
-}
+// No handlers here anymore, they have been moved to api.go

@@ -278,6 +278,21 @@ func (sm *SessionManager) GetSessionByToken(token string) (*Session, bool) {
 	return session, ok
 }
 
+// GetSessionByID returns a session by its session ID.
+func (sm *SessionManager) GetSessionByID(sessionID string) (*Session, bool) {
+	sm.RLock()
+	defer sm.RUnlock()
+
+	// This is inefficient, but session IDs are not currently indexed.
+	// For a system with a very large number of sessions, an index would be needed.
+	for _, session := range sm.sessionsByMAC {
+		if session.SessionID == sessionID {
+			return session, true
+		}
+	}
+	return nil, false
+}
+
 // AssociateToken adds the session to the token lookup map.
 func (sm *SessionManager) AssociateToken(session *Session) {
 	sm.Lock()
