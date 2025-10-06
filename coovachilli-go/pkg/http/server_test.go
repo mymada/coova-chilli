@@ -61,7 +61,7 @@ func setupTestServer(t *testing.T) (*Server, *config.Config, *core.SessionManage
 
 	radiusReqChan := make(chan *core.Session, 1)
 
-	server, err := NewServer(cfg, sm, radiusReqChan, mockDc, zerolog.Nop(), metrics.NewNoopRecorder(), mockFw, mockSr, mockRc)
+	server, err := NewServer(cfg, sm, radiusReqChan, mockDc, zerolog.Nop(), metrics.NewNoopRecorder(), mockFw, mockSr, mockRc, nil)
 	require.NoError(t, err, "NewServer should not return an error during test setup")
 
 	return server, cfg, sm, mockDc

@@ -25,6 +25,11 @@ import (
 	"layeh.com/radius/rfc2866"
 )
 
+// SSOHandlers interface for SSO integration
+type SSOHandlers interface {
+	RegisterRoutes(mux *http.ServeMux)
+}
+
 // Server holds the state for the HTTP server.
 type Server struct {
 	cfg            *config.Config
@@ -37,6 +42,7 @@ type Server struct {
 	scriptRunner   *script.Runner
 	radiusClient   *radius.Client
 	templates      *template.Template
+	ssoHandlers    SSOHandlers
 }
 
 // NewServer creates a new HTTP server.
@@ -50,6 +56,7 @@ func NewServer(
 	fw firewall.FirewallManager,
 	sr *script.Runner,
 	rc *radius.Client,
+	ssoHandlers SSOHandlers,
 ) (*Server, error) {
 	if recorder == nil {
 		recorder = metrics.NewNoopRecorder()
@@ -82,6 +89,7 @@ func NewServer(
 		scriptRunner:   sr,
 		radiusClient:   rc,
 		templates:      templates,
+		ssoHandlers:    ssoHandlers,
 	}, nil
 }
 
@@ -103,6 +111,12 @@ func (s *Server) Start() {
 	// WISPr endpoints
 	http.HandleFunc("/wispr", s.handleWISPr)
 	http.HandleFunc("/wispr/login", s.handleWISPrLogin)
+
+	// ✅ CORRECTION CRITIQUE: Enregistrer les routes SSO
+	if s.ssoHandlers != nil {
+		s.logger.Info().Msg("Registering SSO routes")
+		s.ssoHandlers.RegisterRoutes(mux)
+	}
 
 	addr := fmt.Sprintf(":%d", s.cfg.UAMPort)
 
@@ -792,6 +806,44 @@ func (s *Server) handleFASAuth(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		s.logger.Warn().Str("mac", clientMAC.String()).Msg("No session found for MAC address in FAS token")
 		http.Error(w, "Session not found", http.StatusNotFound)
+		return
+	}
+
+	// ✅ CORRECTION CRITIQUE: Valider l'état de la session
+	session.RLock()
+	alreadyAuth := session.Authenticated
+	sessionIP := session.HisIP.String()
+	sessionLastSeen := session.LastSeen
+	session.RUnlock()
+
+	// Vérifier que la session n'est pas déjà authentifiée
+	if alreadyAuth {
+		s.logger.Warn().
+			Str("mac", clientMAC.String()).
+			Str("ip", sessionIP).
+			Msg("FAS callback received for already authenticated session - rejecting")
+		http.Error(w, "Session already authenticated", http.StatusConflict)
+		return
+	}
+
+	// Vérifier que l'IP correspond (protection anti-hijacking)
+	if sessionIP != claims.ClientIP {
+		s.logger.Warn().
+			Str("token_ip", claims.ClientIP).
+			Str("session_ip", sessionIP).
+			Str("mac", clientMAC.String()).
+			Msg("FAS token IP mismatch - possible session hijacking")
+		http.Error(w, "Session validation failed", http.StatusForbidden)
+		return
+	}
+
+	// Vérifier que la session est récente (< 10 minutes depuis dernier paquet)
+	if time.Since(sessionLastSeen) > 10*time.Minute {
+		s.logger.Warn().
+			Str("mac", clientMAC.String()).
+			Dur("idle_time", time.Since(sessionLastSeen)).
+			Msg("FAS callback for stale session - rejecting")
+		http.Error(w, "Session expired", http.StatusGone)
 		return
 	}
 

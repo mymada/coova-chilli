@@ -41,6 +41,7 @@ type Session struct {
 
 	// Session state
 	Authenticated       bool
+	StateMachine        *SessionStateMachine `json:"-"` // ✅ State machine for transitions
 	StartTime           time.Time
 	LastSeen            time.Time
 	LastUpTime          time.Time
@@ -194,14 +195,12 @@ type SessionManager struct {
 	sessionsByIPv4  map[string]*Session
 	sessionsByIPv6  map[string]*Session
 	sessionsByMAC   map[string]*Session
-	sessionsByToken map[string]*Session // ✅ Deprecated - use tokenManager
 	recorder        metrics.Recorder
 	cfg             *config.Config
 	sessionCount    int // Track total sessions
 	hooks           SessionHooks
 
-	// ✅ NEW: Unified token manager (optional)
-	tokenManager interface{}  // Can be set to *token.Manager
+	// ✅ Token manager is handled externally now
 }
 
 // NewSessionManager creates a new SessionManager.
@@ -213,7 +212,6 @@ func NewSessionManager(cfg *config.Config, recorder metrics.Recorder) *SessionMa
 		sessionsByIPv4:  make(map[string]*Session),
 		sessionsByIPv6:  make(map[string]*Session),
 		sessionsByMAC:   make(map[string]*Session),
-		sessionsByToken: make(map[string]*Session),
 		recorder:        recorder,
 		cfg:             cfg,
 	}
@@ -226,12 +224,6 @@ func (sm *SessionManager) SetHooks(hooks SessionHooks) {
 	sm.hooks = hooks
 }
 
-// SetTokenManager sets the unified token manager
-func (sm *SessionManager) SetTokenManager(tm interface{}) {
-	sm.Lock()
-	defer sm.Unlock()
-	sm.tokenManager = tm
-}
 
 // StateData is the container for serializing persistent state.
 type StateData struct {
@@ -254,6 +246,7 @@ func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID 
 		HisIP:               ip,
 		HisMAC:              mac,
 		VLANID:              vlanID,
+		StateMachine:        NewSessionStateMachine(), // ✅ Initialize state machine
 		StartTime:           time.Now(),
 		LastSeen:            time.Now(),
 		AuthResult:          make(chan bool, 1),
@@ -350,22 +343,16 @@ func (sm *SessionManager) GetSessionByMAC(mac net.HardwareAddr) (*Session, bool)
 	return session, ok
 }
 
-// GetSessionByToken returns a session by its auth token.
+// GetSessionByToken is deprecated - use token.Manager instead
+// Kept for backward compatibility, always returns false
 func (sm *SessionManager) GetSessionByToken(token string) (*Session, bool) {
-	sm.RLock()
-	defer sm.RUnlock()
-
-	session, ok := sm.sessionsByToken[token]
-	return session, ok
+	return nil, false
 }
 
-// AssociateToken adds the session to the token lookup map.
+// AssociateToken is deprecated - use token.Manager instead
+// Kept for backward compatibility, does nothing
 func (sm *SessionManager) AssociateToken(session *Session) {
-	sm.Lock()
-	defer sm.Unlock()
-	if session.Token != "" {
-		sm.sessionsByToken[session.Token] = session
-	}
+	// No-op: Token management is external now
 }
 
 // DeleteSession deletes a session.
@@ -395,9 +382,6 @@ func (sm *SessionManager) DeleteSession(session *Session) {
 	}
 	if session.HisMAC != nil {
 		delete(sm.sessionsByMAC, session.HisMAC.String())
-	}
-	if session.Token != "" {
-		delete(sm.sessionsByToken, session.Token)
 	}
 
 	sm.sessionCount--
@@ -521,9 +505,6 @@ func (sm *SessionManager) LoadSessions(path string) error {
 		}
 		if s.HisMAC != nil {
 			sm.sessionsByMAC[s.HisMAC.String()] = s
-		}
-		if s.Token != "" {
-			sm.sessionsByToken[s.Token] = s
 		}
 	}
 

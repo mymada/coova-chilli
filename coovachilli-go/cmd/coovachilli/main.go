@@ -314,7 +314,7 @@ func buildApplication(cfg *config.Config, reloader *config.Reloader) (*applicati
 	app.disconnectManager = disconnect.NewManager(cfg, app.sessionManager, app.firewall, app.radiusClient, app.scriptRunner, app.logger)
 	app.reaper = core.NewReaper(cfg, app.sessionManager, app.disconnectManager, app.logger)
 
-	app.httpServer, err = http.NewServer(cfg, app.sessionManager, app.radiusReqChan, app.disconnectManager, app.logger, app.metricsRecorder, app.firewall, app.scriptRunner, app.radiusClient)
+	app.httpServer, err = http.NewServer(cfg, app.sessionManager, app.radiusReqChan, app.disconnectManager, app.logger, app.metricsRecorder, app.firewall, app.scriptRunner, app.radiusClient, app.ssoHandlers)
 	if err != nil {
 		return nil, fmt.Errorf("error creating HTTP server: %w", err)
 	}

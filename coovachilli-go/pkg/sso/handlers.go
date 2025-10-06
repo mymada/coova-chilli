@@ -12,7 +12,6 @@ import (
 	"coovachilli-go/pkg/firewall"
 	"coovachilli-go/pkg/script"
 
-	"github.com/gorilla/mux"
 	"layeh.com/radius/rfc2866"
 )
 
@@ -79,19 +78,19 @@ func (h *SSOHandlers) SetConfig(cfg *config.Config) {
 	h.cfg = cfg
 }
 
-// RegisterRoutes registers SSO routes with the router
-func (h *SSOHandlers) RegisterRoutes(router *mux.Router) {
+// RegisterRoutes registers SSO routes with the standard mux
+func (h *SSOHandlers) RegisterRoutes(mux *http.ServeMux) {
 	// SSO info endpoint
-	router.HandleFunc("/sso/info", h.handleInfo).Methods("GET")
+	mux.HandleFunc("/sso/info", h.handleInfo)
 
 	// SAML endpoints
-	router.HandleFunc("/sso/saml/login", h.handleSAMLLogin).Methods("GET")
-	router.HandleFunc("/sso/saml/acs", h.handleSAMLCallback).Methods("POST")
-	router.HandleFunc("/sso/saml/metadata", h.handleSAMLMetadata).Methods("GET")
+	mux.HandleFunc("/sso/saml/login", h.handleSAMLLogin)
+	mux.HandleFunc("/sso/saml/acs", h.handleSAMLCallback)
+	mux.HandleFunc("/sso/saml/metadata", h.handleSAMLMetadata)
 
 	// OIDC endpoints
-	router.HandleFunc("/sso/oidc/login", h.handleOIDCLogin).Methods("GET")
-	router.HandleFunc("/sso/oidc/callback", h.handleOIDCCallback).Methods("GET")
+	mux.HandleFunc("/sso/oidc/login", h.handleOIDCLogin)
+	mux.HandleFunc("/sso/oidc/callback", h.handleOIDCCallback)
 }
 
 // handleInfo returns information about available SSO providers

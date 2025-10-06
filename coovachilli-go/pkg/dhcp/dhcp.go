@@ -633,6 +633,40 @@ func (s *Server) handleRequest(req *dhcpv4.DHCPv4, packet gopacket.Packet) ([]by
 		session = s.sessionManager.CreateSession(reqIP, req.ClientHWAddr, vlanID)
 	}
 
+	// ✅ CORRECTION: Vérifier si déjà authentifié pour éviter doublons RADIUS
+	session.RLock()
+	alreadyAuthenticated := session.Authenticated
+	session.RUnlock()
+
+	if alreadyAuthenticated {
+		s.logger.Debug().
+			Str("mac", req.ClientHWAddr.String()).
+			Str("ip", reqIP.String()).
+			Msg("Session already authenticated, skipping RADIUS auth")
+		// Renouvellement simple sans réauthentification
+		s.Lock()
+		s.leasesV4[req.ClientHWAddr.String()] = &Lease{
+			IP:      reqIP,
+			MAC:     req.ClientHWAddr,
+			Expires: time.Now().Add(s.cfg.Lease),
+		}
+		s.Unlock()
+
+		resp, err := dhcpv4.NewReplyFromRequest(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create DHCPv4 reply: %w", err)
+		}
+		resp.YourIPAddr = reqIP
+		resp.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeAck))
+		resp.UpdateOption(dhcpv4.OptServerIdentifier(s.cfg.DHCPListen))
+		resp.UpdateOption(dhcpv4.OptIPAddressLeaseTime(s.cfg.Lease))
+		resp.UpdateOption(dhcpv4.OptRouter(s.cfg.DHCPListen))
+		resp.UpdateOption(dhcpv4.OptDNS(s.cfg.DNS1, s.cfg.DNS2))
+
+		s.logger.Info().Str("ip", reqIP.String()).Str("mac", req.ClientHWAddr.String()).Msg("ACKing IP (renewal without re-auth)")
+		return resp.ToBytes(), nil
+	}
+
 	s.logger.Debug().Str("mac", req.ClientHWAddr.String()).Msg("Sending session to RADIUS for authorization")
 	s.radiusReqChan <- session
 
