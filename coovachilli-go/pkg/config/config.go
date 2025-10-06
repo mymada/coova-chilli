@@ -153,6 +153,8 @@ type Config struct {
 	Metrics MetricsConfig `yaml:"metrics"`
 	// Admin API settings
 	AdminAPI AdminAPIConfig `yaml:"admin_api"`
+	// Remote Management settings
+	Management ManagementConfig `yaml:"management"`
 	// Walled Garden settings
 	WalledGarden WalledGardenConfig `yaml:"walledgarden"`
 	// L7 Filtering settings
@@ -285,6 +287,16 @@ type AdminAPIConfig struct {
 	RateLimitBurst   int                 `yaml:"rate_limit_burst" envconfig:"RATE_LIMIT_BURST"`
 }
 
+// ManagementConfig holds the configuration for remote management (pull model).
+type ManagementConfig struct {
+	Enabled      bool                `yaml:"enabled" envconfig:"ENABLED"`
+	ServerURL    string              `yaml:"server_url" envconfig:"SERVER_URL"`
+	InstanceID   string              `yaml:"instance_id" envconfig:"INSTANCE_ID"`
+	AuthTokenStr string              `yaml:"auth_token" envconfig:"AUTH_TOKEN"`
+	AuthToken    *securestore.Secret `yaml:"-"`
+	SyncInterval time.Duration       `yaml:"sync_interval" envconfig:"SYNC_INTERVAL"`
+}
+
 // WalledGardenConfig holds the configuration for the walled garden.
 type WalledGardenConfig struct {
 	AllowedDomains  []string `yaml:"allowedDomains" envconfig:"ALLOWEDDOMAINS"`
@@ -344,6 +356,10 @@ func Load(path string) (*Config, error) {
 	if cfg.AdminAPI.AuthTokenStr != "" {
 		cfg.AdminAPI.AuthToken = securestore.NewSecret(cfg.AdminAPI.AuthTokenStr)
 		cfg.AdminAPI.AuthTokenStr = ""
+	}
+	if cfg.Management.AuthTokenStr != "" {
+		cfg.Management.AuthToken = securestore.NewSecret(cfg.Management.AuthTokenStr)
+		cfg.Management.AuthTokenStr = ""
 	}
 	if cfg.RadiusAcctSecretStr != "" {
 		cfg.RadiusAcctSecret = securestore.NewSecret(cfg.RadiusAcctSecretStr)

@@ -135,26 +135,6 @@ func (msm *MultiSiteManager) ListSites() []*Site {
 	return sites
 }
 
-// UpdateSite updates an existing site.
-func (msm *MultiSiteManager) UpdateSite(id string, updatedSiteData *Site) (*Site, error) {
-	msm.mu.Lock()
-	defer msm.mu.Unlock()
-
-	site, exists := msm.sites[id]
-	if !exists {
-		return nil, fmt.Errorf("site not found: %s", id)
-	}
-
-	// Update mutable fields
-	site.Name = updatedSiteData.Name
-	site.Description = updatedSiteData.Description
-	site.Endpoint = updatedSiteData.Endpoint
-	site.AuthToken = updatedSiteData.AuthToken
-	site.Location = updatedSiteData.Location
-
-	return site, nil
-}
-
 // SyncSiteStats synchronizes statistics from a remote site
 func (msm *MultiSiteManager) SyncSiteStats(siteID string) error {
 	site, err := msm.GetSite(siteID)

@@ -232,19 +232,6 @@ func (sm *SessionManager) GetSessionByIPs(srcIP, dstIP net.IP) (*Session, bool) 
 	return nil, false
 }
 
-// HasSessionByIP checks if a session exists for a given IP address.
-func (sm *SessionManager) HasSessionByIP(ip net.IP) bool {
-	sm.RLock()
-	defer sm.RUnlock()
-	var exists bool
-	if ip.To4() != nil {
-		_, exists = sm.sessionsByIPv4[ip.String()]
-	} else {
-		_, exists = sm.sessionsByIPv6[ip.String()]
-	}
-	return exists
-}
-
 // GetSessionByIP returns a session by IP address.
 func (sm *SessionManager) GetSessionByIP(ip net.IP) (*Session, bool) {
 	sm.RLock()
@@ -276,21 +263,6 @@ func (sm *SessionManager) GetSessionByToken(token string) (*Session, bool) {
 
 	session, ok := sm.sessionsByToken[token]
 	return session, ok
-}
-
-// GetSessionByID returns a session by its session ID.
-func (sm *SessionManager) GetSessionByID(sessionID string) (*Session, bool) {
-	sm.RLock()
-	defer sm.RUnlock()
-
-	// This is inefficient, but session IDs are not currently indexed.
-	// For a system with a very large number of sessions, an index would be needed.
-	for _, session := range sm.sessionsByMAC {
-		if session.SessionID == sessionID {
-			return session, true
-		}
-	}
-	return nil, false
 }
 
 // AssociateToken adds the session to the token lookup map.

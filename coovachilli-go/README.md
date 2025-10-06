@@ -66,6 +66,26 @@ admin_api:
 ```
 For a complete list of available endpoints and their specifications, please see the [Admin API Specification](./docs/ADMIN_API_SPEC.md).
 
+## Remote Management (Pull Model)
+
+In addition to local configuration, CoovaChilli-Go can operate in a "managed" mode. When enabled, the instance acts as a client and fetches its configuration periodically from a central management server. This allows for centralized control of a fleet of CoovaChilli instances.
+
+**How it works:**
+- When enabled, CoovaChilli-Go will contact the configured `server_url` on startup to fetch its initial configuration.
+- It will then periodically poll the server at the specified `sync_interval` to check for updates.
+- If a new configuration is received, it will be applied on-the-fly without service interruption using the built-in hot-reloading mechanism.
+
+**Configuration:**
+To enable remote management, add the following section to your `config.yaml`. The local file will only be used to bootstrap the connection, after which the remote configuration takes precedence.
+```yaml
+management:
+  enabled: true
+  server_url: "http://your-central-server.com"
+  instance_id: "chilli-instance-01"
+  auth_token: "secret-token-for-this-instance"
+  sync_interval: 15m
+```
+
 ## High Availability (Clustering)
 
 The clustering feature allows you to run multiple CoovaChilli-Go instances in a high-availability setup. It operates in an Active/Standby model, where one node actively handles all traffic while others wait to take over in case of a failure.

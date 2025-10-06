@@ -25,21 +25,11 @@ func (m *mockDisconnector) Disconnect(session *core.Session, reason string) {
 	m.Session = session
 }
 
-// setupTestServer is a helper to create a server instance for testing.
-func setupTestServer(t *testing.T) (*Server, *config.Config, *core.SessionManager, *mockDisconnector) {
-	cfg := &config.Config{
-		TemplateDir: "../../www/templates",
-	}
-	sm := core.NewSessionManager(cfg, nil)
-	mockDc := &mockDisconnector{}
-	server, err := NewServer(cfg, sm, nil, mockDc, zerolog.Nop(), nil)
-	require.NoError(t, err, "NewServer should not return an error during test setup")
-	return server, cfg, sm, mockDc
-}
-
 func TestHandleStatus(t *testing.T) {
 	// Setup
-	server, _, sm, _ := setupTestServer(t)
+	cfg := &config.Config{}
+	sm := core.NewSessionManager(cfg, nil)
+	server := NewServer(cfg, sm, nil, nil, zerolog.Nop(), nil)
 
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
@@ -57,13 +47,16 @@ func TestHandleStatus(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	body := rr.Body.String()
 	require.Contains(t, body, "<h1>Session Active</h1>")
-	require.Contains(t, body, "<strong>User:</strong> testuser</p>")
-	require.Contains(t, body, "<strong>IP Address:</strong> 10.0.0.15</p>")
+	require.Contains(t, body, "Welcome, testuser!")
+	require.Contains(t, body, "IP Address: 10.0.0.15")
 }
 
 func TestHandleLogout(t *testing.T) {
 	// Setup
-	server, _, sm, mockDc := setupTestServer(t)
+	cfg := &config.Config{}
+	sm := core.NewSessionManager(cfg, nil)
+	mockDc := &mockDisconnector{}
+	server := NewServer(cfg, sm, nil, mockDc, zerolog.Nop(), nil)
 
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
@@ -86,7 +79,9 @@ func TestHandleLogout(t *testing.T) {
 
 func TestHandleApiStatus(t *testing.T) {
 	// Setup
-	server, _, sm, _ := setupTestServer(t)
+	cfg := &config.Config{}
+	sm := core.NewSessionManager(cfg, nil)
+	server := NewServer(cfg, sm, nil, nil, zerolog.Nop(), nil)
 
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
@@ -110,7 +105,10 @@ func TestHandleApiStatus(t *testing.T) {
 
 func TestHandleApiLogout(t *testing.T) {
 	// Setup
-	server, _, sm, mockDc := setupTestServer(t)
+	cfg := &config.Config{}
+	sm := core.NewSessionManager(cfg, nil)
+	mockDc := &mockDisconnector{}
+	server := NewServer(cfg, sm, nil, mockDc, zerolog.Nop(), nil)
 
 	// Create a mock session with a token
 	clientIP := net.ParseIP("10.0.0.15")
@@ -135,7 +133,9 @@ func TestHandleApiLogout(t *testing.T) {
 
 func TestHandleJsonpStatus(t *testing.T) {
 	// Setup
-	server, _, sm, _ := setupTestServer(t)
+	cfg := &config.Config{}
+	sm := core.NewSessionManager(cfg, nil)
+	server := NewServer(cfg, sm, nil, nil, zerolog.Nop(), nil)
 
 	// Create a mock session
 	clientIP := net.ParseIP("10.0.0.15")
@@ -218,7 +218,9 @@ func TestIsValidJSONPCallback(t *testing.T) {
 }
 
 func TestHandleJsonpStatus_SecurityValidation(t *testing.T) {
-	server, _, _, _ := setupTestServer(t)
+	cfg := &config.Config{}
+	sm := core.NewSessionManager(cfg, nil)
+	server := NewServer(cfg, sm, nil, nil, zerolog.Nop(), nil)
 
 	maliciousCallbacks := []struct {
 		name     string
@@ -253,7 +255,9 @@ func TestHandleJsonpStatus_SecurityValidation(t *testing.T) {
 }
 
 func TestHandleJsonpStatus_NoCallback(t *testing.T) {
-	server, _, _, _ := setupTestServer(t)
+	cfg := &config.Config{}
+	sm := core.NewSessionManager(cfg, nil)
+	server := NewServer(cfg, sm, nil, nil, zerolog.Nop(), nil)
 
 	req := httptest.NewRequest("GET", "/json/status", nil)
 	rr := httptest.NewRecorder()

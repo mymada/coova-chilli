@@ -38,7 +38,7 @@ func (r *Reloader) Register(c Reconfigurable) {
 
 // PerformReload loads the configuration from disk and applies it to all registered components.
 func (r *Reloader) PerformReload() {
-	r.logger.Info().Msg("Starting configuration reload...")
+	r.logger.Info().Msg("Starting configuration reload from file...")
 
 	newConfig, err := Load(r.configPath)
 	if err != nil {
@@ -46,6 +46,12 @@ func (r *Reloader) PerformReload() {
 		return
 	}
 
+	r.ReloadWithConfig(newConfig)
+}
+
+// ReloadWithConfig applies a new configuration object to all registered components.
+func (r *Reloader) ReloadWithConfig(newConfig *Config) {
+	r.logger.Info().Msg("Applying new configuration to all components...")
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
