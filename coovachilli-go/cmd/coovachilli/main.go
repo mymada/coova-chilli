@@ -179,6 +179,7 @@ type application struct {
 	vlanManager       *vlan.VLANManager
 	gdprManager       *gdpr.GDPRManager
 	ssoManager        *sso.SSOManager
+	ssoHandlers       *sso.SSOHandlers // ✅ Added for SSO HTTP handlers
 
 	// Admin modules
 	dashboard         *admin.Dashboard
@@ -369,7 +370,18 @@ func buildApplication(cfg *config.Config, reloader *config.Reloader) (*applicati
 		if err != nil {
 			app.logger.Warn().Err(err).Msg("Failed to initialize SSO manager, continuing without it")
 		} else {
-			app.logger.Info().Msg("SSO manager initialized")
+			// ✅ CORRECTION: Connect SSO with network components
+			ssoHandlers := sso.NewSSOHandlers(app.ssoManager)
+			ssoHandlers.SetSessionManager(sso.NewSessionManagerAdapter(app.sessionManager))
+			ssoHandlers.SetFirewall(app.firewall)
+			ssoHandlers.SetRadiusClient(app.radiusClient)
+			ssoHandlers.SetScriptRunner(app.scriptRunner)
+			ssoHandlers.SetConfig(cfg)
+
+			// Store handlers for HTTP server integration
+			app.ssoHandlers = ssoHandlers
+
+			app.logger.Info().Msg("SSO manager initialized and connected to network components")
 		}
 	}
 

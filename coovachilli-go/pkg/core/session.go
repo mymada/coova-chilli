@@ -78,6 +78,77 @@ type Session struct {
 	EAPOL EAPOLState
 }
 
+// GetIP returns the client IP address
+func (s *Session) GetIP() net.IP {
+	return s.HisIP
+}
+
+// GetMAC returns the client MAC address
+func (s *Session) GetMAC() net.HardwareAddr {
+	return s.HisMAC
+}
+
+// SetAuthenticated sets the authentication status
+func (s *Session) SetAuthenticated(authenticated bool) {
+	s.Authenticated = authenticated
+}
+
+// SetUsername sets the username in redir state
+func (s *Session) SetUsername(username string) {
+	s.Redir.Username = username
+}
+
+// SetSessionParams sets the session parameters (for role application)
+func (s *Session) SetSessionParams(params interface{}) {
+	// Type assertion to handle auth.SessionParams
+	if authParams, ok := params.(struct {
+		SessionTimeout   uint32
+		IdleTimeout      uint32
+		BandwidthMaxUp   uint64
+		BandwidthMaxDown uint64
+		MaxInputOctets   uint64
+		MaxOutputOctets  uint64
+		MaxTotalOctets   uint64
+		InterimInterval  uint32
+		FilterID         string
+	}); ok {
+		s.SessionParams.SessionTimeout = authParams.SessionTimeout
+		s.SessionParams.IdleTimeout = authParams.IdleTimeout
+		s.SessionParams.BandwidthMaxUp = authParams.BandwidthMaxUp
+		s.SessionParams.BandwidthMaxDown = authParams.BandwidthMaxDown
+		s.SessionParams.MaxInputOctets = authParams.MaxInputOctets
+		s.SessionParams.MaxOutputOctets = authParams.MaxOutputOctets
+		s.SessionParams.MaxTotalOctets = authParams.MaxTotalOctets
+		s.SessionParams.InterimInterval = authParams.InterimInterval
+		s.SessionParams.FilterID = authParams.FilterID
+	}
+}
+
+// GetSessionParams returns current session parameters
+func (s *Session) GetSessionParams() interface{} {
+	return struct {
+		SessionTimeout   uint32
+		IdleTimeout      uint32
+		BandwidthMaxUp   uint64
+		BandwidthMaxDown uint64
+		MaxInputOctets   uint64
+		MaxOutputOctets  uint64
+		MaxTotalOctets   uint64
+		InterimInterval  uint32
+		FilterID         string
+	}{
+		SessionTimeout:   s.SessionParams.SessionTimeout,
+		IdleTimeout:      s.SessionParams.IdleTimeout,
+		BandwidthMaxUp:   s.SessionParams.BandwidthMaxUp,
+		BandwidthMaxDown: s.SessionParams.BandwidthMaxDown,
+		MaxInputOctets:   s.SessionParams.MaxInputOctets,
+		MaxOutputOctets:  s.SessionParams.MaxOutputOctets,
+		MaxTotalOctets:   s.SessionParams.MaxTotalOctets,
+		InterimInterval:  s.SessionParams.InterimInterval,
+		FilterID:         s.SessionParams.FilterID,
+	}
+}
+
 // SessionParams holds RADIUS-provisioned session parameters.
 type SessionParams struct {
 	SessionTimeout   uint32
@@ -123,11 +194,14 @@ type SessionManager struct {
 	sessionsByIPv4  map[string]*Session
 	sessionsByIPv6  map[string]*Session
 	sessionsByMAC   map[string]*Session
-	sessionsByToken map[string]*Session
+	sessionsByToken map[string]*Session // ✅ Deprecated - use tokenManager
 	recorder        metrics.Recorder
 	cfg             *config.Config
 	sessionCount    int // Track total sessions
 	hooks           SessionHooks
+
+	// ✅ NEW: Unified token manager (optional)
+	tokenManager interface{}  // Can be set to *token.Manager
 }
 
 // NewSessionManager creates a new SessionManager.
@@ -150,6 +224,13 @@ func (sm *SessionManager) SetHooks(hooks SessionHooks) {
 	sm.Lock()
 	defer sm.Unlock()
 	sm.hooks = hooks
+}
+
+// SetTokenManager sets the unified token manager
+func (sm *SessionManager) SetTokenManager(tm interface{}) {
+	sm.Lock()
+	defer sm.Unlock()
+	sm.tokenManager = tm
 }
 
 // StateData is the container for serializing persistent state.

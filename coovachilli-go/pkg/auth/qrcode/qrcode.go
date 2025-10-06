@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"image/png"
 	"io"
 	"sync"
 	"time"

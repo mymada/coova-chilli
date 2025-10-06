@@ -1,77 +1,152 @@
 package dns
 
 import (
+	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"strings"
+	"sync"
 
 	"coovachilli-go/pkg/config"
+
 	"github.com/miekg/dns"
 	"github.com/rs/zerolog"
 )
 
-// GardenInterface defines the methods the DNS proxy needs from the garden service.
-// This is used to break the circular dependency between dns and garden packages.
 type GardenInterface interface {
 	HandleDNSResponse(domain string, ips []net.IP)
 }
 
-// Proxy handles DNS proxying for unauthenticated clients.
 type Proxy struct {
 	cfg    *config.Config
 	logger zerolog.Logger
-	garden GardenInterface // Interface to the walled garden service
+	garden GardenInterface
+	cache  *DNSCache
 }
 
-// NewProxy creates a new DNS proxy.
 func NewProxy(cfg *config.Config, logger zerolog.Logger, garden GardenInterface) *Proxy {
 	return &Proxy{
 		cfg:    cfg,
 		logger: logger.With().Str("component", "dns").Logger(),
 		garden: garden,
+		cache:  NewDNSCache(),
 	}
 }
 
-// HandleQuery forwards a DNS query to an upstream server and notifies the
-// walled garden of the response. It takes the raw DNS query payload and returns
-// the raw DNS response payload.
 func (p *Proxy) HandleQuery(queryPayload []byte) ([]byte, error) {
 	req := new(dns.Msg)
 	if err := req.Unpack(queryPayload); err != nil {
-		return nil, fmt.Errorf("failed to unpack dns query: %w", err)
+		p.logger.Error().Err(err).Msg("Failed to unpack DNS query")
+		return nil, fmt.Errorf("failed to unpack DNS query: %w", err)
 	}
 
 	if len(req.Question) == 0 {
-		return nil, fmt.Errorf("received dns query with no questions")
+		p.logger.Error().Msg("Received DNS query with no questions")
+		return nil, fmt.Errorf("received DNS query with no questions")
 	}
 
 	qname := req.Question[0].Name
 	p.logger.Debug().Str("qname", qname).Msg("Handling DNS query")
 
-	// Create a new DNS client
-	c := new(dns.Client)
-	// Use the configured DNS servers
-	upstreamAddr := net.JoinHostPort(p.cfg.DNS1.String(), "53")
-
-	// Forward the request to the upstream server
-	resp, _, err := c.Exchange(req, upstreamAddr)
-	if err != nil {
-		p.logger.Error().Err(err).Str("qname", qname).Msg("Failed to forward DNS query to upstream")
-		// Try the secondary DNS server if the first one fails
-		if p.cfg.DNS2 != nil {
-			p.logger.Debug().Str("dns_server", p.cfg.DNS2.String()).Msg("Trying secondary DNS server")
-			upstreamAddr = net.JoinHostPort(p.cfg.DNS2.String(), "53")
-			resp, _, err = c.Exchange(req, upstreamAddr)
-			if err != nil {
-				p.logger.Error().Err(err).Str("qname", qname).Msg("Failed to forward DNS query to secondary upstream")
-				return nil, err
-			}
-		} else {
-			return nil, err
-		}
+	if !isValidDomain(qname) {
+		p.logger.Error().Str("qname", qname).Msg("Invalid domain name in DNS query")
+		return nil, fmt.Errorf("invalid domain name in DNS query")
 	}
 
-	// If the response is successful, extract IPs and notify the garden
+	if ips, ok := p.cache.Get(qname); ok {
+		resp := new(dns.Msg)
+		resp.SetReply(req)
+		for _, ip := range ips {
+			if ip.To4() != nil {
+				resp.Answer = append(resp.Answer, &dns.A{
+					Hdr: dns.RR_Header{Name: qname, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+					A:   ip,
+				})
+			} else {
+				resp.Answer = append(resp.Answer, &dns.AAAA{
+					Hdr:  dns.RR_Header{Name: qname, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 300},
+					AAAA: ip,
+				})
+			}
+		}
+		respBytes, err := resp.Pack()
+		if err != nil {
+			return nil, fmt.Errorf("failed to pack cached dns response: %w", err)
+		}
+		return respBytes, nil
+	}
+
+	encryptedPayload, err := encryptPayload(queryPayload)
+	if err != nil {
+		p.logger.Error().Err(err).Msg("Failed to encrypt DNS query payload")
+		return nil, fmt.Errorf("failed to encrypt DNS query payload: %w", err)
+	}
+
+	upstreamAddrs := []string{net.JoinHostPort(p.cfg.DNS1.String(), "53")}
+	if p.cfg.DNS2 != nil {
+		upstreamAddrs = append(upstreamAddrs, net.JoinHostPort(p.cfg.DNS2.String(), "53"))
+	}
+
+	var resp *dns.Msg
+	var lastErr error
+
+	for _, addr := range upstreamAddrs {
+		p.logger.Debug().Str("dns_server", addr).Msg("Trying DNS server")
+
+		tlsConfig := &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			MaxVersion: tls.VersionTLS13,
+		}
+		conn, err := tls.Dial("tcp", addr, tlsConfig)
+		if err != nil {
+			p.logger.Error().Err(err).Str("dns_server", addr).Msg("Failed to connect to DNS server")
+			lastErr = err
+			continue
+		}
+		defer conn.Close()
+
+		_, err = conn.Write(encryptedPayload)
+		if err != nil {
+			p.logger.Error().Err(err).Msg("Failed to send DNS query payload")
+			lastErr = err
+			continue
+		}
+
+		respBytes, err := io.ReadAll(conn)
+		if err != nil {
+			p.logger.Error().Err(err).Msg("Failed to read DNS response payload")
+			lastErr = err
+			continue
+		}
+
+		decryptedPayload, err := decryptPayload(respBytes)
+		if err != nil {
+			p.logger.Error().Err(err).Msg("Failed to decrypt DNS response payload")
+			lastErr = err
+			continue
+		}
+
+		resp = new(dns.Msg)
+		if err := resp.Unpack(decryptedPayload); err != nil {
+			p.logger.Error().Err(err).Msg("Failed to unpack DNS response")
+			lastErr = err
+			continue
+		}
+		if !isValidDNSResponse(resp) {
+			p.logger.Error().Msg("Invalid DNS response")
+			lastErr = fmt.Errorf("invalid DNS response")
+			continue
+		}
+
+		break
+	}
+
+	if lastErr != nil && resp == nil {
+		p.logger.Error().Err(lastErr).Str("qname", qname).Msg("Failed to forward DNS query to all upstream servers")
+		return nil, fmt.Errorf("failed to forward DNS query: %w", lastErr)
+	}
+
 	if resp != nil && resp.Rcode == dns.RcodeSuccess {
 		var ips []net.IP
 		for _, ans := range resp.Answer {
@@ -82,22 +157,79 @@ func (p *Proxy) HandleQuery(queryPayload []byte) ([]byte, error) {
 				ips = append(ips, rec.AAAA)
 			}
 		}
-
-		if len(ips) > 0 && p.garden != nil {
-			// Trim the trailing dot from the domain name before sending to garden
-			trimmedDomain := qname
-			if strings.HasSuffix(qname, ".") {
-				trimmedDomain = qname[:len(qname)-1]
+		if len(ips) > 0 {
+			domain := strings.TrimSuffix(qname, ".")
+			p.cache.Set(qname, ips)
+			if p.garden != nil {
+				p.garden.HandleDNSResponse(domain, ips)
 			}
-			p.garden.HandleDNSResponse(trimmedDomain, ips)
 		}
 	}
 
-	// Pack the response message back into bytes
 	respBytes, err := resp.Pack()
 	if err != nil {
 		return nil, fmt.Errorf("failed to pack dns response: %w", err)
 	}
-
 	return respBytes, nil
+}
+
+func isValidDomain(domain string) bool {
+	if len(domain) == 0 || len(domain) > 253 {
+		return false
+	}
+	for _, c := range domain {
+		if !isValidDomainChar(c) {
+			return false
+		}
+	}
+	return true
+}
+
+func isValidDomainChar(c rune) bool {
+	return (c >= 'a' && c <= 'z') ||
+	       (c >= 'A' && c <= 'Z') ||
+	       (c >= '0' && c <= '9') ||
+	       c == '.' || c == '-' || c == '_'
+}
+
+type DNSCache struct {
+	cache map[string][]net.IP
+	mu    sync.Mutex
+}
+
+func NewDNSCache() *DNSCache {
+	return &DNSCache{
+		cache: make(map[string][]net.IP),
+	}
+}
+
+func (c *DNSCache) Get(domain string) ([]net.IP, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ips, ok := c.cache[domain]
+	return ips, ok
+}
+
+func (c *DNSCache) Set(domain string, ips []net.IP) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cache[domain] = ips
+}
+
+func encryptPayload(payload []byte) ([]byte, error) {
+	// TODO: Implement proper encryption
+	return payload, nil
+}
+
+func decryptPayload(payload []byte) ([]byte, error) {
+	// TODO: Implement proper decryption
+	return payload, nil
+}
+
+func isValidDNSResponse(resp *dns.Msg) bool {
+	if resp == nil {
+		return false
+	}
+	// Basic validation
+	return resp.Rcode == dns.RcodeSuccess || resp.Rcode == dns.RcodeNameError
 }

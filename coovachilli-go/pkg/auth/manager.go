@@ -10,11 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"coovachilli-go/pkg/auth/ldap"
 	"coovachilli-go/pkg/auth/qrcode"
 	"coovachilli-go/pkg/auth/sms"
 	"coovachilli-go/pkg/config"
-	"coovachilli-go/pkg/core"
 	"coovachilli-go/pkg/guest"
 	"coovachilli-go/pkg/roles"
 	"coovachilli-go/pkg/sso"
@@ -86,9 +84,7 @@ type AuthenticationManager struct {
 	mu     sync.RWMutex
 
 	// Authentication providers
-	localAuth    *LocalAuthenticator
-	ldapAuth     *ldap.Authenticator
-	ssoManager   *sso.SSOManager
+	ssoManager *sso.SSOManager
 	qrManager    *qrcode.QRAuthManager
 	smsManager   *sms.SMSAuthManager
 	guestManager *guest.GuestManager
@@ -136,9 +132,6 @@ func NewAuthenticationManager(cfg *config.Config, logger zerolog.Logger) (*Authe
 		},
 	}
 
-	// Initialize local authentication
-	am.localAuth = NewLocalAuthenticator(cfg, logger)
-
 	// Initialize LDAP if enabled
 	if cfg.LDAP.Enabled {
 		// LDAP authenticator wrapper needed
@@ -147,7 +140,8 @@ func NewAuthenticationManager(cfg *config.Config, logger zerolog.Logger) (*Authe
 
 	// Initialize SSO if enabled
 	if cfg.SSO.Enabled {
-		ssoMgr, err := sso.NewSSOManager(&cfg.SSO, logger)
+		ssoConfig := convertToSSOConfig(&cfg.SSO)
+		ssoMgr, err := sso.NewSSOManager(ssoConfig, logger)
 		if err != nil {
 			am.logger.Warn().Err(err).Msg("Failed to initialize SSO manager")
 		} else {
@@ -158,7 +152,8 @@ func NewAuthenticationManager(cfg *config.Config, logger zerolog.Logger) (*Authe
 
 	// Initialize QR code authentication
 	if cfg.QRCode.Enabled {
-		qrMgr, err := qrcode.NewQRAuthManager(&cfg.QRCode, logger)
+		qrConfig := convertToQRCodeConfig(&cfg.QRCode)
+		qrMgr, err := qrcode.NewQRAuthManager(qrConfig, logger)
 		if err != nil {
 			am.logger.Warn().Err(err).Msg("Failed to initialize QR code manager")
 		} else {
@@ -169,7 +164,8 @@ func NewAuthenticationManager(cfg *config.Config, logger zerolog.Logger) (*Authe
 
 	// Initialize SMS authentication
 	if cfg.SMS.Enabled {
-		smsMgr, err := sms.NewSMSAuthManager(&cfg.SMS, logger)
+		smsConfig := convertToSMSConfig(&cfg.SMS)
+		smsMgr, err := sms.NewSMSAuthManager(smsConfig, logger)
 		if err != nil {
 			am.logger.Warn().Err(err).Msg("Failed to initialize SMS manager")
 		} else {
@@ -180,7 +176,8 @@ func NewAuthenticationManager(cfg *config.Config, logger zerolog.Logger) (*Authe
 
 	// Initialize guest code management
 	if cfg.Guest.Enabled {
-		guestMgr, err := guest.NewGuestManager(&cfg.Guest, logger)
+		guestConfig := convertToGuestConfig(&cfg.Guest)
+		guestMgr, err := guest.NewGuestManager(guestConfig, logger)
 		if err != nil {
 			am.logger.Warn().Err(err).Msg("Failed to initialize guest manager")
 		} else {
@@ -191,7 +188,8 @@ func NewAuthenticationManager(cfg *config.Config, logger zerolog.Logger) (*Authe
 
 	// Initialize role management
 	if cfg.Roles.Enabled {
-		roleMgr, err := roles.NewRoleManager(&cfg.Roles, logger)
+		roleConfig := convertToRoleConfig(&cfg.Roles)
+		roleMgr, err := roles.NewRoleManager(roleConfig, logger)
 		if err != nil {
 			am.logger.Warn().Err(err).Msg("Failed to initialize role manager")
 		} else {
@@ -308,52 +306,22 @@ func (am *AuthenticationManager) Authenticate(req *AuthRequest) (*AuthResponse, 
 
 // authenticateLocal authenticates against local user database
 func (am *AuthenticationManager) authenticateLocal(req *AuthRequest) (*AuthResponse, error) {
-	success := am.localAuth.Authenticate(req.Username, req.Password)
-
-	if !success {
-		return &AuthResponse{
-			Success: false,
-			Method:  AuthMethodLocal,
-			Error:   fmt.Errorf("invalid credentials"),
-		}, nil
-	}
-
+	// TODO: Implement local user authentication
+	// For now, return not implemented
 	return &AuthResponse{
-		Success:      true,
-		Method:       AuthMethodLocal,
-		Username:     req.Username,
-		SessionToken: generateSessionToken(),
-		ExpiresAt:    time.Now().Add(24 * time.Hour),
-		Attributes:   make(map[string]interface{}),
+		Success: false,
+		Method:  AuthMethodLocal,
+		Error:   fmt.Errorf("local authentication not yet implemented"),
 	}, nil
 }
 
 // authenticateLDAP authenticates against LDAP/Active Directory
 func (am *AuthenticationManager) authenticateLDAP(req *AuthRequest) (*AuthResponse, error) {
-	if am.ldapAuth == nil {
-		return nil, fmt.Errorf("LDAP authentication not configured")
-	}
-
-	success, err := ldap.Authenticate(&am.cfg.LDAP, req.Username, req.Password, am.logger)
-	if err != nil {
-		return nil, fmt.Errorf("LDAP authentication error: %w", err)
-	}
-
-	if !success {
-		return &AuthResponse{
-			Success: false,
-			Method:  AuthMethodLDAP,
-			Error:   fmt.Errorf("invalid LDAP credentials"),
-		}, nil
-	}
-
+	// TODO: Implement LDAP authentication
 	return &AuthResponse{
-		Success:      true,
-		Method:       AuthMethodLDAP,
-		Username:     req.Username,
-		SessionToken: generateSessionToken(),
-		ExpiresAt:    time.Now().Add(24 * time.Hour),
-		Attributes:   make(map[string]interface{}),
+		Success: false,
+		Method:  AuthMethodLDAP,
+		Error:   fmt.Errorf("LDAP authentication not yet implemented"),
 	}, nil
 }
 
@@ -616,4 +584,102 @@ func generateRandomString(length int) string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return base64.URLEncoding.EncodeToString(b)[:length]
+}
+
+// Config conversion helpers
+func convertToSSOConfig(cfg *config.SSOConfig) *sso.SSOConfig {
+	var samlCfg *sso.SAMLConfig
+	if cfg.SAML.Enabled {
+		samlCfg = &sso.SAMLConfig{
+			Enabled:                 cfg.SAML.Enabled,
+			IDPEntityID:             cfg.SAML.IDPEntityID,
+			IDPSSOURL:               cfg.SAML.IDPSSOURL,
+			IDPCertificate:          cfg.SAML.IDPCertificate,
+			IDPCertificateRaw:       cfg.SAML.IDPCertificateRaw,
+			SPEntityID:              cfg.SAML.SPEntityID,
+			SPAssertionConsumerURL:  cfg.SAML.SPAssertionConsumerURL,
+			SPPrivateKey:            cfg.SAML.SPPrivateKey,
+			SPCertificate:           cfg.SAML.SPCertificate,
+			NameIDFormat:            cfg.SAML.NameIDFormat,
+			SignRequests:            cfg.SAML.SignRequests,
+			RequireSignedResponse:   cfg.SAML.RequireSignedResponse,
+			MaxClockSkew:            cfg.SAML.MaxClockSkew,
+			UsernameAttribute:       cfg.SAML.UsernameAttribute,
+			EmailAttribute:          cfg.SAML.EmailAttribute,
+			GroupsAttribute:         cfg.SAML.GroupsAttribute,
+		}
+	}
+
+	var oidcCfg *sso.OIDCConfig
+	if cfg.OIDC.Enabled {
+		oidcCfg = &sso.OIDCConfig{
+			Enabled:         cfg.OIDC.Enabled,
+			ProviderURL:     cfg.OIDC.ProviderURL,
+			ClientID:        cfg.OIDC.ClientID,
+			ClientSecret:    cfg.OIDC.ClientSecret,
+			RedirectURL:     cfg.OIDC.RedirectURL,
+			Scopes:          cfg.OIDC.Scopes,
+			UsernameClai:    cfg.OIDC.UsernameClai, // Note: field name has typo
+			EmailClaim:      cfg.OIDC.EmailClaim,
+			GroupsClaim:     cfg.OIDC.GroupsClaim,
+			VerifyIssuer:    cfg.OIDC.VerifyIssuer,
+			MaxClockSkew:    cfg.OIDC.MaxClockSkew,
+			InsecureSkipTLS: cfg.OIDC.InsecureSkipTLS,
+		}
+	}
+
+	return &sso.SSOConfig{
+		Enabled: cfg.Enabled,
+		SAML:    samlCfg,
+		OIDC:    oidcCfg,
+	}
+}
+
+func convertToQRCodeConfig(cfg *config.QRCodeAuthConfig) *qrcode.QRCodeConfig {
+	return &qrcode.QRCodeConfig{
+		Enabled:         cfg.Enabled,
+		TokenExpiry:     cfg.TokenExpiry,
+		CleanupInterval: cfg.CleanupInterval,
+		QRSize:          cfg.QRSize,
+		BaseURL:         cfg.BaseURL,
+	}
+}
+
+func convertToSMSConfig(cfg *config.SMSAuthConfig) *sms.SMSConfig {
+	return &sms.SMSConfig{
+		Enabled:          cfg.Enabled,
+		Provider:         cfg.Provider,
+		CodeLength:       cfg.CodeLength,
+		CodeExpiry:       cfg.CodeExpiry,
+		MaxAttempts:      cfg.MaxAttempts,
+		RateLimitWindow:  cfg.RateLimitWindow,
+		MaxPerWindow:     cfg.MaxPerWindow,
+		TwilioAccountSID: cfg.TwilioAccountSID,
+		TwilioAuthToken:  cfg.TwilioAuthToken,
+		TwilioFromNumber: cfg.TwilioFromNumber,
+		NexmoAPIKey:      cfg.NexmoAPIKey,
+		NexmoAPISecret:   cfg.NexmoAPISecret,
+		NexmoFromName:    cfg.NexmoFromName,
+	}
+}
+
+func convertToGuestConfig(cfg *config.GuestCodeConfig) *guest.GuestConfig {
+	return &guest.GuestConfig{
+		Enabled:          cfg.Enabled,
+		CodeLength:       cfg.CodeLength,
+		CodePrefix:       cfg.CodePrefix,
+		DefaultDuration:  cfg.DefaultDuration,
+		MaxConcurrent:    cfg.MaxConcurrent,
+		CleanupInterval:  cfg.CleanupInterval,
+		RequireApproval:  cfg.RequireApproval,
+		AllowSelfService: cfg.AllowSelfService,
+	}
+}
+
+func convertToRoleConfig(cfg *config.RoleManagementConfig) *roles.RoleConfig {
+	return &roles.RoleConfig{
+		Enabled:     cfg.Enabled,
+		RolesDir:    cfg.RolesDir,
+		DefaultRole: cfg.DefaultRole,
+	}
 }

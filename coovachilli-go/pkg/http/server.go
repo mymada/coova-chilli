@@ -264,13 +264,22 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			session.Unlock()
 			s.sessionManager.AssociateToken(session)
 
-			http.SetCookie(w, &http.Cookie{
+			// ✅ CORRECTION: Secure cookie settings
+			cookie := &http.Cookie{
 				Name:     sessionCookieName,
 				Value:    token,
 				Expires:  time.Now().Add(24 * time.Hour),
 				HttpOnly: true,
 				Path:     "/",
-			})
+				SameSite: http.SameSiteStrictMode, // ✅ CSRF protection
+			}
+
+			// Set Secure flag if using HTTPS
+			if s.cfg.CertFile != "" && s.cfg.KeyFile != "" {
+				cookie.Secure = true // ✅ HTTPS only
+			}
+
+			http.SetCookie(w, cookie)
 
 			http.Redirect(w, r, "/status", http.StatusFound)
 		} else {

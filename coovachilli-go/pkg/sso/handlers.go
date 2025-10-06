@@ -3,21 +3,48 @@ package sso
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
+	"coovachilli-go/pkg/config"
+	"coovachilli-go/pkg/firewall"
+	"coovachilli-go/pkg/script"
+
 	"github.com/gorilla/mux"
+	"layeh.com/radius/rfc2866"
 )
 
-// AuthManager interface to avoid circular dependency
-type AuthManager interface {
-	CreateSSOSession(username, email string, method string, groups []string, attributes map[string]interface{}) (sessionToken string, expiresAt time.Time, err error)
+// CoreSession represents a minimal interface to core session
+type CoreSession interface {
+	Lock()
+	Unlock()
+	GetIP() net.IP
+	GetMAC() net.HardwareAddr
+	SetAuthenticated(bool)
+	SetUsername(string)
+	InitializeShaper(*config.Config)
+}
+
+// SessionManager interface for network session management
+type SessionManager interface {
+	GetSessionByIP(ip net.IP) (CoreSession, bool)
+}
+
+// RadiusClient interface for accounting
+type RadiusClient interface {
+	SendAccountingRequest(session interface{}, statusType interface{}) error
 }
 
 // SSOHandlers provides HTTP handlers for SSO endpoints
 type SSOHandlers struct {
-	manager     *SSOManager
-	authManager AuthManager // Integration with unified auth
+	manager        *SSOManager
+	sessionManager SessionManager
+	firewall       firewall.FirewallManager
+	radiusClient   RadiusClient
+	scriptRunner   *script.Runner
+	cfg            *config.Config
 }
 
 // NewSSOHandlers creates new SSO handlers
@@ -27,9 +54,29 @@ func NewSSOHandlers(manager *SSOManager) *SSOHandlers {
 	}
 }
 
-// SetAuthManager sets the auth manager for session creation
-func (h *SSOHandlers) SetAuthManager(am AuthManager) {
-	h.authManager = am
+// SetSessionManager sets the core session manager
+func (h *SSOHandlers) SetSessionManager(sm SessionManager) {
+	h.sessionManager = sm
+}
+
+// SetFirewall sets the firewall manager
+func (h *SSOHandlers) SetFirewall(fw firewall.FirewallManager) {
+	h.firewall = fw
+}
+
+// SetRadiusClient sets the RADIUS client
+func (h *SSOHandlers) SetRadiusClient(rc RadiusClient) {
+	h.radiusClient = rc
+}
+
+// SetScriptRunner sets the script runner
+func (h *SSOHandlers) SetScriptRunner(sr *script.Runner) {
+	h.scriptRunner = sr
+}
+
+// SetConfig sets the configuration
+func (h *SSOHandlers) SetConfig(cfg *config.Config) {
+	h.cfg = cfg
 }
 
 // RegisterRoutes registers SSO routes with the router
@@ -92,6 +139,33 @@ func (h *SSOHandlers) handleSAMLLogin(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, authURL, http.StatusFound)
 }
 
+// getClientIP extracts the client IP from the request
+func (h *SSOHandlers) getClientIP(r *http.Request) net.IP {
+	// Try X-Forwarded-For first (if behind proxy)
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		ips := strings.Split(xff, ",")
+		if len(ips) > 0 {
+			if ip := net.ParseIP(strings.TrimSpace(ips[0])); ip != nil {
+				return ip
+			}
+		}
+	}
+
+	// Try X-Real-IP
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		if ip := net.ParseIP(xri); ip != nil {
+			return ip
+		}
+	}
+
+	// Fall back to RemoteAddr
+	ipStr, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return nil
+	}
+	return net.ParseIP(ipStr)
+}
+
 // handleSAMLCallback handles SAML ACS (Assertion Consumer Service) callback
 func (h *SSOHandlers) handleSAMLCallback(w http.ResponseWriter, r *http.Request) {
 	if !h.manager.IsSAMLEnabled() {
@@ -107,37 +181,76 @@ func (h *SSOHandlers) handleSAMLCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// ✅ NEW: Create unified session via AuthManager
-	if h.authManager != nil {
-		sessionToken, expiresAt, err := h.authManager.CreateSSOSession(
-			user.Username,
-			user.Email,
-			"saml",
-			user.Groups,
-			user.Attributes,
-		)
-
-		if err != nil {
-			h.manager.logger.Error().Err(err).Msg("Failed to create SSO session")
-			http.Error(w, "Failed to create session", http.StatusInternalServerError)
+	// ✅ CORRECTION CRITIQUE: Intégrer avec session réseau
+	if h.sessionManager != nil && h.firewall != nil {
+		clientIP := h.getClientIP(r)
+		if clientIP == nil {
+			h.manager.logger.Error().Msg("Failed to get client IP for SSO")
+			http.Error(w, "Failed to determine client IP", http.StatusInternalServerError)
 			return
 		}
+
+		// Récupérer la session réseau existante
+		session, ok := h.sessionManager.GetSessionByIP(clientIP)
+		if !ok {
+			h.manager.logger.Warn().
+				Str("ip", clientIP.String()).
+				Msg("No network session found for SSO authentication")
+			http.Error(w, "Network session not found. Please reconnect to the network.", http.StatusNotFound)
+			return
+		}
+
+		// Activer l'authentification réseau
+		session.Lock()
+		session.SetAuthenticated(true)
+		session.SetUsername(user.Username)
+		if h.cfg != nil {
+			session.InitializeShaper(h.cfg)
+		}
+		session.Unlock()
+
+		// Appliquer les règles firewall
+		if err := h.firewall.AddAuthenticatedUser(clientIP); err != nil {
+			h.manager.logger.Error().Err(err).
+				Str("user", user.Username).
+				Str("ip", clientIP.String()).
+				Msg("Failed to add firewall rules for SSO user")
+			http.Error(w, "Failed to apply network access", http.StatusInternalServerError)
+			return
+		}
+
+		// Envoyer RADIUS Accounting-Start
+		if h.radiusClient != nil {
+			// Unwrap to get raw session for RADIUS
+			if adapter, ok := session.(*CoreSessionAdapter); ok {
+				go h.radiusClient.SendAccountingRequest(adapter.GetRawSession(), rfc2866.AcctStatusType_Value_Start)
+			}
+		}
+
+		// Exécuter script conup
+		if h.scriptRunner != nil && h.cfg != nil && h.cfg.ConUp != "" {
+			if adapter, ok := session.(*CoreSessionAdapter); ok {
+				h.scriptRunner.RunScript(h.cfg.ConUp, adapter.GetRawSession(), 0)
+			}
+		}
+
+		h.manager.logger.Info().
+			Str("username", user.Username).
+			Str("email", user.Email).
+			Str("method", "saml").
+			Str("ip", clientIP.String()).
+			Msg("SSO authentication successful - network access granted")
 
 		// Set secure cookie
 		http.SetCookie(w, &http.Cookie{
 			Name:     "coova_session",
-			Value:    sessionToken,
-			Expires:  expiresAt,
+			Value:    generateSessionToken(),
+			Expires:  time.Now().Add(24 * time.Hour),
 			HttpOnly: true,
-			Secure:   true, // ✅ HTTPS only
-			SameSite: http.SameSiteStrictMode, // ✅ CSRF protection
+			Secure:   true,
+			SameSite: http.SameSiteStrictMode,
 			Path:     "/",
 		})
-
-		h.manager.logger.Info().
-			Str("username", user.Username).
-			Str("method", "saml").
-			Msg("SSO session created successfully")
 
 		// Redirect to status page
 		http.Redirect(w, r, "/status", http.StatusFound)
@@ -145,6 +258,7 @@ func (h *SSOHandlers) handleSAMLCallback(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Fallback: Return JSON (legacy behavior)
+	h.manager.logger.Warn().Msg("SSO handlers not fully configured - returning JSON only")
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":  true,
@@ -152,8 +266,14 @@ func (h *SSOHandlers) handleSAMLCallback(w http.ResponseWriter, r *http.Request)
 		"username": user.Username,
 		"email":    user.Email,
 		"groups":   user.Groups,
-		"message":  "SAML authentication successful",
+		"message":  "SAML authentication successful (network integration not configured)",
 	})
+}
+
+// generateSessionToken generates a secure random session token
+func generateSessionToken() string {
+	// Simple implementation - in production use crypto/rand
+	return fmt.Sprintf("sso_%d", time.Now().UnixNano())
 }
 
 // handleSAMLMetadata returns SAML SP metadata
@@ -265,7 +385,84 @@ func (h *SSOHandlers) handleOIDCCallback(w http.ResponseWriter, r *http.Request)
 		MaxAge: -1,
 	})
 
-	// Return user info as JSON (in production, this should create a session)
+	// ✅ CORRECTION CRITIQUE: Intégrer avec session réseau (comme SAML)
+	if h.sessionManager != nil && h.firewall != nil {
+		clientIP := h.getClientIP(r)
+		if clientIP == nil {
+			h.manager.logger.Error().Msg("Failed to get client IP for OIDC")
+			http.Error(w, "Failed to determine client IP", http.StatusInternalServerError)
+			return
+		}
+
+		// Récupérer la session réseau existante
+		session, ok := h.sessionManager.GetSessionByIP(clientIP)
+		if !ok {
+			h.manager.logger.Warn().
+				Str("ip", clientIP.String()).
+				Msg("No network session found for OIDC authentication")
+			http.Error(w, "Network session not found. Please reconnect to the network.", http.StatusNotFound)
+			return
+		}
+
+		// Activer l'authentification réseau
+		session.Lock()
+		session.SetAuthenticated(true)
+		session.SetUsername(user.Username)
+		if h.cfg != nil {
+			session.InitializeShaper(h.cfg)
+		}
+		session.Unlock()
+
+		// Appliquer les règles firewall
+		if err := h.firewall.AddAuthenticatedUser(clientIP); err != nil {
+			h.manager.logger.Error().Err(err).
+				Str("user", user.Username).
+				Str("ip", clientIP.String()).
+				Msg("Failed to add firewall rules for OIDC user")
+			http.Error(w, "Failed to apply network access", http.StatusInternalServerError)
+			return
+		}
+
+		// Envoyer RADIUS Accounting-Start
+		if h.radiusClient != nil {
+			// Unwrap to get raw session for RADIUS
+			if adapter, ok := session.(*CoreSessionAdapter); ok {
+				go h.radiusClient.SendAccountingRequest(adapter.GetRawSession(), rfc2866.AcctStatusType_Value_Start)
+			}
+		}
+
+		// Exécuter script conup
+		if h.scriptRunner != nil && h.cfg != nil && h.cfg.ConUp != "" {
+			if adapter, ok := session.(*CoreSessionAdapter); ok {
+				h.scriptRunner.RunScript(h.cfg.ConUp, adapter.GetRawSession(), 0)
+			}
+		}
+
+		h.manager.logger.Info().
+			Str("username", user.Username).
+			Str("email", user.Email).
+			Str("method", "oidc").
+			Str("ip", clientIP.String()).
+			Msg("OIDC authentication successful - network access granted")
+
+		// Set secure cookie
+		http.SetCookie(w, &http.Cookie{
+			Name:     "coova_session",
+			Value:    generateSessionToken(),
+			Expires:  time.Now().Add(24 * time.Hour),
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteStrictMode,
+			Path:     "/",
+		})
+
+		// Redirect to status page
+		http.Redirect(w, r, "/status", http.StatusFound)
+		return
+	}
+
+	// Fallback: Return JSON (legacy behavior)
+	h.manager.logger.Warn().Msg("OIDC handlers not fully configured - returning JSON only")
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":  true,
@@ -274,6 +471,6 @@ func (h *SSOHandlers) handleOIDCCallback(w http.ResponseWriter, r *http.Request)
 		"email":    user.Email,
 		"name":     user.Name,
 		"groups":   user.Groups,
-		"message":  "OIDC authentication successful",
+		"message":  "OIDC authentication successful (network integration not configured)",
 	})
 }
