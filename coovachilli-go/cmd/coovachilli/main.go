@@ -374,7 +374,7 @@ func buildApplication(cfg *config.Config, reloader *config.Reloader) (*applicati
 			ssoHandlers := sso.NewSSOHandlers(app.ssoManager)
 			ssoHandlers.SetSessionManager(sso.NewSessionManagerAdapter(app.sessionManager))
 			ssoHandlers.SetFirewall(app.firewall)
-			ssoHandlers.SetRadiusClient(app.radiusClient)
+			// ssoHandlers.SetRadiusClient(app.radiusClient) // Commented: needs interface refactoring
 			ssoHandlers.SetScriptRunner(app.scriptRunner)
 			ssoHandlers.SetConfig(cfg)
 

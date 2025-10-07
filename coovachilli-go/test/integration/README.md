@@ -1,17 +1,20 @@
-# Tests d'Intégration CoovaChilli-Go
+# CoovaChilli-Go - Integration Tests
 
-Suite de tests end-to-end pour CoovaChilli-Go avec DHCP, RADIUS, IPv4/IPv6, iptables/ufw.
+Complete E2E test suite for CoovaChilli-Go with SSO, FAS, VLAN, and RADIUS support.
 
 ## 🚀 Quick Start
 
 ```bash
-# Lancer tous les tests
-./run_tests_local.sh
+# Build application
+cd ../.. && make build && cd test/integration
 
-# Tests spécifiques
-./run_tests_local.sh ipv4-iptables
+# Run all E2E tests (SSO, FAS, VLAN)
+docker compose -f docker-compose.full-e2e.yml up --abort-on-container-exit
 
-# Déboguer (laisse les conteneurs actifs)
+# Run basic tests (IPv4/IPv6)
+./run_tests_local.sh ipv4-iptables yes
+
+# Debug mode (keeps containers running)
 ./run_tests_local.sh ipv4-iptables no
 ```
 
@@ -19,32 +22,61 @@ Suite de tests end-to-end pour CoovaChilli-Go avec DHCP, RADIUS, IPv4/IPv6, ipta
 
 ```
 test/integration/
-├── docker-compose.e2e.yml      # Configuration Docker Compose principale
-├── Dockerfile.chilli           # Image CoovaChilli pour tests
-├── Dockerfile.client           # Image client de test
-├── entrypoint.sh               # Script de démarrage CoovaChilli
-├── run_tests_local.sh          # Script pour exécution locale
+├── docker-compose.e2e.yml        # Basic tests (IPv4/IPv6)
+├── docker-compose.full-e2e.yml   # Complete E2E stack (SSO/FAS/VLAN)
+├── Dockerfile.chilli             # CoovaChilli image
+├── Dockerfile.client             # Test client image
+├── entrypoint.sh                 # CoovaChilli startup script
+├── run_tests_local.sh            # Local test runner
 │
-├── config.iptables.yaml        # Config CoovaChilli pour iptables
-├── config.ufw.yaml             # Config CoovaChilli pour ufw
+├── config.*.yaml                 # Test configurations
+│   ├── config.iptables.yaml      # iptables config
+│   ├── config.ufw.yaml           # ufw config
+│   ├── config.saml.yaml          # SAML SSO config
+│   ├── config.oidc.yaml          # OIDC SSO config
+│   ├── config.fas.yaml           # FAS config
+│   └── config.vlan.yaml          # VLAN config
 │
 ├── radius/
-│   ├── clients.conf            # Configuration clients RADIUS
-│   └── users                   # Base utilisateurs de test
+│   ├── clients.conf              # RADIUS client config
+│   └── users                     # Test users database
+│
+├── fas/
+│   ├── Dockerfile                # FAS mock server
+│   ├── server.py                 # Python Flask FAS server
+│   └── requirements.txt          # Python dependencies
 │
 ├── tests/
-│   └── run_e2e_tests.sh        # Script de test principal
+│   ├── run_e2e_tests.sh          # Basic E2E tests
+│   ├── run_sso_tests.sh          # SSO tests (SAML/OIDC)
+│   ├── run_fas_tests.sh          # FAS tests
+│   ├── run_vlan_tests.sh         # VLAN tests
+│   └── run_radius_tests.sh       # RADIUS tests
 │
 ├── www/
-│   └── index.html              # Page web de test
+│   └── index.html                # Test web page
 │
-├── nginx.conf                  # Configuration nginx
-└── results/                    # Résultats des tests (généré)
+├── nginx.conf                    # Nginx config
+├── E2E_TESTING_GUIDE.md          # Complete documentation
+└── results/                      # Test results (generated)
 ```
 
-## 🧪 Tests exécutés
+## 🧪 Test Suites
 
-### Configuration testée
+### E2E Test Suites (Full Stack)
+
+| Suite | Tests | Description | Command |
+|-------|-------|-------------|---------|
+| **SSO (SAML)** | 8 | SAML 2.0 authentication | `docker compose -f docker-compose.full-e2e.yml run --rm client-saml` |
+| **SSO (OIDC)** | 8 | OpenID Connect auth | `docker compose -f docker-compose.full-e2e.yml run --rm client-oidc` |
+| **FAS** | 10 | Forward Auth Service | `docker compose -f docker-compose.full-e2e.yml run --rm client-fas` |
+| **VLAN 100** | 10 | VLAN tagging/isolation | `docker compose -f docker-compose.full-e2e.yml run --rm client-vlan-100` |
+| **VLAN 200** | 10 | VLAN tagging/isolation | `docker compose -f docker-compose.full-e2e.yml run --rm client-vlan-200` |
+| **RADIUS** | 18 | RADIUS protocol | See E2E_TESTING_GUIDE.md |
+
+**Total E2E Tests:** 54+
+
+### Basic Tests (IPv4/IPv6)
 
 | Config | IPv4 | IPv6 | Firewall | Tests |
 |--------|------|------|----------|-------|
@@ -53,22 +85,28 @@ test/integration/
 | 3 | ✅ | ❌ | ufw | 12 |
 | 4 | ❌ | ✅ | ufw | 12 |
 
-**Total : 48 tests**
+**Total Basic Tests:** 48
 
-### Scénarios
+### Test Coverage
 
 1. ✅ Network Interface Check
 2. ✅ DHCP IP Allocation (IPv4/IPv6)
 3. ✅ DNS Resolution
 4. ✅ Internet Blocked Before Auth
 5. ✅ Captive Portal Redirect
-6. ✅ RADIUS Authentication
+6. ✅ RADIUS Authentication (PAP/CHAP)
 7. ✅ Internet Access After Auth
 8. ✅ Firewall Rules Verification
 9. ✅ Session Status API
-10. ✅ Bandwidth Test
-11. ✅ Metrics Endpoint (Prometheus)
-12. ✅ Admin API
+10. ✅ SSO Authentication (SAML/OIDC)
+11. ✅ FAS Token Lifecycle
+12. ✅ VLAN Assignment & Isolation
+13. ✅ Bandwidth Test & QoS
+14. ✅ Metrics Endpoint (Prometheus)
+15. ✅ Admin API
+16. ✅ CoA (Change of Authorization)
+17. ✅ Disconnect-Message
+18. ✅ Accounting (Start/Interim/Stop)
 
 ## 🛠️ Commandes utiles
 
@@ -117,14 +155,26 @@ jq -r '.summary.success_rate' results/test_*.json
 jq -r '.tests[] | select(.status == "fail") | .name' results/test_*.json
 ```
 
-## 🌐 Utilisateurs de test
+## 🌐 Test Credentials
 
-| Username | Password | Timeout | Bandwidth |
-|----------|----------|---------|-----------|
-| testuser | testpass | 3600s | 10 Mbps |
-| limiteduser | limitedpass | 1800s | 1 Mbps |
-| shortuser | shortpass | 300s | Unlimited |
-| ipv6user | ipv6pass | 3600s | 10 Mbps (IPv6) |
+### RADIUS Users
+
+| Username | Password | Timeout | Bandwidth | VLAN |
+|----------|----------|---------|-----------|------|
+| testuser | testpass | 3600s | 10 Mbps | - |
+| user1 | user1pass | 3600s | 10 Mbps | - |
+| vlan100user | testpass | 3600s | 5 Mbps | 100 |
+| vlan200user | testpass | 3600s | 5 Mbps | 200 |
+| limiteduser | limitedpass | 1800s | 1 Mbps | - |
+| shortuser | shortpass | 300s | Unlimited | - |
+| ipv6user | ipv6pass | 3600s | 10 Mbps (IPv6) | - |
+
+### Admin Access
+
+- **Keycloak (OIDC):** http://localhost:8090 (admin/admin123)
+- **SAML IdP:** http://localhost:8091
+- **FAS Server:** http://localhost:8081
+- **Prometheus:** http://localhost:9090
 
 ## 📊 Résultats
 
@@ -159,16 +209,32 @@ Les clients de test utilisent :
 - `TEST_PASS` - Password RADIUS (testpass)
 - `FIREWALL_TYPE` - `iptables` ou `ufw`
 
-### Ports exposés
+### Service Ports
 
-| Service | Port | Description |
-|---------|------|-------------|
-| CoovaChilli UAM | 8080 | Portail captif HTTP |
-| CoovaChilli Metrics | 9090 | Prometheus metrics |
-| CoovaChilli Admin | 8081 | API d'administration |
-| FreeRADIUS Auth | 1812 | RADIUS authentication |
-| FreeRADIUS Acct | 1813 | RADIUS accounting |
-| Nginx | 80 | Serveur web de test |
+#### CoovaChilli Instances
+
+| Instance | Admin API | Portal | Metrics | Auth Method |
+|----------|-----------|--------|---------|-------------|
+| chilli-saml | 3990 | 8080 | 2112 | SAML |
+| chilli-oidc | 3991 | 8081 | 2113 | OIDC |
+| chilli-fas | 3992 | 8082 | 2114 | FAS |
+| chilli-vlan | 3993 | 8083 | 2115 | VLAN |
+| chilli-iptables | 8081 | 8080 | 9090 | Basic |
+| chilli-ufw | 8082 | 8080 | 9091 | Basic |
+
+#### Backend Services
+
+| Service | Port | Protocol | Description |
+|---------|------|----------|-------------|
+| RADIUS Auth | 1812 | UDP | RADIUS authentication |
+| RADIUS Acct | 1813 | UDP | RADIUS accounting |
+| RADIUS CoA | 3799 | UDP | Change of Authorization |
+| FAS Server | 8081 | HTTP | Forward Auth Service |
+| Keycloak | 8090 | HTTP | OIDC Provider |
+| SAML IdP | 8091 | HTTP | SAML 2.0 IdP |
+| PostgreSQL | 5432 | TCP | Database |
+| Prometheus | 9090 | HTTP | Metrics |
+| Nginx | 8888 | HTTP | Test web server |
 
 ## 🐛 Dépannage
 
@@ -218,24 +284,71 @@ docker compose exec chilli-iptables ip6tables -L -n -v
 docker compose exec chilli-ufw ufw status verbose
 ```
 
-## 📚 Documentation complète
+## 📚 Complete Documentation
 
-Voir [docs/INTEGRATION_TESTING.md](../../docs/INTEGRATION_TESTING.md) pour :
+**For detailed information, see [E2E_TESTING_GUIDE.md](./E2E_TESTING_GUIDE.md)**
 
-- Architecture détaillée
-- Guide CI/CD
-- Contribution
-- Métriques de qualité
-- Références
+Topics covered:
+- **Architecture** - Network topology, service components
+- **Test Scenarios** - Detailed test descriptions
+- **Running Tests** - All execution methods
+- **CI/CD Integration** - GitHub Actions workflow
+- **Troubleshooting** - Common issues and solutions
+- **Advanced Testing** - Load testing, custom scenarios
+- **Contributing** - How to add new tests
 
-## 🤝 Contribution
+## 🚀 CI/CD Integration
 
-Pour ajouter un nouveau test :
+Tests run automatically via GitHub Actions:
 
-1. Éditer `tests/run_e2e_tests.sh`
-2. Ajouter fonction `test_nouvelle_feature()`
-3. Appeler via `run_test "Nom" test_nouvelle_feature`
+```yaml
+# Workflow file: .github/workflows/e2e-tests.yml
+
+# Triggers:
+- Push to main/develop
+- Pull requests
+- Daily schedule (2 AM UTC)
+- Manual workflow dispatch
+```
+
+**Test Jobs:**
+1. Basic Tests (IPv4/IPv6 × iptables/ufw)
+2. SSO Tests (SAML + OIDC)
+3. FAS Tests
+4. VLAN Tests (VLAN 100 + 200)
+5. RADIUS Tests (Auth, Accounting, CoA, DM)
+6. Performance Tests (1000 concurrent sessions)
+7. Security Tests (Gosec + Trivy)
+8. Report Generation
+
+## 🤝 Contributing
+
+To add a new test:
+
+1. Create test script in `tests/run_YOUR_test.sh`
+2. Add Docker client service in `docker-compose.full-e2e.yml`
+3. Add GitHub Actions job in `.github/workflows/e2e-tests.yml`
+4. Update documentation
+
+**Test Standards:**
+- Use bash for test scripts
+- Include colored output (RED/GREEN)
+- Track pass/fail counts
+- Write results to `/results/`
+- Exit with proper code (0=pass, 1=fail)
+- Include descriptive test names
+
+## 📞 Support
+
+- **Issues:** https://github.com/your-org/coovachilli-go/issues
+- **Discussions:** https://github.com/your-org/coovachilli-go/discussions
+- **Documentation:** [E2E_TESTING_GUIDE.md](./E2E_TESTING_GUIDE.md)
 
 ## 📝 License
 
-Même licence que le projet principal CoovaChilli-Go.
+Same license as the main CoovaChilli-Go project.
+
+---
+
+**Last Updated:** 2025-01-10
+**Test Coverage:** 100+ E2E tests across all components

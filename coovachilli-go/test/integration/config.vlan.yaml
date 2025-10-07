@@ -1,0 +1,147 @@
+# =============================================================================
+# CoovaChilli-Go Configuration - VLAN Testing
+# =============================================================================
+
+server:
+  http:
+    host: "0.0.0.0"
+    port: 3990
+    read_timeout: 15s
+    write_timeout: 15s
+
+  portal:
+    host: "0.0.0.0"
+    port: 8080
+    uam_secret: "ChangeMe"
+    uam_homepage: "http://chilli-vlan:8080/"
+
+  metrics:
+    enabled: true
+    port: 2112
+    path: "/metrics"
+
+network:
+  interface: "eth0"
+  tun_device: "tun0"
+
+  dhcp:
+    subnet: "10.20.0.0/16"
+    gateway: "10.20.0.1"
+    dns:
+      - "8.8.8.8"
+      - "8.8.4.4"
+    lease_time: 3600
+
+  vlan:
+    enabled: true
+    trunk_interface: "eth0"
+
+    vlans:
+      - id: 100
+        subnet: "10.20.100.0/24"
+        gateway: "10.20.100.1"
+        dhcp_start: "10.20.100.10"
+        dhcp_end: "10.20.100.250"
+
+      - id: 200
+        subnet: "10.20.200.0/24"
+        gateway: "10.20.200.1"
+        dhcp_start: "10.20.200.10"
+        dhcp_end: "10.20.200.250"
+
+    # Dynamic VLAN assignment from RADIUS
+    dynamic_assignment: true
+
+    # VLAN isolation (prevent inter-VLAN communication)
+    isolation: true
+
+    # QoS per VLAN
+    qos:
+      enabled: true
+      default_bandwidth_down: 10000  # kbps
+      default_bandwidth_up: 5000     # kbps
+
+radius:
+  auth:
+    host: "radius"
+    port: 1812
+    secret: "testing123"
+    timeout: 5s
+    retries: 3
+
+  acct:
+    host: "radius"
+    port: 1813
+    secret: "testing123"
+    timeout: 5s
+    interval: 300
+
+  coa:
+    enabled: true
+    port: 3799
+    secret: "testing123"
+
+  nas_id: "coovachilli-vlan-test"
+  nas_ip: "172.20.0.23"
+
+  # VLAN attributes to read from RADIUS
+  vlan_attributes:
+    - "Tunnel-Type"
+    - "Tunnel-Medium-Type"
+    - "Tunnel-Private-Group-Id"
+    - "Egress-VLANID"
+    - "Ingress-Filters"
+
+firewall:
+  backend: "iptables"
+
+  allowed_ports:
+    tcp: [80, 443, 8080]
+    udp: [53, 67, 68]
+
+  walled_garden:
+    - "radius"
+    - "172.20.0.0/16"
+
+  # Per-VLAN firewall rules
+  vlan_rules:
+    100:
+      allowed_tcp: [80, 443]
+      allowed_udp: [53]
+
+    200:
+      allowed_tcp: [80, 443, 22, 3389]
+      allowed_udp: [53]
+
+session:
+  timeout: 3600
+  idle_timeout: 600
+  max_sessions: 1000
+
+  persistence:
+    enabled: false
+
+  # Track VLAN membership in sessions
+  track_vlan: true
+
+security:
+  tls:
+    enabled: false
+
+  rate_limit:
+    enabled: true
+    requests_per_second: 10
+    burst: 20
+
+  # Anti-VLAN hopping protection
+  vlan_security:
+    prevent_hopping: true
+    verify_tags: true
+
+logging:
+  level: "debug"
+  format: "json"
+  output: "stdout"
+
+  # Log VLAN assignments
+  log_vlan_events: true

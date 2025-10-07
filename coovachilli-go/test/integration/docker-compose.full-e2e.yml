@@ -1,0 +1,538 @@
+version: '3.8'
+
+# =============================================================================
+# COMPLETE E2E TEST STACK - CoovaChilli-Go
+# =============================================================================
+# Includes: RADIUS, SSO (SAML/OIDC), FAS, VLAN, Full Network Simulation
+# =============================================================================
+
+services:
+  # ==========================================================================
+  # BACKEND SERVICES
+  # ==========================================================================
+
+  # FreeRADIUS Server (Authentication + Accounting + CoA)
+  radius:
+    image: freeradius/freeradius-server:latest
+    container_name: radius-server
+    hostname: radius
+    volumes:
+      - ./radius/clients.conf:/etc/raddb/clients.conf
+      - ./radius/users:/etc/raddb/mods-config/files/authorize
+      - ./radius/dictionary:/etc/raddb/dictionary
+      - ./radius/eap.conf:/etc/raddb/mods-available/eap
+    networks:
+      backend:
+        ipv4_address: 172.20.0.10
+    ports:
+      - "1812:1812/udp"  # Auth
+      - "1813:1813/udp"  # Acct
+      - "3799:3799/udp"  # CoA/DM
+    healthcheck:
+      test: ["CMD", "radtest", "testuser", "testpass", "localhost", "0", "testing123"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: radiusd -X
+
+  # FAS Server (Forward Authentication Service)
+  fas-server:
+    build:
+      context: ./fas
+      dockerfile: Dockerfile
+    container_name: fas-server
+    hostname: fas
+    environment:
+      - FAS_SECRET=supersecretfaskey123456789
+      - FAS_PORT=8081
+      - FAS_DB_PATH=/data/fas.db
+      - RADIUS_HOST=radius
+      - RADIUS_SECRET=testing123
+    volumes:
+      - fas-data:/data
+    networks:
+      backend:
+        ipv4_address: 172.20.0.11
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Keycloak (OIDC Provider)
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    container_name: keycloak
+    hostname: keycloak
+    environment:
+      - KEYCLOAK_ADMIN=admin
+      - KEYCLOAK_ADMIN_PASSWORD=admin123
+      - KC_HTTP_PORT=8080
+      - KC_HOSTNAME_STRICT=false
+      - KC_HOSTNAME_STRICT_HTTPS=false
+      - KC_HTTP_ENABLED=true
+    volumes:
+      - keycloak-data:/opt/keycloak/data
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm.json
+    networks:
+      backend:
+        ipv4_address: 172.20.0.12
+    ports:
+      - "8090:8080"
+    command:
+      - start-dev
+      - --import-realm
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  # SimpleSAMLphp (SAML IdP)
+  saml-idp:
+    image: kristophjunge/test-saml-idp:latest
+    container_name: saml-idp
+    hostname: saml
+    environment:
+      - SIMPLESAMLPHP_SP_ENTITY_ID=http://chilli-saml/saml/metadata
+      - SIMPLESAMLPHP_SP_ASSERTION_CONSUMER_SERVICE=http://chilli-saml:3990/sso/saml/acs
+      - SIMPLESAMLPHP_SP_SINGLE_LOGOUT_SERVICE=http://chilli-saml:3990/sso/saml/slo
+    networks:
+      backend:
+        ipv4_address: 172.20.0.13
+    ports:
+      - "8091:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/simplesaml/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # PostgreSQL (for session persistence testing)
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres-db
+    hostname: postgres
+    environment:
+      - POSTGRES_DB=coovachilli
+      - POSTGRES_USER=chilli
+      - POSTGRES_PASSWORD=chillipass
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      backend:
+        ipv4_address: 172.20.0.14
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chilli"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Prometheus (Metrics Collection)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    hostname: prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    networks:
+      backend:
+        ipv4_address: 172.20.0.15
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+  # ==========================================================================
+  # COOVACHILLI INSTANCES
+  # ==========================================================================
+
+  # CoovaChilli with SSO (SAML)
+  chilli-saml:
+    build:
+      context: ../..
+      dockerfile: test/integration/Dockerfile.chilli
+    container_name: chilli-saml
+    hostname: chilli-saml
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      - FIREWALL_BACKEND=iptables
+      - SSO_ENABLED=true
+      - SSO_TYPE=saml
+    volumes:
+      - ./config.saml.yaml:/app/config.yaml
+      - /lib/modules:/lib/modules:ro
+    networks:
+      backend:
+        ipv4_address: 172.20.0.20
+      hotspot_saml:
+        ipv4_address: 10.10.0.1
+        ipv6_address: fd10:10::1
+    ports:
+      - "3990:3990"  # Admin API
+      - "8080:8080"  # UAM Portal
+      - "2112:2112"  # Metrics
+    depends_on:
+      radius:
+        condition: service_healthy
+      saml-idp:
+        condition: service_healthy
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+
+  # CoovaChilli with SSO (OIDC)
+  chilli-oidc:
+    build:
+      context: ../..
+      dockerfile: test/integration/Dockerfile.chilli
+    container_name: chilli-oidc
+    hostname: chilli-oidc
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      - FIREWALL_BACKEND=iptables
+      - SSO_ENABLED=true
+      - SSO_TYPE=oidc
+    volumes:
+      - ./config.oidc.yaml:/app/config.yaml
+      - /lib/modules:/lib/modules:ro
+    networks:
+      backend:
+        ipv4_address: 172.20.0.21
+      hotspot_oidc:
+        ipv4_address: 10.11.0.1
+        ipv6_address: fd10:11::1
+    ports:
+      - "3991:3990"
+      - "8081:8080"
+      - "2113:2112"
+    depends_on:
+      radius:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+
+  # CoovaChilli with FAS
+  chilli-fas:
+    build:
+      context: ../..
+      dockerfile: test/integration/Dockerfile.chilli
+    container_name: chilli-fas
+    hostname: chilli-fas
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      - FIREWALL_BACKEND=iptables
+      - FAS_ENABLED=true
+    volumes:
+      - ./config.fas.yaml:/app/config.yaml
+      - /lib/modules:/lib/modules:ro
+    networks:
+      backend:
+        ipv4_address: 172.20.0.22
+      hotspot_fas:
+        ipv4_address: 10.12.0.1
+        ipv6_address: fd10:12::1
+    ports:
+      - "3992:3990"
+      - "8082:8080"
+      - "2114:2112"
+    depends_on:
+      radius:
+        condition: service_healthy
+      fas-server:
+        condition: service_healthy
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+
+  # CoovaChilli with VLAN Tagging
+  chilli-vlan:
+    build:
+      context: ../..
+      dockerfile: test/integration/Dockerfile.chilli
+    container_name: chilli-vlan
+    hostname: chilli-vlan
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      - FIREWALL_BACKEND=iptables
+      - VLAN_ENABLED=true
+    volumes:
+      - ./config.vlan.yaml:/app/config.yaml
+      - /lib/modules:/lib/modules:ro
+    networks:
+      backend:
+        ipv4_address: 172.20.0.23
+      hotspot_vlan:
+    ports:
+      - "3993:3990"
+      - "8083:8080"
+      - "2115:2112"
+    depends_on:
+      radius:
+        condition: service_healthy
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+
+  # ==========================================================================
+  # TEST INFRASTRUCTURE
+  # ==========================================================================
+
+  # Test Web Server (Internet simulation)
+  webserver:
+    image: nginx:alpine
+    container_name: webserver
+    hostname: www
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./www:/usr/share/nginx/html:ro
+    networks:
+      backend:
+        ipv4_address: 172.20.0.100
+    ports:
+      - "8888:80"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost/"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # VLAN Switch Simulator
+  vlan-switch:
+    image: alpine:latest
+    container_name: vlan-switch
+    hostname: switch
+    cap_add:
+      - NET_ADMIN
+    networks:
+      hotspot_vlan:
+      vlan_100:
+      vlan_200:
+    command: >
+      sh -c "apk add --no-cache vlan &&
+             modprobe 8021q &&
+             sleep infinity"
+
+  # ==========================================================================
+  # TEST CLIENTS
+  # ==========================================================================
+
+  # SSO SAML Test Client
+  client-saml:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: client-saml
+    hostname: client-saml
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - TEST_TYPE=sso-saml
+      - CHILLI_HOST=10.10.0.1
+      - CHILLI_UAM_PORT=8080
+      - SAML_IDP_URL=http://saml:8080/simplesaml/
+      - TEST_USER=user1
+      - TEST_PASS=user1pass
+    volumes:
+      - ./tests:/tests:ro
+      - ./results:/results
+    networks:
+      hotspot_saml:
+    depends_on:
+      chilli-saml:
+        condition: service_started
+      webserver:
+        condition: service_healthy
+    command: ["/tests/run_sso_tests.sh", "saml"]
+
+  # SSO OIDC Test Client
+  client-oidc:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: client-oidc
+    hostname: client-oidc
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - TEST_TYPE=sso-oidc
+      - CHILLI_HOST=10.11.0.1
+      - CHILLI_UAM_PORT=8080
+      - OIDC_PROVIDER_URL=http://keycloak:8080
+      - TEST_USER=testuser
+      - TEST_PASS=testpass123
+    volumes:
+      - ./tests:/tests:ro
+      - ./results:/results
+    networks:
+      hotspot_oidc:
+    depends_on:
+      chilli-oidc:
+        condition: service_started
+      keycloak:
+        condition: service_healthy
+    command: ["/tests/run_sso_tests.sh", "oidc"]
+
+  # FAS Test Client
+  client-fas:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: client-fas
+    hostname: client-fas
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - TEST_TYPE=fas
+      - CHILLI_HOST=10.12.0.1
+      - CHILLI_UAM_PORT=8080
+      - FAS_URL=http://fas:8081
+      - TEST_USER=testuser
+      - TEST_PASS=testpass
+    volumes:
+      - ./tests:/tests:ro
+      - ./results:/results
+    networks:
+      hotspot_fas:
+    depends_on:
+      chilli-fas:
+        condition: service_started
+      fas-server:
+        condition: service_healthy
+    command: ["/tests/run_fas_tests.sh"]
+
+  # VLAN Test Clients
+  client-vlan-100:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: client-vlan-100
+    hostname: client-vlan100
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - TEST_TYPE=vlan
+      - VLAN_ID=100
+      - CHILLI_HOST=10.20.100.1
+      - TEST_USER=vlan100user
+      - TEST_PASS=testpass
+    volumes:
+      - ./tests:/tests:ro
+      - ./results:/results
+    networks:
+      vlan_100:
+    depends_on:
+      - chilli-vlan
+    command: ["/tests/run_vlan_tests.sh", "100"]
+
+  client-vlan-200:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: client-vlan-200
+    hostname: client-vlan200
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - TEST_TYPE=vlan
+      - VLAN_ID=200
+      - CHILLI_HOST=10.20.200.1
+      - TEST_USER=vlan200user
+      - TEST_PASS=testpass
+    volumes:
+      - ./tests:/tests:ro
+      - ./results:/results
+    networks:
+      vlan_200:
+    depends_on:
+      - chilli-vlan
+    command: ["/tests/run_vlan_tests.sh", "200"]
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+networks:
+  # Backend network (RADIUS, DB, SSO servers)
+  backend:
+    driver: bridge
+    enable_ipv6: false
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1
+
+  # Hotspot networks
+  hotspot_saml:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 10.10.0.0/24
+        - subnet: fd10:10::/64
+
+  hotspot_oidc:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 10.11.0.0/24
+        - subnet: fd10:11::/64
+
+  hotspot_fas:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 10.12.0.0/24
+        - subnet: fd10:12::/64
+
+  hotspot_vlan:
+    driver: macvlan
+    driver_opts:
+      parent: eth0
+    ipam:
+      config:
+        - subnet: 10.20.0.0/16
+
+  vlan_100:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.20.100.0/24
+
+  vlan_200:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.20.200.0/24
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  fas-data:
+  keycloak-data:
+  postgres-data:
+  prometheus-data:

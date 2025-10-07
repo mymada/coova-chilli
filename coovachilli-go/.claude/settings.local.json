@@ -15,7 +15,10 @@
       "Bash(./verify_setup.sh:*)",
       "Bash(sed:*)",
       "Bash(go doc:*)",
-      "Bash(go mod:*)"
+      "Bash(go mod:*)",
+      "Bash(if [ -f coovachilli_optimized ])",
+      "Bash(then ls -lh coovachilli_optimized coovachilli)",
+      "Bash(fi)"
     ],
     "deny": [],
     "ask": []

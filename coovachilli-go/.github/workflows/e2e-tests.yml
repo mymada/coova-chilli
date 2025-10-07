@@ -1,0 +1,418 @@
+name: E2E Tests - Complete Stack
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run every day at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      test_suite:
+        description: 'Test suite to run'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - sso
+          - fas
+          - vlan
+          - radius
+          - basic
+
+env:
+  GO_VERSION: '1.21'
+  DOCKER_BUILDKIT: 1
+  COMPOSE_DOCKER_CLI_BUILD: 1
+
+jobs:
+  # ==========================================================================
+  # BASIC TESTS (IPv4/IPv6, iptables/ufw)
+  # ==========================================================================
+  basic-tests:
+    name: Basic Tests (IPv4/IPv6, Firewall)
+    runs-on: ubuntu-latest
+    if: |
+      github.event.inputs.test_suite == 'all' ||
+      github.event.inputs.test_suite == 'basic' ||
+      github.event.inputs.test_suite == ''
+
+    strategy:
+      matrix:
+        test_type: [ipv4-iptables, ipv6-iptables, ipv4-ufw, ipv6-ufw]
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Enable IPv6 in Docker
+        run: |
+          sudo cat /etc/docker/daemon.json 2>/dev/null || echo '{}'
+          echo '{
+            "ipv6": true,
+            "fixed-cidr-v6": "2001:db8:1::/64",
+            "experimental": true,
+            "ip6tables": true
+          }' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          sleep 5
+
+      - name: Build Go application
+        run: make build
+
+      - name: Run ${{ matrix.test_type }} tests
+        working-directory: test/integration
+        run: |
+          ./run_tests_local.sh ${{ matrix.test_type }} yes
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: basic-test-results-${{ matrix.test_type }}
+          path: test/integration/results/
+          retention-days: 30
+
+  # ==========================================================================
+  # SSO TESTS (SAML + OIDC)
+  # ==========================================================================
+  sso-tests:
+    name: SSO Tests (SAML + OIDC)
+    runs-on: ubuntu-latest
+    if: |
+      github.event.inputs.test_suite == 'all' ||
+      github.event.inputs.test_suite == 'sso' ||
+      github.event.inputs.test_suite == ''
+
+    strategy:
+      matrix:
+        sso_type: [saml, oidc]
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build application
+        run: make build
+
+      - name: Run ${{ matrix.sso_type }} SSO tests
+        working-directory: test/integration
+        run: |
+          docker compose -f docker-compose.full-e2e.yml build
+          docker compose -f docker-compose.full-e2e.yml run --rm client-${{ matrix.sso_type }}
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          docker compose -f test/integration/docker-compose.full-e2e.yml logs > sso-${{ matrix.sso_type }}-logs.txt
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: sso-test-results-${{ matrix.sso_type }}
+          path: |
+            test/integration/results/
+            sso-${{ matrix.sso_type }}-logs.txt
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose -f test/integration/docker-compose.full-e2e.yml down -v
+
+  # ==========================================================================
+  # FAS TESTS
+  # ==========================================================================
+  fas-tests:
+    name: FAS Tests
+    runs-on: ubuntu-latest
+    if: |
+      github.event.inputs.test_suite == 'all' ||
+      github.event.inputs.test_suite == 'fas' ||
+      github.event.inputs.test_suite == ''
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build application
+        run: make build
+
+      - name: Run FAS tests
+        working-directory: test/integration
+        run: |
+          docker compose -f docker-compose.full-e2e.yml build
+          docker compose -f docker-compose.full-e2e.yml run --rm client-fas
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: fas-test-results
+          path: test/integration/results/
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose -f test/integration/docker-compose.full-e2e.yml down -v
+
+  # ==========================================================================
+  # VLAN TESTS
+  # ==========================================================================
+  vlan-tests:
+    name: VLAN Tests
+    runs-on: ubuntu-latest
+    if: |
+      github.event.inputs.test_suite == 'all' ||
+      github.event.inputs.test_suite == 'vlan' ||
+      github.event.inputs.test_suite == ''
+
+    strategy:
+      matrix:
+        vlan_id: [100, 200]
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Load 8021q kernel module
+        run: |
+          sudo modprobe 8021q
+          lsmod | grep 8021q
+
+      - name: Build application
+        run: make build
+
+      - name: Run VLAN ${{ matrix.vlan_id }} tests
+        working-directory: test/integration
+        run: |
+          docker compose -f docker-compose.full-e2e.yml build
+          docker compose -f docker-compose.full-e2e.yml run --rm client-vlan-${{ matrix.vlan_id }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: vlan-test-results-${{ matrix.vlan_id }}
+          path: test/integration/results/
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose -f test/integration/docker-compose.full-e2e.yml down -v
+
+  # ==========================================================================
+  # RADIUS TESTS (Auth, Accounting, CoA)
+  # ==========================================================================
+  radius-tests:
+    name: RADIUS Tests
+    runs-on: ubuntu-latest
+    if: |
+      github.event.inputs.test_suite == 'all' ||
+      github.event.inputs.test_suite == 'radius' ||
+      github.event.inputs.test_suite == ''
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install radtest
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y freeradius-utils
+
+      - name: Build application
+        run: make build
+
+      - name: Run RADIUS tests
+        working-directory: test/integration
+        run: |
+          docker compose -f docker-compose.full-e2e.yml up -d radius chilli-fas
+          sleep 10
+
+          # Test RADIUS auth
+          docker compose -f docker-compose.full-e2e.yml exec -T radius \
+            radtest testuser testpass localhost 0 testing123
+
+          # Run full RADIUS test suite
+          bash tests/run_radius_tests.sh
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: radius-test-results
+          path: test/integration/results/
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose -f test/integration/docker-compose.full-e2e.yml down -v
+
+  # ==========================================================================
+  # PERFORMANCE TESTS
+  # ==========================================================================
+  performance-tests:
+    name: Performance & Load Tests
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_suite == 'all' || github.event.inputs.test_suite == ''
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build optimized binary
+        run: make build-optimized
+
+      - name: Run benchmarks
+        run: |
+          go test -bench=. -benchmem -run=^$ ./pkg/... | tee benchmark-results.txt
+
+      - name: Run load tests
+        working-directory: test/integration
+        run: |
+          docker compose -f docker-compose.full-e2e.yml up -d
+          sleep 15
+
+          # Simulate 1000 concurrent sessions
+          bash tests/run_load_tests.sh 1000
+
+      - name: Upload performance results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-results
+          path: |
+            benchmark-results.txt
+            test/integration/results/load-*
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose -f test/integration/docker-compose.full-e2e.yml down -v
+
+  # ==========================================================================
+  # SECURITY TESTS
+  # ==========================================================================
+  security-tests:
+    name: Security Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Gosec (Security Scanner)
+        uses: securego/gosec@master
+        with:
+          args: '-no-fail -fmt sarif -out gosec-results.sarif ./...'
+
+      - name: Upload Gosec results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: gosec-results.sarif
+
+      - name: Run Trivy (Container Scanner)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ==========================================================================
+  # REPORT GENERATION
+  # ==========================================================================
+  generate-report:
+    name: Generate Test Report
+    runs-on: ubuntu-latest
+    needs: [basic-tests, sso-tests, fas-tests, vlan-tests, radius-tests]
+    if: always()
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Generate summary report
+        run: |
+          echo "# CoovaChilli-Go E2E Test Results" > test-report.md
+          echo "" >> test-report.md
+          echo "**Date**: $(date)" >> test-report.md
+          echo "**Commit**: ${{ github.sha }}" >> test-report.md
+          echo "" >> test-report.md
+          echo "## Test Summary" >> test-report.md
+
+          # Aggregate results
+          find . -name "*.txt" -type f | while read file; do
+            echo "### $(basename $file .txt)" >> test-report.md
+            tail -20 "$file" >> test-report.md
+            echo "" >> test-report.md
+          done
+
+      - name: Upload report
+        uses: actions/upload-artifact@v3
+        with:
+          name: complete-test-report
+          path: test-report.md
+          retention-days: 90
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('test-report.md', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });

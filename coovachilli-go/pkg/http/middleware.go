@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
 	"golang.org/x/time/rate"
@@ -12,22 +13,35 @@ import (
 // RateLimiterMiddleware holds the state for the rate limiting middleware.
 type RateLimiterMiddleware struct {
 	logger         zerolog.Logger
-	clients        map[string]*rate.Limiter
+	clients        map[string]*rateLimiterEntry
 	mu             sync.Mutex
 	rate           rate.Limit
 	burst          int
 	enabled        bool
 }
 
+// rateLimiterEntry tracks a rate limiter and its last access time
+type rateLimiterEntry struct {
+	limiter    *rate.Limiter
+	lastAccess time.Time
+}
+
 // NewRateLimiter creates a new rate limiting middleware.
 func NewRateLimiter(logger zerolog.Logger, enabled bool, r float64, b int) *RateLimiterMiddleware {
-	return &RateLimiterMiddleware{
+	rl := &RateLimiterMiddleware{
 		logger:  logger,
-		clients: make(map[string]*rate.Limiter),
+		clients: make(map[string]*rateLimiterEntry),
 		rate:    rate.Limit(r),
 		burst:   b,
 		enabled: enabled,
 	}
+
+	// ✅ OPTIMIZATION: Start automatic cleanup of stale entries
+	if enabled {
+		go rl.cleanupStaleClients()
+	}
+
+	return rl
 }
 
 // getClientLimiter retrieves or creates a rate limiter for a given IP address.
@@ -35,12 +49,42 @@ func (rl *RateLimiterMiddleware) getClientLimiter(ip string) *rate.Limiter {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	limiter, exists := rl.clients[ip]
+	entry, exists := rl.clients[ip]
 	if !exists {
-		limiter = rate.NewLimiter(rl.rate, rl.burst)
-		rl.clients[ip] = limiter
+		entry = &rateLimiterEntry{
+			limiter:    rate.NewLimiter(rl.rate, rl.burst),
+			lastAccess: time.Now(),
+		}
+		rl.clients[ip] = entry
+	} else {
+		entry.lastAccess = time.Now()
 	}
-	return limiter
+	return entry.limiter
+}
+
+// ✅ OPTIMIZATION: Cleanup stale rate limiters to prevent memory leak
+func (rl *RateLimiterMiddleware) cleanupStaleClients() {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		rl.mu.Lock()
+		now := time.Now()
+		staleThreshold := 30 * time.Minute
+		removed := 0
+
+		for ip, entry := range rl.clients {
+			if now.Sub(entry.lastAccess) > staleThreshold {
+				delete(rl.clients, ip)
+				removed++
+			}
+		}
+
+		if removed > 0 {
+			rl.logger.Debug().Int("removed", removed).Int("remaining", len(rl.clients)).Msg("Cleaned up stale rate limiters")
+		}
+		rl.mu.Unlock()
+	}
 }
 
 // Middleware is the actual middleware handler.

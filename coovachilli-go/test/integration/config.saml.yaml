@@ -1,0 +1,114 @@
+# =============================================================================
+# CoovaChilli-Go Configuration - SAML SSO Testing
+# =============================================================================
+
+server:
+  http:
+    host: "0.0.0.0"
+    port: 3990
+    read_timeout: 15s
+    write_timeout: 15s
+
+  portal:
+    host: "0.0.0.0"
+    port: 8080
+    uam_secret: "ChangeMe"
+    uam_homepage: "http://chilli-saml:8080/"
+    redirect_url: "http://saml:8080/simplesaml/"
+
+  metrics:
+    enabled: true
+    port: 2112
+    path: "/metrics"
+
+network:
+  interface: "eth0"
+  tun_device: "tun0"
+
+  dhcp:
+    subnet: "10.10.0.0/24"
+    gateway: "10.10.0.1"
+    dns:
+      - "8.8.8.8"
+      - "8.8.4.4"
+    lease_time: 3600
+
+  ipv6:
+    enabled: true
+    subnet: "fd10:10::/64"
+    gateway: "fd10:10::1"
+
+radius:
+  auth:
+    host: "radius"
+    port: 1812
+    secret: "testing123"
+    timeout: 5s
+    retries: 3
+
+  acct:
+    host: "radius"
+    port: 1813
+    secret: "testing123"
+    timeout: 5s
+    interval: 300
+
+  coa:
+    enabled: true
+    port: 3799
+    secret: "testing123"
+
+  nas_id: "coovachilli-saml-test"
+  nas_ip: "172.20.0.20"
+
+sso:
+  enabled: true
+  type: "saml"
+
+  saml:
+    entity_id: "http://chilli-saml/saml/metadata"
+    metadata_url: "http://saml:8080/simplesaml/saml2/idp/metadata.php"
+
+    sp:
+      acs_url: "http://chilli-saml:3990/sso/saml/acs"
+      slo_url: "http://chilli-saml:3990/sso/saml/slo"
+
+    idp:
+      sso_url: "http://saml:8080/simplesaml/saml2/idp/SSOService.php"
+      slo_url: "http://saml:8080/simplesaml/saml2/idp/SingleLogoutService.php"
+
+    sign_request: true
+    want_assertions_signed: true
+
+firewall:
+  backend: "iptables"
+
+  allowed_ports:
+    tcp: [80, 443, 8080]
+    udp: [53, 67, 68]
+
+  walled_garden:
+    - "saml"
+    - "172.20.0.0/16"
+
+session:
+  timeout: 3600
+  idle_timeout: 600
+  max_sessions: 1000
+
+  persistence:
+    enabled: false
+
+security:
+  tls:
+    enabled: false
+
+  rate_limit:
+    enabled: true
+    requests_per_second: 10
+    burst: 20
+
+logging:
+  level: "debug"
+  format: "json"
+  output: "stdout"

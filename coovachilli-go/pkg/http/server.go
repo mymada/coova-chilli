@@ -224,6 +224,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ✅ SECURITY: Limit request body size
+	r.Body = http.MaxBytesReader(w, r.Body, 1048576) // 1MB max
+	defer r.Body.Close()
+
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "Failed to parse form", http.StatusBadRequest)
 		return
@@ -445,6 +449,10 @@ func (s *Server) handleApiLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ✅ SECURITY: Limit request body size to prevent DoS
+	r.Body = http.MaxBytesReader(w, r.Body, 1048576) // 1MB max
+	defer r.Body.Close()
+
 	var req apiLoginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "{\"error\":\"Invalid request body\"}", http.StatusBadRequest)
@@ -499,13 +507,19 @@ func (s *Server) handleApiLogin(w http.ResponseWriter, r *http.Request) {
 			session.Unlock()
 			s.sessionManager.AssociateToken(session)
 
-			http.SetCookie(w, &http.Cookie{
+			// ✅ SECURITY: Secure cookie with CSRF protection
+			cookie := &http.Cookie{
 				Name:     sessionCookieName,
 				Value:    token,
 				Expires:  time.Now().Add(24 * time.Hour),
 				HttpOnly: true,
 				Path:     "/",
-			})
+				SameSite: http.SameSiteStrictMode,
+			}
+			if s.cfg.CertFile != "" && s.cfg.KeyFile != "" {
+				cookie.Secure = true
+			}
+			http.SetCookie(w, cookie)
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprint(w, "{\"status\":\"success\"}")
 		} else {

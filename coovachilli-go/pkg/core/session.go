@@ -191,12 +191,13 @@ type SessionHooks struct {
 
 // SessionManager manages all active sessions.
 type SessionManager struct {
-	sync.RWMutex
-	sessionsByIPv4  map[string]*Session
-	sessionsByIPv6  map[string]*Session
-	sessionsByMAC   map[string]*Session
+	// ✅ OPTIMIZATION: Use sync.Map for lock-free reads
+	sessionsByIPv4  sync.Map // map[string]*Session
+	sessionsByIPv6  sync.Map // map[string]*Session
+	sessionsByMAC   sync.Map // map[string]*Session
 	recorder        metrics.Recorder
 	cfg             *config.Config
+	sessionCountMu  sync.Mutex
 	sessionCount    int // Track total sessions
 	hooks           SessionHooks
 
@@ -208,10 +209,8 @@ func NewSessionManager(cfg *config.Config, recorder metrics.Recorder) *SessionMa
 	if recorder == nil {
 		recorder = metrics.NewNoopRecorder()
 	}
+	// ✅ OPTIMIZATION: sync.Map is initialized empty
 	return &SessionManager{
-		sessionsByIPv4:  make(map[string]*Session),
-		sessionsByIPv6:  make(map[string]*Session),
-		sessionsByMAC:   make(map[string]*Session),
 		recorder:        recorder,
 		cfg:             cfg,
 	}
@@ -219,8 +218,8 @@ func NewSessionManager(cfg *config.Config, recorder metrics.Recorder) *SessionMa
 
 // SetHooks sets the session lifecycle hooks
 func (sm *SessionManager) SetHooks(hooks SessionHooks) {
-	sm.Lock()
-	defer sm.Unlock()
+	sm.sessionCountMu.Lock()
+	defer sm.sessionCountMu.Unlock()
 	sm.hooks = hooks
 }
 
@@ -233,13 +232,14 @@ type StateData struct {
 
 // CreateSession creates a new session for a client.
 func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID uint16) *Session {
-	sm.Lock()
-	defer sm.Unlock()
-
-	// Check session limit
+	// ✅ OPTIMIZATION: Check session limit with minimal locking
+	sm.sessionCountMu.Lock()
 	if sm.sessionCount >= MaxSessions {
+		sm.sessionCountMu.Unlock()
 		return nil // Session limit reached
 	}
+	sm.sessionCount++
+	sm.sessionCountMu.Unlock()
 
 	now := MonotonicTime()
 	session := &Session{
@@ -260,23 +260,27 @@ func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID 
 		},
 	}
 
+	// ✅ OPTIMIZATION: Lock-free writes with sync.Map
 	if ip != nil {
 		if ip.To4() != nil {
-			sm.sessionsByIPv4[ip.String()] = session
+			sm.sessionsByIPv4.Store(ip.String(), session)
 		} else {
-			sm.sessionsByIPv6[ip.String()] = session
+			sm.sessionsByIPv6.Store(ip.String(), session)
 		}
 	}
 	if mac != nil {
-		sm.sessionsByMAC[mac.String()] = session
+		sm.sessionsByMAC.Store(mac.String(), session)
 	}
 
-	sm.sessionCount++
 	sm.recorder.IncGauge("chilli_sessions_active_total", nil)
 
 	// Call ipup hook if configured
-	if sm.hooks.OnIPUp != nil {
-		go sm.hooks.OnIPUp(session)
+	sm.sessionCountMu.Lock()
+	onIPUp := sm.hooks.OnIPUp
+	sm.sessionCountMu.Unlock()
+
+	if onIPUp != nil {
+		go onIPUp(session)
 	}
 
 	return session
@@ -284,22 +288,20 @@ func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID 
 
 // GetSessionByIPs determines if an IP pair belongs to a session, returning the session and whether it's uplink.
 func (sm *SessionManager) GetSessionByIPs(srcIP, dstIP net.IP) (*Session, bool) {
-	sm.RLock()
-	defer sm.RUnlock()
-
+	// ✅ OPTIMIZATION: Lock-free reads with sync.Map
 	if srcIP.To4() != nil {
-		if session, ok := sm.sessionsByIPv4[srcIP.String()]; ok {
-			return session, true // Uplink
+		if val, ok := sm.sessionsByIPv4.Load(srcIP.String()); ok {
+			return val.(*Session), true // Uplink
 		}
-		if session, ok := sm.sessionsByIPv4[dstIP.String()]; ok {
-			return session, false // Downlink
+		if val, ok := sm.sessionsByIPv4.Load(dstIP.String()); ok {
+			return val.(*Session), false // Downlink
 		}
 	} else {
-		if session, ok := sm.sessionsByIPv6[srcIP.String()]; ok {
-			return session, true // Uplink
+		if val, ok := sm.sessionsByIPv6.Load(srcIP.String()); ok {
+			return val.(*Session), true // Uplink
 		}
-		if session, ok := sm.sessionsByIPv6[dstIP.String()]; ok {
-			return session, false // Downlink
+		if val, ok := sm.sessionsByIPv6.Load(dstIP.String()); ok {
+			return val.(*Session), false // Downlink
 		}
 	}
 
@@ -308,39 +310,40 @@ func (sm *SessionManager) GetSessionByIPs(srcIP, dstIP net.IP) (*Session, bool) 
 
 // HasSessionByIP checks if a session exists for a given IP address.
 func (sm *SessionManager) HasSessionByIP(ip net.IP) bool {
-	sm.RLock()
-	defer sm.RUnlock()
+	// ✅ OPTIMIZATION: Lock-free reads
 	var exists bool
 	if ip.To4() != nil {
-		_, exists = sm.sessionsByIPv4[ip.String()]
+		_, exists = sm.sessionsByIPv4.Load(ip.String())
 	} else {
-		_, exists = sm.sessionsByIPv6[ip.String()]
+		_, exists = sm.sessionsByIPv6.Load(ip.String())
 	}
 	return exists
 }
 
 // GetSessionByIP returns a session by IP address.
 func (sm *SessionManager) GetSessionByIP(ip net.IP) (*Session, bool) {
-	sm.RLock()
-	defer sm.RUnlock()
-
-	var session *Session
+	// ✅ OPTIMIZATION: Lock-free reads
+	var val interface{}
 	var ok bool
 	if ip.To4() != nil {
-		session, ok = sm.sessionsByIPv4[ip.String()]
+		val, ok = sm.sessionsByIPv4.Load(ip.String())
 	} else {
-		session, ok = sm.sessionsByIPv6[ip.String()]
+		val, ok = sm.sessionsByIPv6.Load(ip.String())
 	}
-	return session, ok
+	if !ok {
+		return nil, false
+	}
+	return val.(*Session), true
 }
 
 // GetSessionByMAC returns a session by MAC address.
 func (sm *SessionManager) GetSessionByMAC(mac net.HardwareAddr) (*Session, bool) {
-	sm.RLock()
-	defer sm.RUnlock()
-
-	session, ok := sm.sessionsByMAC[mac.String()]
-	return session, ok
+	// ✅ OPTIMIZATION: Lock-free reads
+	val, ok := sm.sessionsByMAC.Load(mac.String())
+	if !ok {
+		return nil, false
+	}
+	return val.(*Session), true
 }
 
 // GetSessionByToken is deprecated - use token.Manager instead
@@ -362,29 +365,30 @@ func (sm *SessionManager) DeleteSession(session *Session) {
 	}
 
 	// Call ipdown hook before deleting session
-	sm.RLock()
+	sm.sessionCountMu.Lock()
 	ipdownHook := sm.hooks.OnIPDown
-	sm.RUnlock()
+	sm.sessionCountMu.Unlock()
 
 	if ipdownHook != nil {
 		ipdownHook(session)
 	}
 
-	sm.Lock()
-	defer sm.Unlock()
-
+	// ✅ OPTIMIZATION: Lock-free deletes with sync.Map
 	if session.HisIP != nil {
 		if session.HisIP.To4() != nil {
-			delete(sm.sessionsByIPv4, session.HisIP.String())
+			sm.sessionsByIPv4.Delete(session.HisIP.String())
 		} else {
-			delete(sm.sessionsByIPv6, session.HisIP.String())
+			sm.sessionsByIPv6.Delete(session.HisIP.String())
 		}
 	}
 	if session.HisMAC != nil {
-		delete(sm.sessionsByMAC, session.HisMAC.String())
+		sm.sessionsByMAC.Delete(session.HisMAC.String())
 	}
 
+	sm.sessionCountMu.Lock()
 	sm.sessionCount--
+	sm.sessionCountMu.Unlock()
+
 	sm.recorder.DecGauge("chilli_sessions_active_total", nil)
 
 	// Close AuthResult channel to prevent goroutine leaks
@@ -397,41 +401,41 @@ func (sm *SessionManager) DeleteSession(session *Session) {
 
 // Reconfigure updates the configuration for the SessionManager.
 func (sm *SessionManager) Reconfigure(newConfig *config.Config) error {
-	sm.Lock()
-	defer sm.Unlock()
+	sm.sessionCountMu.Lock()
+	defer sm.sessionCountMu.Unlock()
 	sm.cfg = newConfig
 	return nil
 }
 
 // GetAllSessions returns all active sessions.
 func (sm *SessionManager) GetAllSessions() []*Session {
-	sm.RLock()
-	defer sm.RUnlock()
-	sessions := make([]*Session, 0, len(sm.sessionsByIPv4)+len(sm.sessionsByIPv6))
-	for _, s := range sm.sessionsByIPv4 {
-		sessions = append(sessions, s)
-	}
-	for _, s := range sm.sessionsByIPv6 {
-		sessions = append(sessions, s)
-	}
+	// ✅ OPTIMIZATION: Iterate sync.Map efficiently
+	sessions := make([]*Session, 0, sm.sessionCount)
+	sm.sessionsByIPv4.Range(func(key, value interface{}) bool {
+		sessions = append(sessions, value.(*Session))
+		return true
+	})
+	sm.sessionsByIPv6.Range(func(key, value interface{}) bool {
+		sessions = append(sessions, value.(*Session))
+		return true
+	})
 	return sessions
 }
 
 // SaveSessions serializes all active, authenticated sessions to a file.
 func (sm *SessionManager) SaveSessions(path string) error {
-	sm.RLock()
-	defer sm.RUnlock()
-
 	if path == "" {
 		return nil // Nothing to do if no path is configured
 	}
 
 	var sessionsToSave []*Session
-	for _, s := range sm.sessionsByMAC {
+	sm.sessionsByMAC.Range(func(key, value interface{}) bool {
+		s := value.(*Session)
 		if s.Authenticated {
 			sessionsToSave = append(sessionsToSave, s)
 		}
-	}
+		return true
+	})
 
 	if len(sessionsToSave) == 0 {
 		return nil // Nothing to save
@@ -452,9 +456,6 @@ func (sm *SessionManager) SaveSessions(path string) error {
 
 // LoadSessions loads sessions from a file, adjusting for downtime.
 func (sm *SessionManager) LoadSessions(path string) error {
-	sm.Lock()
-	defer sm.Unlock()
-
 	if path == "" {
 		return nil
 	}
@@ -498,14 +499,18 @@ func (sm *SessionManager) LoadSessions(path string) error {
 		// Re-populate the session manager's maps
 		if s.HisIP != nil {
 			if s.HisIP.To4() != nil {
-				sm.sessionsByIPv4[s.HisIP.String()] = s
+				sm.sessionsByIPv4.Store(s.HisIP.String(), s)
 			} else {
-				sm.sessionsByIPv6[s.HisIP.String()] = s
+				sm.sessionsByIPv6.Store(s.HisIP.String(), s)
 			}
 		}
 		if s.HisMAC != nil {
-			sm.sessionsByMAC[s.HisMAC.String()] = s
+			sm.sessionsByMAC.Store(s.HisMAC.String(), s)
 		}
+
+		sm.sessionCountMu.Lock()
+		sm.sessionCount++
+		sm.sessionCountMu.Unlock()
 	}
 
 	return nil

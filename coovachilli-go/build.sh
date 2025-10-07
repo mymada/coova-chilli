@@ -29,8 +29,19 @@ export CGO_ENABLED=1
 # Create the output directory if it doesn't exist
 mkdir -p ${OUTPUT_DIR}
 
-# Build the binary
-go build -o "${OUTPUT_DIR}/${BINARY_NAME}_${TARGET_OS}_${TARGET_ARCH}" -ldflags="-s -w" ./cmd/coovachilli
+# ✅ OPTIMIZATION: Build with maximum optimization flags
+VERSION=$(git describe --tags --always 2>/dev/null || echo "dev")
+BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# Build the binary with aggressive optimization
+go build \
+	-o "${OUTPUT_DIR}/${BINARY_NAME}_${TARGET_OS}_${TARGET_ARCH}" \
+	-ldflags="-s -w -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}" \
+	-trimpath \
+	-tags=netgo \
+	-gcflags="all=-l -B -C" \
+	-asmflags="all=-trimpath=$(pwd)" \
+	./cmd/coovachilli
 
 echo "Build successful!"
 echo "Binary created at: ${OUTPUT_DIR}/${BINARY_NAME}_${TARGET_OS}_${TARGET_ARCH}"

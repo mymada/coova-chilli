@@ -1,0 +1,113 @@
+# =============================================================================
+# CoovaChilli-Go Configuration - OIDC SSO Testing
+# =============================================================================
+
+server:
+  http:
+    host: "0.0.0.0"
+    port: 3990
+    read_timeout: 15s
+    write_timeout: 15s
+
+  portal:
+    host: "0.0.0.0"
+    port: 8080
+    uam_secret: "ChangeMe"
+    uam_homepage: "http://chilli-oidc:8080/"
+    redirect_url: "http://keycloak:8080/"
+
+  metrics:
+    enabled: true
+    port: 2112
+    path: "/metrics"
+
+network:
+  interface: "eth0"
+  tun_device: "tun0"
+
+  dhcp:
+    subnet: "10.11.0.0/24"
+    gateway: "10.11.0.1"
+    dns:
+      - "8.8.8.8"
+      - "8.8.4.4"
+    lease_time: 3600
+
+  ipv6:
+    enabled: true
+    subnet: "fd10:11::/64"
+    gateway: "fd10:11::1"
+
+radius:
+  auth:
+    host: "radius"
+    port: 1812
+    secret: "testing123"
+    timeout: 5s
+    retries: 3
+
+  acct:
+    host: "radius"
+    port: 1813
+    secret: "testing123"
+    timeout: 5s
+    interval: 300
+
+  coa:
+    enabled: true
+    port: 3799
+    secret: "testing123"
+
+  nas_id: "coovachilli-oidc-test"
+  nas_ip: "172.20.0.21"
+
+sso:
+  enabled: true
+  type: "oidc"
+
+  oidc:
+    provider_url: "http://keycloak:8080/realms/master"
+    client_id: "coovachilli"
+    client_secret: "coovachilli-secret-key"
+    redirect_uri: "http://chilli-oidc:3990/sso/oidc/callback"
+
+    scopes:
+      - "openid"
+      - "profile"
+      - "email"
+
+    auto_discovery: true
+    jwks_cache_duration: 3600
+
+firewall:
+  backend: "iptables"
+
+  allowed_ports:
+    tcp: [80, 443, 8080]
+    udp: [53, 67, 68]
+
+  walled_garden:
+    - "keycloak"
+    - "172.20.0.0/16"
+
+session:
+  timeout: 3600
+  idle_timeout: 600
+  max_sessions: 1000
+
+  persistence:
+    enabled: false
+
+security:
+  tls:
+    enabled: false
+
+  rate_limit:
+    enabled: true
+    requests_per_second: 10
+    burst: 20
+
+logging:
+  level: "debug"
+  format: "json"
+  output: "stdout"

@@ -32,9 +32,30 @@ build: ## Build the CoovaChilli binary
 	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -o $(BINARY) $(MAIN_PATH)
 	@echo "$(COLOR_GREEN)✓ Build complete: $(BINARY)$(COLOR_RESET)"
 
+build-optimized: ## Build highly optimized binary (smaller size, better performance)
+	@echo "$(COLOR_BLUE)Building optimized CoovaChilli-Go...$(COLOR_RESET)"
+	CGO_ENABLED=1 $(GO) build \
+		-ldflags="-s -w -X main.version=$$(git describe --tags --always 2>/dev/null || echo 'dev') -X main.buildTime=$$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+		-trimpath \
+		-tags=netgo \
+		-a \
+		-o $(BINARY) $(MAIN_PATH)
+	@echo "$(COLOR_YELLOW)Compressing binary with upx...$(COLOR_RESET)"
+	@if command -v upx >/dev/null 2>&1; then \
+		upx --best --lzma $(BINARY); \
+		echo "$(COLOR_GREEN)✓ Binary compressed$(COLOR_RESET)"; \
+	else \
+		echo "$(COLOR_YELLOW)⚠ upx not found, skipping compression$(COLOR_RESET)"; \
+	fi
+	@ls -lh $(BINARY)
+	@echo "$(COLOR_GREEN)✓ Optimized build complete$(COLOR_RESET)"
+
 build-static: ## Build static binary (for containers)
 	@echo "$(COLOR_BLUE)Building static binary...$(COLOR_RESET)"
-	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -ldflags="-s -w" -o $(BINARY) $(MAIN_PATH)
+	CGO_ENABLED=1 $(GO) build $(GOFLAGS) \
+		-ldflags="-s -w -extldflags '-static'" \
+		-trimpath \
+		-o $(BINARY) $(MAIN_PATH)
 	@echo "$(COLOR_GREEN)✓ Static build complete$(COLOR_RESET)"
 
 install: ## Install the binary to $GOPATH/bin
