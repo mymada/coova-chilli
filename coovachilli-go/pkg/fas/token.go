@@ -15,6 +15,7 @@ type Claims struct {
 	ClientMAC   string `json:"cli"`
 	ClientIP    string `json:"cip"`
 	OriginalURL string `json:"url"`
+	SessionNonce string `json:"nonce"` // ✅ SECURITY: Unique nonce to prevent replay attacks
 	jwt.RegisteredClaims
 }
 
@@ -41,12 +42,13 @@ func GenerateToken(session *core.Session, cfg *config.FASConfig) (string, error)
 	}
 	expirationTime := time.Now().Add(validity)
 
-	// Create the JWT claims
+	// Create the JWT claims with session-specific nonce
 	claims := &Claims{
-		NASID:       session.SessionID, // Using SessionID as a unique identifier for the NAS context
-		ClientMAC:   session.HisMAC.String(),
-		ClientIP:    session.HisIP.String(),
-		OriginalURL: session.Redir.UserURL,
+		NASID:        session.SessionID, // Using SessionID as a unique identifier for the NAS context
+		ClientMAC:    session.HisMAC.String(),
+		ClientIP:     session.HisIP.String(),
+		OriginalURL:  session.Redir.UserURL,
+		SessionNonce: session.FASNonce, // ✅ SECURITY: Bind token to specific session
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(expirationTime),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),

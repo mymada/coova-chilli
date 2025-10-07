@@ -1,11 +1,16 @@
 package script
 
 import (
+	"context"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
 
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/core"
@@ -18,6 +23,9 @@ type Runner struct {
 	cfg    *config.Config
 }
 
+// ✅ SECURITY FIX CVE-005: Whitelist of safe characters for environment variables
+var safeCharPattern = regexp.MustCompile(`^[a-zA-Z0-9@._-]+$`)
+
 // NewRunner creates a new script runner.
 func NewRunner(logger zerolog.Logger, cfg *config.Config) *Runner {
 	return &Runner{
@@ -26,17 +34,30 @@ func NewRunner(logger zerolog.Logger, cfg *config.Config) *Runner {
 	}
 }
 
+// ✅ SECURITY FIX CVE-005: Sanitize environment values to prevent injection
+func sanitizeEnvValue(value string) string {
+	// If value contains unsafe characters, encode it in base64
+	if !safeCharPattern.MatchString(value) {
+		// Base64 encode to make it safe
+		encoded := base64.StdEncoding.EncodeToString([]byte(value))
+		return "b64:" + encoded // Prefix to indicate encoding
+	}
+	return value
+}
+
 // setEnv adds a key-value pair to the environment string slice.
 func setEnv(env []string, key string, value interface{}) []string {
 	return append(env, fmt.Sprintf("%s=%v", key, value))
 }
 
 // setEnvStr adds a string key-value pair to the environment.
+// ✅ SECURITY FIX CVE-005: All user-controlled values are now sanitized
 func setEnvStr(env []string, key, value string) []string {
 	if value == "" {
 		return env
 	}
-	return append(env, fmt.Sprintf("%s=%s", key, value))
+	sanitized := sanitizeEnvValue(value)
+	return append(env, fmt.Sprintf("%s=%s", key, sanitized))
 }
 
 // buildEnv creates the environment variable slice for the script execution.
@@ -103,22 +124,65 @@ func (r *Runner) buildEnv(session *core.Session, terminateCause int) []string {
 }
 
 // RunScript executes a script with the environment populated from the session.
+// ✅ SECURITY FIX CVE-005: Added comprehensive security checks
 func (r *Runner) RunScript(scriptPath string, session *core.Session, terminateCause int) {
 	if scriptPath == "" {
 		return
 	}
 
-	r.logger.Info().Str("script", scriptPath).Str("session", session.SessionID).Msg("Executing script")
+	// ✅ SECURITY: Validate script path
+	absPath, err := filepath.Abs(scriptPath)
+	if err != nil {
+		r.logger.Error().Err(err).Str("script", scriptPath).Msg("Invalid script path")
+		return
+	}
 
-	cmd := exec.Command(scriptPath)
+	// ✅ SECURITY: Check if script is in an allowed directory
+	allowedDirs := []string{"/etc/coovachilli/scripts", "/usr/local/lib/coovachilli"}
+	allowed := false
+	for _, dir := range allowedDirs {
+		if strings.HasPrefix(absPath, dir) {
+			allowed = true
+			break
+		}
+	}
+
+	if !allowed {
+		r.logger.Error().Str("script", absPath).Msg("Script not in allowed directory - execution denied")
+		return
+	}
+
+	// ✅ SECURITY: Check file permissions (reject world-writable)
+	info, err := os.Stat(absPath)
+	if err != nil {
+		r.logger.Error().Err(err).Str("script", absPath).Msg("Cannot stat script file")
+		return
+	}
+
+	if info.Mode().Perm()&0002 != 0 {
+		r.logger.Error().Str("script", absPath).Msg("Script is world-writable - execution denied for security")
+		return
+	}
+
+	r.logger.Info().Str("script", absPath).Str("session", session.SessionID).Msg("Executing script")
+
+	// ✅ SECURITY: Use context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, absPath)
 	cmd.Env = r.buildEnv(session, terminateCause)
 
 	go func() {
 		output, err := cmd.CombinedOutput()
 		if err != nil {
-			r.logger.Error().Err(err).Str("script", scriptPath).Bytes("output", output).Msg("Script execution failed")
+			if ctx.Err() == context.DeadlineExceeded {
+				r.logger.Error().Str("script", absPath).Msg("Script execution timed out after 30s")
+			} else {
+				r.logger.Error().Err(err).Str("script", absPath).Bytes("output", output).Msg("Script execution failed")
+			}
 			return
 		}
-		r.logger.Debug().Str("script", scriptPath).Bytes("output", output).Msg("Script executed successfully")
+		r.logger.Debug().Str("script", absPath).Bytes("output", output).Msg("Script executed successfully")
 	}()
 }

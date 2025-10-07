@@ -1,8 +1,11 @@
 package core
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -74,6 +77,9 @@ type Session struct {
 
 	// Token is a secure token for cookie-based auto-login.
 	Token string
+
+	// FASNonce is a unique nonce to prevent FAS token replay attacks
+	FASNonce string
 
 	// EAPOL state
 	EAPOL EAPOLState
@@ -242,6 +248,10 @@ func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID 
 	sm.sessionCountMu.Unlock()
 
 	now := MonotonicTime()
+
+	// Generate unique FAS nonce for this session
+	fasNonce := generateSecureNonce()
+
 	session := &Session{
 		HisIP:               ip,
 		HisMAC:              mac,
@@ -252,6 +262,7 @@ func (sm *SessionManager) CreateSession(ip net.IP, mac net.HardwareAddr, vlanID 
 		AuthResult:          make(chan bool, 1),
 		StartTimeSec:        now,
 		LastActivityTimeSec: now,
+		FASNonce:            fasNonce, // ✅ SECURITY: Unique nonce per session
 		SessionParams: SessionParams{
 			SessionTimeout:   sm.cfg.DefSessionTimeout,
 			IdleTimeout:      sm.cfg.DefIdleTimeout,
@@ -514,4 +525,14 @@ func (sm *SessionManager) LoadSessions(path string) error {
 	}
 
 	return nil
+}
+
+// generateSecureNonce generates a cryptographically secure random nonce
+func generateSecureNonce() string {
+	b := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		// Fallback to timestamp-based if crypto fails (should never happen)
+		return fmt.Sprintf("nonce_%d", time.Now().UnixNano())
+	}
+	return base64.URLEncoding.EncodeToString(b)
 }

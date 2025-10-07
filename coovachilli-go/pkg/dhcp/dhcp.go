@@ -36,6 +36,7 @@ type Server struct {
 	ifaceMAC       net.HardwareAddr
 	ifaceIPv6      net.IP
 	logger         zerolog.Logger
+	rateLimiter    *DHCPRateLimiter // ✅ SECURITY FIX CVE-004: Rate limiting
 }
 
 // Lease holds information about a DHCP lease.
@@ -91,6 +92,11 @@ func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<-
 	if recorder == nil {
 		recorder = metrics.NewNoopRecorder()
 	}
+
+	// ✅ SECURITY FIX CVE-004: Create rate limiter
+	rl := NewDHCPRateLimiter(logger)
+	go rl.Cleanup()
+
 	server := &Server{
 		cfg:            cfg,
 		sessionManager: sm,
@@ -105,6 +111,7 @@ func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<-
 		ifaceMAC:       iface.HardwareAddr,
 		ifaceIPv6:      ifaceIPv6,
 		logger:         logger.With().Str("component", "dhcp").Logger(),
+		rateLimiter:    rl, // ✅ SECURITY FIX CVE-004
 	}
 
 	go server.listen()
@@ -539,6 +546,15 @@ func (s *Server) HandleDHCPv4(dhcpPayload []byte, packet gopacket.Packet) ([]byt
 	req, err := dhcpv4.FromBytes(dhcpPayload)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse DHCPv4 request: %w", err)
+	}
+
+	// ✅ SECURITY FIX CVE-004: Rate limiting to prevent pool exhaustion
+	macStr := req.ClientHWAddr.String()
+	if !s.rateLimiter.IsAllowed(macStr) {
+		s.logger.Warn().
+			Str("mac", macStr).
+			Msg("DHCP rate limit exceeded - ignoring request")
+		return nil, req, nil // Silently drop the request
 	}
 
 	s.logger.Debug().Str("type", req.MessageType().String()).Str("mac", req.ClientHWAddr.String()).Msg("Received DHCPv4 request")

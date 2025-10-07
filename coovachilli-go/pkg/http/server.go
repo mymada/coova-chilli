@@ -828,7 +828,27 @@ func (s *Server) handleFASAuth(w http.ResponseWriter, r *http.Request) {
 	alreadyAuth := session.Authenticated
 	sessionIP := session.HisIP.String()
 	sessionLastSeen := session.LastSeen
+	expectedNonce := session.FASNonce
 	session.RUnlock()
+
+	// ✅ SECURITY FIX CVE-001: Validate nonce to prevent replay attacks
+	if expectedNonce == "" {
+		s.logger.Warn().
+			Str("mac", clientMAC.String()).
+			Msg("FAS token already consumed (nonce empty) - replay attack blocked")
+		http.Error(w, "Token already used", http.StatusConflict)
+		return
+	}
+
+	if claims.SessionNonce != expectedNonce {
+		s.logger.Warn().
+			Str("expected_nonce", expectedNonce[:16]+"...").
+			Str("received_nonce", claims.SessionNonce[:16]+"...").
+			Str("mac", clientMAC.String()).
+			Msg("FAS token nonce mismatch - replay attack blocked")
+		http.Error(w, "Invalid token nonce", http.StatusForbidden)
+		return
+	}
 
 	// Vérifier que la session n'est pas déjà authentifiée
 	if alreadyAuth {
@@ -864,6 +884,7 @@ func (s *Server) handleFASAuth(w http.ResponseWriter, r *http.Request) {
 	// 4. Update session with parameters from FAS
 	session.Lock()
 	session.Authenticated = true
+	session.FASNonce = "" // ✅ SECURITY: Consume nonce to prevent replay
 	// The username is not provided by FAS, but we can set it to the MAC address for accounting purposes
 	if session.Redir.Username == "" {
 		session.Redir.Username = claims.ClientMAC

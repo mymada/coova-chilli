@@ -3,8 +3,10 @@ package cluster
 import (
 	"bytes"
 	"crypto/cipher"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
 
@@ -39,9 +41,10 @@ type ChilliHeader struct {
 	_     [2]byte
 }
 
-// IV is the static initialization vector used for Blowfish CBC.
-// It MUST match the one in the C implementation.
-var iv = []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
+// ✅ SECURITY FIX CVE-003: Removed static IV
+// Old vulnerable code:
+// var iv = []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
+// Now using random IV per message for proper CBC mode security
 
 // Serialize converts the ChilliHeader to a byte slice for transmission.
 func (h *ChilliHeader) Serialize() ([]byte, error) {
@@ -62,11 +65,18 @@ func DeserializeChilliHeader(data []byte) (*ChilliHeader, error) {
 	return &h, nil
 }
 
-// Encrypt encrypts data using Blowfish CBC.
+// Encrypt encrypts data using Blowfish CBC with a random IV.
+// ✅ SECURITY FIX CVE-003: Each message now uses a unique random IV
 func Encrypt(data, key []byte) ([]byte, error) {
 	block, err := blowfish.NewCipher(key)
 	if err != nil {
 		return nil, err
+	}
+
+	// ✅ Generate random IV for each encryption
+	iv := make([]byte, blowfish.BlockSize)
+	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+		return nil, fmt.Errorf("failed to generate IV: %w", err)
 	}
 
 	// CBC requires padding to a multiple of the block size.
@@ -79,27 +89,41 @@ func Encrypt(data, key []byte) ([]byte, error) {
 	cbc := cipher.NewCBCEncrypter(block, iv)
 	cbc.CryptBlocks(encrypted, paddedData)
 
-	return encrypted, nil
+	// ✅ Prepend IV to ciphertext (standard practice for CBC mode)
+	return append(iv, encrypted...), nil
 }
 
 // Decrypt decrypts data using Blowfish CBC.
+// ✅ SECURITY FIX CVE-003: Now extracts IV from the message
 func Decrypt(data, key []byte) ([]byte, error) {
+	// ✅ Ensure we have at least one block (IV)
+	if len(data) < blowfish.BlockSize {
+		return nil, fmt.Errorf("ciphertext too short to contain IV")
+	}
+
 	block, err := blowfish.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(data)%blowfish.BlockSize != 0 {
+	// ✅ Extract IV from the first block
+	iv := data[:blowfish.BlockSize]
+	ciphertext := data[blowfish.BlockSize:]
+
+	if len(ciphertext)%blowfish.BlockSize != 0 {
 		return nil, fmt.Errorf("encrypted data is not a multiple of the block size")
 	}
 
-	decrypted := make([]byte, len(data))
+	decrypted := make([]byte, len(ciphertext))
 	cbc := cipher.NewCBCDecrypter(block, iv)
-	cbc.CryptBlocks(decrypted, data)
+	cbc.CryptBlocks(decrypted, ciphertext)
 
 	// Unpad
+	if len(decrypted) == 0 {
+		return nil, fmt.Errorf("decrypted data is empty")
+	}
 	padLen := int(decrypted[len(decrypted)-1])
-	if padLen > blowfish.BlockSize || padLen == 0 {
+	if padLen > blowfish.BlockSize || padLen == 0 || padLen > len(decrypted) {
 		return nil, fmt.Errorf("invalid padding")
 	}
 	return decrypted[:len(decrypted)-padLen], nil

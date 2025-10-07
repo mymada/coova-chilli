@@ -2,6 +2,7 @@ package admin
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 
 	"coovachilli-go/pkg/config"
@@ -16,6 +17,7 @@ type Server struct {
 	disconnecter core.Disconnector
 	logger       zerolog.Logger
 	httpServer   *http.Server
+	rateLimiter  *RateLimiter // ✅ SECURITY FIX CVE-002: Rate limiting
 }
 
 // NewServer creates a new admin API server
@@ -25,11 +27,15 @@ func NewServer(
 	disconnecter core.Disconnector,
 	logger zerolog.Logger,
 ) *Server {
+	rl := NewRateLimiter(logger)
+	go rl.Cleanup() // Start background cleanup
+
 	return &Server{
 		cfg:          cfg,
 		sessionMgr:   sm,
 		disconnecter: disconnecter,
 		logger:       logger.With().Str("component", "admin").Logger(),
+		rateLimiter:  rl, // ✅ SECURITY FIX CVE-002
 	}
 }
 
@@ -61,6 +67,19 @@ func (s *Server) Start() {
 // authMiddleware provides authentication for the admin API
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// ✅ SECURITY FIX CVE-002: Extract client IP
+		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if clientIP == "" {
+			clientIP = r.RemoteAddr
+		}
+
+		// ✅ SECURITY FIX CVE-002: Check rate limiting before authentication
+		if !s.rateLimiter.IsAllowed(clientIP) {
+			s.logger.Warn().Str("ip", clientIP).Msg("Admin API rate limit exceeded")
+			http.Error(w, "Too many requests. Try again later.", http.StatusTooManyRequests)
+			return
+		}
+
 		if s.cfg.AdminAPI.AuthToken != nil && s.cfg.AdminAPI.AuthToken.IsSet() {
 			token := r.Header.Get("Authorization")
 
@@ -74,10 +93,16 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 				return nil
 			})
 
+			// ✅ SECURITY FIX CVE-002: Record authentication attempt
+			s.rateLimiter.RecordAttempt(clientIP, authorized && err == nil)
+
 			if err != nil || !authorized {
+				s.logger.Warn().Str("ip", clientIP).Msg("Failed admin authentication attempt")
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
+
+			s.logger.Info().Str("ip", clientIP).Msg("Successful admin authentication")
 		}
 		next.ServeHTTP(w, r)
 	})
