@@ -42,6 +42,34 @@ radiusnasid: nas01
 radiustimeout: 5s
 coaport: 3799
 
+# RadSec (RADIUS over TLS) - Secure RADIUS
+radsecenable: false
+radsecport: 2083
+radseccertfile: /etc/coovachilli/certs/client.pem
+radseckeyfile: /etc/coovachilli/certs/client-key.pem
+radseccafile: /etc/coovachilli/certs/ca.pem
+
+# RADIUS Proxy - Advanced realm-based routing
+proxyenable: false
+proxylisten: 0.0.0.0
+proxyport: 1645
+proxysecret: proxysecret123
+
+# EAP Settings - Support for PEAP, EAP-TTLS, EAP-TLS
+eapenable: false
+eapmethod: PEAP  # Options: TLS, TTLS, PEAP
+eapcertfile: /etc/coovachilli/certs/eap-server.pem
+eapkeyfile: /etc/coovachilli/certs/eap-server-key.pem
+eapcafile: /etc/coovachilli/certs/eap-ca.pem
+
+# Advanced Bandwidth Shaping & QoS
+# Per-user bandwidth limits with granular control
+defbandwidthmaxdown: 1000000  # 1 Mbps in bps (default download)
+defbandwidthmaxup: 512000     # 512 Kbps in bps (default upload)
+bwbucketupsize: 65536         # 64 KB - Upload burst size
+bwbucketdnsize: 131072        # 128 KB - Download burst size
+bwbucketminsize: 4096         # 4 KB - Minimum bucket size
+
 # Firewall Configuration
 firewallbackend: iptables
 extif: eth0

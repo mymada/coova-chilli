@@ -89,6 +89,13 @@ type Config struct {
 	ProxySecretStr      string              `yaml:"proxysecret" envconfig:"PROXYSECRET"`
 	ProxySecret         *securestore.Secret `yaml:"-"`
 
+	// EAP settings
+	EAPEnable           bool                `yaml:"eapenable" envconfig:"EAPENABLE"`
+	EAPMethod           string              `yaml:"eapmethod" envconfig:"EAPMETHOD"` // TLS, TTLS, PEAP
+	EAPCertFile         string              `yaml:"eapcertfile" envconfig:"EAPCERTFILE"`
+	EAPKeyFile          string              `yaml:"eapkeyfile" envconfig:"EAPKEYFILE"`
+	EAPCAFile           string              `yaml:"eapcafile" envconfig:"EAPCAFILE"`
+
 	// UAM/Captive Portal settings
 	UAMPort             int               `yaml:"uamport" envconfig:"UAMPORT"`
 	UAMUIPort           int               `yaml:"uamuiport" envconfig:"UAMUIPORT"`

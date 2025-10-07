@@ -18,7 +18,8 @@
       "Bash(go mod:*)",
       "Bash(if [ -f coovachilli_optimized ])",
       "Bash(then ls -lh coovachilli_optimized coovachilli)",
-      "Bash(fi)"
+      "Bash(fi)",
+      "Bash(test:*)"
     ],
     "deny": [],
     "ask": []

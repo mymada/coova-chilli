@@ -69,6 +69,11 @@ type Session struct {
 	BucketDownSize uint64
 	LastBWTime     time.Time
 
+	// Advanced shaping and QoS
+	ShaperStats     *ShaperStats
+	TrafficClasses  map[QoSClass]TrafficClass
+	RequestAuthenticator []byte `json:"-"` // For EAP key derivation
+
 	// UAM/Redir state
 	Redir RedirState
 
@@ -83,6 +88,9 @@ type Session struct {
 
 	// EAPOL state
 	EAPOL EAPOLState
+
+	// EAP session state for advanced authentication
+	EAPSession interface{} `json:"-"`
 }
 
 // GetIP returns the client IP address
