@@ -399,6 +399,18 @@ func (s *Server) HandleDHCPv6(packet []byte) ([]byte, dhcpv6.DHCPv6, error) {
 		return nil, nil, fmt.Errorf("failed to assert request as DHCPv6 message")
 	}
 
+	// ✅ SECURITY FIX: Apply rate limiting to DHCPv6
+	clientDUID := message.Options.ClientID()
+	if clientDUID != nil {
+		duidStr := clientDUID.String()
+		if !s.rateLimiter.IsAllowed(duidStr) {
+			s.logger.Warn().
+				Str("duid", duidStr).
+				Msg("DHCPv6 rate limit exceeded - ignoring request")
+			return nil, req, nil // Silently drop the request
+		}
+	}
+
 	var resp dhcpv6.DHCPv6
 	switch req.Type() {
 	case dhcpv6.MessageTypeSolicit:

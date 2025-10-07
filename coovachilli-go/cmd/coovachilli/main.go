@@ -169,6 +169,8 @@ type application struct {
 	ethLayer          layers.Ethernet
 	arpLayer          layers.ARP
 	ip4Layer          layers.IPv4
+	ip6Layer          layers.IPv6
+	icmpv6Layer       layers.ICMPv6
 	udpLayer          layers.UDP
 	tcpLayer          layers.TCP
 	dnsLayer          layers.DNS
@@ -257,7 +259,7 @@ func buildApplication(cfg *config.Config, reloader *config.Reloader) (*applicati
 		packetChan:    make(chan []byte),
 		shutdownChan:  make(chan os.Signal, 1),
 	}
-	app.parser = gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &app.ethLayer, &app.arpLayer, &app.ip4Layer, &app.tcpLayer, &app.udpLayer, &app.dnsLayer)
+	app.parser = gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &app.ethLayer, &app.arpLayer, &app.ip4Layer, &app.ip6Layer, &app.icmpv6Layer, &app.tcpLayer, &app.udpLayer, &app.dnsLayer)
 
 	// Initialize metrics recorder
 	if cfg.Metrics.Enabled {
@@ -763,11 +765,9 @@ func (app *application) processPackets() {
 			case layers.LayerTypeARP:
 				app.handleARPRequest(&app.ethLayer, &app.arpLayer, app.tunDevice)
 			case layers.LayerTypeIPv4:
-				app.handleIPPacket(&app.ip4Layer, decodedLayers)
+				app.handleIPv4Packet(&app.ip4Layer, decodedLayers)
 			case layers.LayerTypeIPv6:
-				// The current logic inside only handles IPv4. For now, we decode but drop IPv6.
-				// To support IPv6 here, a similar block to the one below for ipv4 would be needed.
-				continue
+				app.handleIPv6Packet(&app.ip6Layer, decodedLayers)
 			}
 		}
 	}
@@ -822,7 +822,7 @@ func (app *application) handleARPRequest(eth *layers.Ethernet, arp *layers.ARP, 
 	}
 }
 
-func (app *application) handleIPPacket(ipv4 *layers.IPv4, decodedLayers []gopacket.LayerType) {
+func (app *application) handleIPv4Packet(ipv4 *layers.IPv4, decodedLayers []gopacket.LayerType) {
 	isDNS := false
 	for _, layerType := range decodedLayers {
 		if layerType == layers.LayerTypeDNS {
@@ -879,6 +879,331 @@ func (app *application) handleIPPacket(ipv4 *layers.IPv4, decodedLayers []gopack
 		}
 		// All other unauthenticated traffic is implicitly dropped
 	}
+}
+
+func (app *application) handleIPv6Packet(ipv6 *layers.IPv6, decodedLayers []gopacket.LayerType) {
+	// ✅ SECURITY: Validate IPv6 packet
+	if err := security.ValidateIPv6Packet(ipv6.SrcIP, ipv6.DstIP); err != nil {
+		app.logger.Debug().Err(err).
+			Str("src_ip", ipv6.SrcIP.String()).
+			Str("dst_ip", ipv6.DstIP.String()).
+			Msg("Dropping invalid IPv6 packet")
+		return
+	}
+
+	// Check if this is ICMPv6 (for NDP handling)
+	isICMPv6 := false
+	isDNS := false
+	for _, layerType := range decodedLayers {
+		if layerType == layers.LayerTypeICMPv6 {
+			isICMPv6 = true
+		}
+		if layerType == layers.LayerTypeDNS {
+			isDNS = true
+		}
+	}
+
+	// Handle ICMPv6 Neighbor Discovery separately
+	if isICMPv6 {
+		app.handleICMPv6Packet(ipv6, &app.icmpv6Layer)
+		return
+	}
+
+	packetSize := uint64(len(ipv6.Payload))
+
+	session, isUplink := app.sessionManager.GetSessionByIPs(ipv6.SrcIP, ipv6.DstIP)
+	if session == nil {
+		return // No session found for this packet, drop it
+	}
+
+	session.RLock()
+	isAuthenticated := session.Authenticated
+	session.RUnlock()
+
+	if isAuthenticated {
+		if session.ShouldDropPacket(packetSize, isUplink) {
+			app.logger.Debug().Str("user", session.Redir.Username).Bool("isUplink", isUplink).Msg("Dropping IPv6 packet due to bandwidth limit")
+			return
+		}
+		session.Lock()
+		if isUplink {
+			session.OutputOctets += packetSize
+			session.OutputPackets++
+		} else {
+			session.InputOctets += packetSize
+			session.InputPackets++
+		}
+		session.Unlock()
+		// Authenticated traffic is forwarded by the firewall
+	} else {
+		// Handle unauthenticated IPv6 traffic
+		if isUplink {
+			// For unauthenticated users, only allow DNS traffic
+			if isDNS {
+				dnsQueryPayload := app.udpLayer.Payload
+				if responsePayload, err := app.dnsProxy.HandleQuery(dnsQueryPayload); err != nil {
+					app.logger.Warn().Err(err).Msg("DNS proxy failed to handle IPv6 query")
+				} else if responsePayload != nil {
+					// Send DNS response back to the client
+					if err := app.sendDNSResponseV6(ipv6, &app.udpLayer, responsePayload); err != nil {
+						app.logger.Error().Err(err).Msg("Failed to send IPv6 DNS response")
+					}
+				}
+			}
+			// Other unauthenticated traffic is implicitly dropped
+		}
+	}
+}
+
+func (app *application) handleICMPv6Packet(ipv6 *layers.IPv6, icmpv6 *layers.ICMPv6) {
+	// ✅ SECURITY: Validate ICMPv6 source address
+	if err := security.ValidateICMPv6Source(ipv6.SrcIP, uint8(icmpv6.TypeCode.Type())); err != nil {
+		app.logger.Debug().Err(err).
+			Str("src_ip", ipv6.SrcIP.String()).
+			Uint8("icmp_type", uint8(icmpv6.TypeCode.Type())).
+			Msg("Dropping ICMPv6 packet with invalid source")
+		return
+	}
+
+	// Handle Neighbor Solicitation (NDP - equivalent to ARP for IPv6)
+	if icmpv6.TypeCode.Type() == layers.ICMPv6TypeNeighborSolicitation {
+		app.handleNeighborSolicitation(ipv6, icmpv6)
+		return
+	}
+
+	// Handle Router Solicitation
+	if icmpv6.TypeCode.Type() == layers.ICMPv6TypeRouterSolicitation {
+		app.handleRouterSolicitation(ipv6, icmpv6)
+		return
+	}
+
+	// Other ICMPv6 types are allowed through for authenticated sessions
+	session, _ := app.sessionManager.GetSessionByIPs(ipv6.SrcIP, ipv6.DstIP)
+	if session != nil {
+		session.RLock()
+		isAuthenticated := session.Authenticated
+		session.RUnlock()
+		if isAuthenticated {
+			// Let authenticated ICMPv6 through (ping, etc.)
+			return
+		}
+	}
+}
+
+func (app *application) handleNeighborSolicitation(reqIPv6 *layers.IPv6, reqICMP *layers.ICMPv6) {
+	// Parse the target address from the ICMPv6 payload
+	if len(reqICMP.Payload) < 16 {
+		return // Invalid NS packet
+	}
+	targetIP := net.IP(reqICMP.Payload[4:20]) // Target address starts at byte 4
+
+	// Check if the target IP is one we manage
+	if !app.sessionManager.HasSessionByIP(targetIP) &&
+	   (app.cfg.DHCPListenV6 == nil || targetIP.String() != app.cfg.DHCPListenV6.String()) {
+		return
+	}
+
+	app.logger.Debug().
+		Str("targetIP", targetIP.String()).
+		Str("srcIP", reqIPv6.SrcIP.String()).
+		Msg("Neighbor Solicitation for managed IPv6, sending Neighbor Advertisement")
+
+	// Get interface MAC address
+	iface, err := net.InterfaceByName(app.tunDevice.Name())
+	if err != nil {
+		app.logger.Error().Err(err).Msg("Failed to get interface for NA reply")
+		return
+	}
+
+	// Build Neighbor Advertisement
+	ipLayer := &layers.IPv6{
+		Version:    6,
+		NextHeader: layers.IPProtocolICMPv6,
+		HopLimit:   255,
+		SrcIP:      targetIP,
+		DstIP:      reqIPv6.SrcIP,
+	}
+
+	icmpLayer := &layers.ICMPv6{
+		TypeCode: layers.CreateICMPv6TypeCode(layers.ICMPv6TypeNeighborAdvertisement, 0),
+	}
+
+	// Neighbor Advertisement payload: Flags (4 bytes) + Target Address (16 bytes) + Options
+	naPayload := make([]byte, 24)
+	naPayload[0] = 0x60 // Flags: Router=0, Solicited=1, Override=1
+	copy(naPayload[4:20], targetIP.To16())
+	// Option: Target Link-Layer Address (type=2, length=1)
+	naPayload[20] = 2  // Type
+	naPayload[21] = 1  // Length (in units of 8 bytes)
+	copy(naPayload[22:], iface.HardwareAddr)
+
+	icmpLayer.Payload = naPayload
+	if err := icmpLayer.SetNetworkLayerForChecksum(ipLayer); err != nil {
+		app.logger.Error().Err(err).Msg("Failed to set checksum for NA")
+		return
+	}
+
+	buffer := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	if err := gopacket.SerializeLayers(buffer, opts, ipLayer, icmpLayer); err != nil {
+		app.logger.Error().Err(err).Msg("Failed to serialize Neighbor Advertisement")
+		return
+	}
+
+	if _, err := app.tunDevice.Write(buffer.Bytes()); err != nil {
+		app.logger.Error().Err(err).Msg("Failed to write Neighbor Advertisement")
+	}
+}
+
+func (app *application) handleRouterSolicitation(reqIPv6 *layers.IPv6, reqICMP *layers.ICMPv6) {
+	// Only send RA if IPv6 is enabled
+	if !app.cfg.IPv6Enable || app.cfg.NetV6.IP == nil {
+		return
+	}
+
+	app.logger.Debug().Str("srcIP", reqIPv6.SrcIP.String()).Msg("Router Solicitation received, sending Router Advertisement")
+
+	// Use the existing RA builder from pkg/icmpv6
+	raBytes, err := app.buildRouterAdvertisement(reqIPv6.SrcIP)
+	if err != nil {
+		app.logger.Error().Err(err).Msg("Failed to build Router Advertisement")
+		return
+	}
+
+	if _, err := app.tunDevice.Write(raBytes); err != nil {
+		app.logger.Error().Err(err).Msg("Failed to write Router Advertisement")
+	}
+}
+
+func (app *application) buildRouterAdvertisement(soliciterIP net.IP) ([]byte, error) {
+	// Get interface MAC address
+	iface, err := net.InterfaceByName(app.tunDevice.Name())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get interface: %w", err)
+	}
+
+	// Generate link-local address from MAC
+	linkLocalIP := make(net.IP, 16)
+	linkLocalIP[0] = 0xfe
+	linkLocalIP[1] = 0x80
+	// EUI-64 from MAC
+	linkLocalIP[8] = iface.HardwareAddr[0] ^ 0x02
+	linkLocalIP[9] = iface.HardwareAddr[1]
+	linkLocalIP[10] = iface.HardwareAddr[2]
+	linkLocalIP[11] = 0xff
+	linkLocalIP[12] = 0xfe
+	linkLocalIP[13] = iface.HardwareAddr[3]
+	linkLocalIP[14] = iface.HardwareAddr[4]
+	linkLocalIP[15] = iface.HardwareAddr[5]
+
+	// Determine destination: soliciter or all-nodes multicast
+	dstIP := soliciterIP
+	if dstIP == nil || dstIP.IsUnspecified() {
+		dstIP = net.ParseIP("ff02::1") // All-nodes multicast
+	}
+
+	ipv6 := &layers.IPv6{
+		Version:    6,
+		SrcIP:      linkLocalIP,
+		DstIP:      dstIP,
+		NextHeader: layers.IPProtocolICMPv6,
+		HopLimit:   255,
+	}
+
+	icmpv6 := &layers.ICMPv6{
+		TypeCode: layers.CreateICMPv6TypeCode(layers.ICMPv6TypeRouterAdvertisement, 0),
+	}
+
+	// RA payload: Cur Hop Limit (1) + Flags (1) + Router Lifetime (2) + Reachable Time (4) + Retrans Timer (4)
+	raPayload := make([]byte, 12)
+	raPayload[0] = 64  // Hop limit
+	raPayload[1] = 0x00 // Flags: Managed=0, Other=0
+	raPayload[2] = 0x07 // Router lifetime (1800s = 0x0708)
+	raPayload[3] = 0x08
+
+	// Add Source Link-Layer Address option
+	sllaOpt := make([]byte, 8)
+	sllaOpt[0] = 1 // Type: Source Link-Layer Address
+	sllaOpt[1] = 1 // Length (in units of 8 bytes)
+	copy(sllaOpt[2:], iface.HardwareAddr)
+	raPayload = append(raPayload, sllaOpt...)
+
+	// Add Prefix Information option
+	prefixLen, _ := app.cfg.NetV6.Mask.Size()
+	prefixOpt := make([]byte, 32)
+	prefixOpt[0] = 3  // Type: Prefix Information
+	prefixOpt[1] = 4  // Length (in units of 8 bytes)
+	prefixOpt[2] = byte(prefixLen)
+	prefixOpt[3] = 0xc0 // Flags: On-link=1, Autonomous=1
+	// Valid lifetime: 2592000 seconds (30 days)
+	prefixOpt[4] = 0x00
+	prefixOpt[5] = 0x27
+	prefixOpt[6] = 0x8d
+	prefixOpt[7] = 0x00
+	// Preferred lifetime: 604800 seconds (7 days)
+	prefixOpt[8] = 0x00
+	prefixOpt[9] = 0x09
+	prefixOpt[10] = 0x3a
+	prefixOpt[11] = 0x80
+	// Reserved
+	prefixOpt[12] = 0x00
+	prefixOpt[13] = 0x00
+	prefixOpt[14] = 0x00
+	prefixOpt[15] = 0x00
+	// Prefix
+	copy(prefixOpt[16:], app.cfg.NetV6.IP.To16())
+	raPayload = append(raPayload, prefixOpt...)
+
+	icmpv6.Payload = raPayload
+	if err := icmpv6.SetNetworkLayerForChecksum(ipv6); err != nil {
+		return nil, fmt.Errorf("failed to set checksum: %w", err)
+	}
+
+	buffer := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{
+		ComputeChecksums: true,
+		FixLengths:       true,
+	}
+
+	if err := gopacket.SerializeLayers(buffer, opts, ipv6, icmpv6); err != nil {
+		return nil, fmt.Errorf("failed to serialize RA packet: %w", err)
+	}
+
+	return buffer.Bytes(), nil
+}
+
+func (app *application) sendDNSResponseV6(reqIPv6 *layers.IPv6, reqUDP *layers.UDP, respPayload []byte) error {
+	ipLayer := &layers.IPv6{
+		Version:    6,
+		NextHeader: layers.IPProtocolUDP,
+		HopLimit:   64,
+		SrcIP:      reqIPv6.DstIP,
+		DstIP:      reqIPv6.SrcIP,
+	}
+	udpLayer := &layers.UDP{SrcPort: reqUDP.DstPort, DstPort: reqUDP.SrcPort}
+
+	if err := udpLayer.SetNetworkLayerForChecksum(ipLayer); err != nil {
+		return fmt.Errorf("failed to set network layer for checksum: %w", err)
+	}
+
+	buffer := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true}
+
+	dnsLayer := &layers.DNS{}
+	if err := dnsLayer.DecodeFromBytes(respPayload, gopacket.NilDecodeFeedback); err != nil {
+		return fmt.Errorf("failed to decode dns response payload for serialization: %w", err)
+	}
+	dnsLayer.QR = true // Set the QR bit to indicate a response
+
+	if err := gopacket.SerializeLayers(buffer, opts, ipLayer, udpLayer, dnsLayer); err != nil {
+		return fmt.Errorf("failed to serialize IPv6 DNS response: %w", err)
+	}
+
+	if _, err := app.tunDevice.Write(buffer.Bytes()); err != nil {
+		return fmt.Errorf("failed to write IPv6 DNS response: %w", err)
+	}
+
+	return nil
 }
 
 func (app *application) sendDNSResponse(reqIPv4 *layers.IPv4, reqUDP *layers.UDP, respPayload []byte) error {
