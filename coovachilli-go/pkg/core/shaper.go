@@ -46,13 +46,13 @@ type ShaperStats struct {
 	LastUpdateTime  time.Time
 	AvgUploadRate   float64 // bytes per second
 	AvgDownloadRate float64 // bytes per second
-	mu              sync.RWMutex
+	mu              sync.RWMutex `json:"-"`
 }
 
 // InitializeShaper sets up the leaky bucket parameters for a session.
 func (s *Session) InitializeShaper(cfg *config.Config) {
-	s.Lock()
-	defer s.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// Initialize upload bucket size
 	if cfg.BwBucketUpSize > 0 {
@@ -90,8 +90,8 @@ func (s *Session) InitializeShaper(cfg *config.Config) {
 // ShouldDropPacket checks if a packet should be dropped based on the leaky bucket algorithm.
 // It returns true if the packet should be dropped. `isUpload` determines the direction.
 func (s *Session) ShouldDropPacket(packetSize uint64, isUpload bool) bool {
-	s.Lock()
-	defer s.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// If no bandwidth limits are set for this direction, don't drop the packet.
 	if (isUpload && s.SessionParams.BandwidthMaxUp == 0) || (!isUpload && s.SessionParams.BandwidthMaxDown == 0) {
@@ -212,8 +212,8 @@ func (s *Session) GetShaperStats() ShaperStats {
 
 // ApplyQoS applies QoS policies to a packet based on traffic class
 func (s *Session) ApplyQoS(packetSize uint64, qosClass QoSClass, isUpload bool) bool {
-	s.Lock()
-	defer s.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// Get traffic class configuration
 	tc := s.GetTrafficClass(qosClass)
@@ -354,8 +354,8 @@ func getDefaultTrafficClass(qosClass QoSClass) *TrafficClass {
 
 // SetTrafficClass sets a custom traffic class for a session
 func (s *Session) SetTrafficClass(qosClass QoSClass, tc TrafficClass) {
-	s.Lock()
-	defer s.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if s.TrafficClasses == nil {
 		s.TrafficClasses = make(map[QoSClass]TrafficClass)
@@ -366,8 +366,8 @@ func (s *Session) SetTrafficClass(qosClass QoSClass, tc TrafficClass) {
 
 // ResetBandwidthBuckets resets the bandwidth buckets to allow burst traffic
 func (s *Session) ResetBandwidthBuckets() {
-	s.Lock()
-	defer s.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	s.BucketUp = 0
 	s.BucketDown = 0
@@ -376,8 +376,8 @@ func (s *Session) ResetBandwidthBuckets() {
 
 // AdjustBandwidthLimits dynamically adjusts bandwidth limits for a session
 func (s *Session) AdjustBandwidthLimits(uploadBps, downloadBps uint64) {
-	s.Lock()
-	defer s.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// Update session parameters
 	s.SessionParams.BandwidthMaxUp = uploadBps

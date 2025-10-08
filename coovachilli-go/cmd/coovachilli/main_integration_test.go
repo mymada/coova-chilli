@@ -67,7 +67,7 @@ func TestFullSessionFlow(t *testing.T) {
 	}
 	fw := newMockFirewallManager()
 	gardenService := garden.NewGarden(&cfg.WalledGarden, fw, logger)
-	sessionManager := core.NewSessionManager(cfg, nil)
+	sessionManager := core.NewSessionManager(cfg, nil, logger)
 
 	// --- 1. Simulate a new unauthenticated user ---
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:01")
@@ -109,7 +109,7 @@ func TestARPHandling(t *testing.T) {
 	cfg := &config.Config{
 		DHCPListen: net.ParseIP("10.1.0.1"),
 	}
-	sessionManager := core.NewSessionManager(cfg, nil)
+	sessionManager := core.NewSessionManager(cfg, nil, logger)
 	app := &application{
 		cfg:            cfg,
 		logger:         logger,

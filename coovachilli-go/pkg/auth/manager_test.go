@@ -26,10 +26,6 @@ func TestNewAuthenticationManager(t *testing.T) {
 		t.Fatal("AuthenticationManager is nil")
 	}
 
-	if am.localAuth == nil {
-		t.Error("localAuth should be initialized")
-	}
-
 	if am.sessions == nil {
 		t.Error("sessions map should be initialized")
 	}

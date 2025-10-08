@@ -407,7 +407,7 @@ func TestRadiusProxy(t *testing.T) {
 		RadiusAuthPort: upstreamPort,
 		RadiusSecret:   securestore.NewSecret(upstreamSecret),
 	}
-	sm := core.NewSessionManager(cfg, nil)
+	sm := core.NewSessionManager(cfg, nil, logger)
 	mac, _ := net.ParseMAC("00:11:22:33:44:55")
 	_ = sm.CreateSession(net.ParseIP("10.2.0.1"), mac, 0)
 

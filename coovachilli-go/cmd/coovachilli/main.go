@@ -309,7 +309,7 @@ func buildApplication(cfg *config.Config, reloader *config.Reloader) (*applicati
 
 	// Initialize other components
 	app.scriptRunner = script.NewRunner(app.logger, cfg)
-	app.sessionManager = core.NewSessionManager(cfg, app.metricsRecorder)
+	app.sessionManager = core.NewSessionManager(cfg, app.metricsRecorder, app.logger)
 	app.gardenService = garden.NewGarden(&cfg.WalledGarden, app.firewall, app.logger)
 	app.dnsProxy = dns.NewProxy(cfg, app.logger, app.gardenService)
 	app.radiusClient = radius.NewClient(cfg, app.logger, app.metricsRecorder)
@@ -545,8 +545,8 @@ func (app *application) shutdown() {
 	}
 
 	// Save sessions before shutdown
-	if err := app.sessionManager.SaveSessions(app.cfg.StateFile); err != nil {
-		app.logger.Error().Err(err).Msg("Failed to save sessions to state file")
+	if err := app.sessionManager.SaveSessions(); err != nil {
+		app.logger.Error().Err(err).Msg("Failed to save sessions")
 	}
 
 	// Disconnect all authenticated sessions
@@ -558,12 +558,13 @@ func (app *application) shutdown() {
 }
 
 func (app *application) loadSessions() {
-	if err := app.sessionManager.LoadSessions(app.cfg.StateFile); err != nil {
-		app.logger.Error().Err(err).Msg("Failed to load sessions from state file")
+	if err := app.sessionManager.LoadSessions(); err != nil {
+		app.logger.Error().Err(err).Msg("Failed to load sessions")
 		return
 	}
+	// After loading sessions, we need to re-apply any necessary state, like firewall rules.
 	if len(app.sessionManager.GetAllSessions()) > 0 {
-		app.logger.Info().Int("count", len(app.sessionManager.GetAllSessions())).Msg("Reloaded sessions from state file")
+		app.logger.Info().Int("count", len(app.sessionManager.GetAllSessions())).Msg("Re-applying firewall rules for loaded sessions")
 		for _, s := range app.sessionManager.GetAllSessions() {
 			if s.Authenticated {
 				if err := app.firewall.AddAuthenticatedUser(s.HisIP); err != nil {
