@@ -5,6 +5,12 @@
 foreground: true
 pidfile: /var/run/coovachilli.pid
 statefile: /var/lib/coovachilli/sessions.json
+
+# Enable session persistence to save active sessions on shutdown and restore on startup.
+sessionpersistence: false
+
+# File to store session data if persistence is enabled.
+sessionfile: /var/run/chilli.sessions.json
 user: chilli
 group: chilli
 

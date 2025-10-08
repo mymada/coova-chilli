@@ -5,12 +5,14 @@ import (
 	"testing"
 
 	"coovachilli-go/pkg/config"
+	"github.com/rs/zerolog"
 )
 
 // Benchmark session creation
 func BenchmarkCreateSession(b *testing.B) {
 	cfg := &config.Config{}
-	sm := NewSessionManager(cfg, nil)
+	logger := zerolog.Nop()
+	sm := NewSessionManager(cfg, nil, logger)
 	mac, _ := net.ParseMAC("00:11:22:33:44:55")
 	ip := net.ParseIP("10.0.0.1")
 
@@ -23,7 +25,8 @@ func BenchmarkCreateSession(b *testing.B) {
 // Benchmark session lookup by IP
 func BenchmarkGetSessionByIP(b *testing.B) {
 	cfg := &config.Config{}
-	sm := NewSessionManager(cfg, nil)
+	logger := zerolog.Nop()
+	sm := NewSessionManager(cfg, nil, logger)
 	mac, _ := net.ParseMAC("00:11:22:33:44:55")
 	ip := net.ParseIP("10.0.0.1")
 	sm.CreateSession(ip, mac, 0)
@@ -37,7 +40,8 @@ func BenchmarkGetSessionByIP(b *testing.B) {
 // Benchmark session lookup by MAC
 func BenchmarkGetSessionByMAC(b *testing.B) {
 	cfg := &config.Config{}
-	sm := NewSessionManager(cfg, nil)
+	logger := zerolog.Nop()
+	sm := NewSessionManager(cfg, nil, logger)
 	mac, _ := net.ParseMAC("00:11:22:33:44:55")
 	ip := net.ParseIP("10.0.0.1")
 	sm.CreateSession(ip, mac, 0)
@@ -51,7 +55,8 @@ func BenchmarkGetSessionByMAC(b *testing.B) {
 // Benchmark concurrent session access
 func BenchmarkConcurrentSessionAccess(b *testing.B) {
 	cfg := &config.Config{}
-	sm := NewSessionManager(cfg, nil)
+	logger := zerolog.Nop()
+	sm := NewSessionManager(cfg, nil, logger)
 
 	// Create multiple sessions
 	for i := 0; i < 100; i++ {
@@ -74,7 +79,8 @@ func BenchmarkConcurrentSessionAccess(b *testing.B) {
 // Benchmark session with token lookup
 func BenchmarkGetSessionByToken(b *testing.B) {
 	cfg := &config.Config{}
-	sm := NewSessionManager(cfg, nil)
+	logger := zerolog.Nop()
+	sm := NewSessionManager(cfg, nil, logger)
 	mac, _ := net.ParseMAC("00:11:22:33:44:55")
 	ip := net.ParseIP("10.0.0.1")
 	session := sm.CreateSession(ip, mac, 0)
@@ -90,7 +96,8 @@ func BenchmarkGetSessionByToken(b *testing.B) {
 // Benchmark session removal
 func BenchmarkRemoveSession(b *testing.B) {
 	cfg := &config.Config{}
-	sm := NewSessionManager(cfg, nil)
+	logger := zerolog.Nop()
+	sm := NewSessionManager(cfg, nil, logger)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -109,7 +116,8 @@ func BenchmarkRemoveSession(b *testing.B) {
 // Benchmark GetAllSessions with many sessions
 func BenchmarkGetAllSessions(b *testing.B) {
 	cfg := &config.Config{}
-	sm := NewSessionManager(cfg, nil)
+	logger := zerolog.Nop()
+	sm := NewSessionManager(cfg, nil, logger)
 
 	// Create 1000 sessions
 	for i := 0; i < 1000; i++ {
@@ -131,7 +139,8 @@ func BenchmarkGetAllSessions(b *testing.B) {
 // Benchmark memory allocation for session creation
 func BenchmarkSessionMemoryAllocation(b *testing.B) {
 	cfg := &config.Config{}
-	sm := NewSessionManager(cfg, nil)
+	logger := zerolog.Nop()
+	sm := NewSessionManager(cfg, nil, logger)
 
 	b.ReportAllocs()
 	b.ResetTimer()

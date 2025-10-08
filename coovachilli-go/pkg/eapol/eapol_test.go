@@ -61,10 +61,10 @@ func (m *mockRadiusClient) SendEAPAccessRequest(session *core.Session, eapPayloa
 
 func setupTestHandler(t *testing.T) (*Handler, *core.SessionManager, *mockRadiusClient, *mockEAPOLSender) {
 	cfg := &config.Config{RadiusSecret: securestore.NewSecret("testing123")}
-	sm := core.NewSessionManager(cfg, nil)
+	logger := zerolog.Nop()
+	sm := core.NewSessionManager(cfg, nil, logger)
 	rc := &mockRadiusClient{}
 	sender := &mockEAPOLSender{}
-	logger := zerolog.Nop()
 	iface := net.Interface{HardwareAddr: testAPMAC}
 
 	handler := NewHandler(cfg, sm, rc, nil, iface, logger)

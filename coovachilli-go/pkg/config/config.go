@@ -151,8 +151,10 @@ type Config struct {
 	IPDown  string `yaml:"ipdown" envconfig:"IPDOWN"`
 
 	// Management
-	StateFile string `yaml:"statefile" envconfig:"STATEFILE"`
-	CmdSocket string `yaml:"cmdsocket" envconfig:"CMDSOCKET"`
+	StateFile          string `yaml:"statefile" envconfig:"STATEFILE"`
+	CmdSocket          string `yaml:"cmdsocket" envconfig:"CMDSOCKET"`
+	SessionPersistence bool   `yaml:"sessionpersistence" envconfig:"SESSIONPERSISTENCE"`
+	SessionFile        string `yaml:"sessionfile" envconfig:"SESSIONFILE"`
 
 	// Cluster settings
 	Cluster ClusterConfig `yaml:"cluster"`

@@ -47,7 +47,7 @@ func TestHandleQuery_InvalidDNSPacket(t *testing.T) {
 
 	assert.Error(t, err)
 	assert.Nil(t, resp)
-	assert.Contains(t, err.Error(), "failed to unpack dns query")
+	assert.ErrorContains(t, err, "failed to unpack DNS query")
 }
 
 func TestHandleQuery_NoQuestions(t *testing.T) {
@@ -127,7 +127,7 @@ func TestHandleQuery_Cache(t *testing.T) {
 	assert.Len(t, resp.Answer, 1)
 	assert.Equal(t, domain+".", resp.Answer[0].Header().Name)
 	assert.Equal(t, dns.TypeA, resp.Answer[0].Header().Rrtype)
-	assert.Equal(t, ips[0], resp.Answer[0].(*dns.A).A)
+	assert.True(t, ips[0].Equal(resp.Answer[0].(*dns.A).A), "IP address mismatch")
 }
 
 func TestProxy_SecurityConsiderations(t *testing.T) {

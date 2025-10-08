@@ -13,6 +13,7 @@ import (
 
 	"coovachilli-go/pkg/config"
 	"coovachilli-go/pkg/metrics"
+	"github.com/rs/zerolog"
 )
 
 var StartTime = time.Now()
@@ -35,7 +36,7 @@ type EAPOLState struct {
 
 // Session holds the state for a single client session.
 type Session struct {
-	sync.RWMutex
+	mu sync.RWMutex `json:"-"`
 
 	// Client identifiers
 	HisIP  net.IP
@@ -78,7 +79,7 @@ type Session struct {
 	Redir RedirState
 
 	// AuthResult is used to signal the result of an authentication attempt.
-	AuthResult chan bool
+	AuthResult chan bool `json:"-"`
 
 	// Token is a secure token for cookie-based auto-login.
 	Token string
@@ -114,6 +115,22 @@ func (s *Session) SetUsername(username string) {
 }
 
 // SetSessionParams sets the session parameters (for role application)
+func (s *Session) Lock() {
+	s.mu.Lock()
+}
+
+func (s *Session) Unlock() {
+	s.mu.Unlock()
+}
+
+func (s *Session) RLock() {
+	s.mu.RLock()
+}
+
+func (s *Session) RUnlock() {
+	s.mu.RUnlock()
+}
+
 func (s *Session) SetSessionParams(params interface{}) {
 	// Type assertion to handle auth.SessionParams
 	if authParams, ok := params.(struct {
@@ -137,6 +154,71 @@ func (s *Session) SetSessionParams(params interface{}) {
 		s.SessionParams.InterimInterval = authParams.InterimInterval
 		s.SessionParams.FilterID = authParams.FilterID
 	}
+}
+
+// sessionJSON is a helper struct for marshalling a Session to JSON.
+// It includes only the fields that should be persisted.
+type sessionJSON struct {
+	HisIP                net.IP                    `json:"HisIP"`
+	HisMAC               net.HardwareAddr          `json:"HisMAC"`
+	VLANID               uint16                    `json:"VLANID"`
+	Authenticated        bool                      `json:"Authenticated"`
+	StartTime            time.Time                 `json:"StartTime"`
+	LastSeen             time.Time                 `json:"LastSeen"`
+	LastUpTime           time.Time                 `json:"LastUpTime"`
+	SessionID            string                    `json:"SessionID"`
+	ChilliSessionID      string                    `json:"ChilliSessionID"`
+	SessionParams        SessionParams             `json:"SessionParams"`
+	InputOctets          uint64                    `json:"InputOctets"`
+	OutputOctets         uint64                    `json:"OutputOctets"`
+	InputPackets         uint64                    `json:"InputPackets"`
+	OutputPackets        uint64                    `json:"OutputPackets"`
+	BucketUp             uint64                    `json:"BucketUp"`
+	BucketDown           uint64                    `json:"BucketDown"`
+	BucketUpSize         uint64                    `json:"BucketUpSize"`
+	BucketDownSize       uint64                    `json:"BucketDownSize"`
+	LastBWTime           time.Time                 `json:"LastBWTime"`
+	ShaperStats          *ShaperStats              `json:"ShaperStats,omitempty"`
+	TrafficClasses       map[QoSClass]TrafficClass `json:"TrafficClasses,omitempty"`
+	Redir                RedirState                `json:"Redir"`
+	Token                string                    `json:"Token"`
+	FASNonce             string                    `json:"FASNonce"`
+	EAPOL                EAPOLState                `json:"EAPOL"`
+}
+
+// MarshalJSON implements the json.Marshaler interface for the Session struct.
+func (s *Session) MarshalJSON() ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Map the Session to the helper struct for serialization.
+	return json.Marshal(&sessionJSON{
+		HisIP:           s.HisIP,
+		HisMAC:          s.HisMAC,
+		VLANID:          s.VLANID,
+		Authenticated:   s.Authenticated,
+		StartTime:       s.StartTime,
+		LastSeen:        s.LastSeen,
+		LastUpTime:      s.LastUpTime,
+		SessionID:       s.SessionID,
+		ChilliSessionID: s.ChilliSessionID,
+		SessionParams:   s.SessionParams,
+		InputOctets:     s.InputOctets,
+		OutputOctets:    s.OutputOctets,
+		InputPackets:    s.InputPackets,
+		OutputPackets:   s.OutputPackets,
+		BucketUp:        s.BucketUp,
+		BucketDown:      s.BucketDown,
+		BucketUpSize:    s.BucketUpSize,
+		BucketDownSize:  s.BucketDownSize,
+		LastBWTime:      s.LastBWTime,
+		ShaperStats:     s.ShaperStats,
+		TrafficClasses:  s.TrafficClasses,
+		Redir:           s.Redir,
+		Token:           s.Token,
+		FASNonce:        s.FASNonce,
+		EAPOL:           s.EAPOL,
+	})
 }
 
 // GetSessionParams returns current session parameters
@@ -211,6 +293,7 @@ type SessionManager struct {
 	sessionsByMAC   sync.Map // map[string]*Session
 	recorder        metrics.Recorder
 	cfg             *config.Config
+	logger          zerolog.Logger
 	sessionCountMu  sync.Mutex
 	sessionCount    int // Track total sessions
 	hooks           SessionHooks
@@ -219,7 +302,7 @@ type SessionManager struct {
 }
 
 // NewSessionManager creates a new SessionManager.
-func NewSessionManager(cfg *config.Config, recorder metrics.Recorder) *SessionManager {
+func NewSessionManager(cfg *config.Config, recorder metrics.Recorder, logger zerolog.Logger) *SessionManager {
 	if recorder == nil {
 		recorder = metrics.NewNoopRecorder()
 	}
@@ -227,6 +310,7 @@ func NewSessionManager(cfg *config.Config, recorder metrics.Recorder) *SessionMa
 	return &SessionManager{
 		recorder:        recorder,
 		cfg:             cfg,
+		logger:          logger.With().Str("component", "session_manager").Logger(),
 	}
 }
 
@@ -441,11 +525,18 @@ func (sm *SessionManager) GetAllSessions() []*Session {
 	return sessions
 }
 
-// SaveSessions serializes all active, authenticated sessions to a file.
-func (sm *SessionManager) SaveSessions(path string) error {
-	if path == "" {
-		return nil // Nothing to do if no path is configured
+// SaveSessions marshals the session map to JSON and writes it to the specified file.
+// It performs an atomic write to prevent data corruption.
+func (sm *SessionManager) SaveSessions() error {
+	if !sm.cfg.SessionPersistence {
+		return nil
 	}
+	if sm.cfg.SessionFile == "" {
+		sm.logger.Warn().Msg("SessionPersistence is enabled, but no sessionfile is configured.")
+		return nil
+	}
+
+	path := sm.cfg.SessionFile
 
 	var sessionsToSave []*Session
 	sm.sessionsByMAC.Range(func(key, value interface{}) bool {
@@ -456,8 +547,12 @@ func (sm *SessionManager) SaveSessions(path string) error {
 		return true
 	})
 
+	sm.logger.Info().Str("path", path).Int("count", len(sessionsToSave)).Msg("Saving active sessions to disk")
+
 	if len(sessionsToSave) == 0 {
-		return nil // Nothing to save
+		sm.logger.Info().Msg("No active sessions to save.")
+		// Ensure an empty file is written to signify no sessions, rather than leaving a stale file.
+		return os.WriteFile(path, []byte("[]"), 0640)
 	}
 
 	state := StateData{
@@ -467,49 +562,82 @@ func (sm *SessionManager) SaveSessions(path string) error {
 
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to marshal sessions: %w", err)
+		return fmt.Errorf("failed to marshal sessions to JSON: %w", err)
 	}
 
-	return os.WriteFile(path, data, 0644)
+	// Write to a temporary file first to ensure atomicity
+	tempPath := path + ".tmp"
+	if err := os.WriteFile(tempPath, data, 0640); err != nil {
+		return fmt.Errorf("failed to write to temporary session file: %w", err)
+	}
+
+	// Rename the temporary file to the final destination
+	if err := os.Rename(tempPath, path); err != nil {
+		return fmt.Errorf("failed to rename temporary session file: %w", err)
+	}
+
+	sm.logger.Info().Str("path", path).Msg("Successfully saved sessions.")
+	return nil
 }
 
-// LoadSessions loads sessions from a file, adjusting for downtime.
-func (sm *SessionManager) LoadSessions(path string) error {
-	if path == "" {
+// LoadSessions reads the session file from disk and unmarshals it into the session manager.
+func (sm *SessionManager) LoadSessions() error {
+	if !sm.cfg.SessionPersistence {
 		return nil
 	}
+	if sm.cfg.SessionFile == "" {
+		sm.logger.Warn().Msg("SessionPersistence is enabled, but no sessionfile is configured.")
+		return nil
+	}
+
+	path := sm.cfg.SessionFile
+	sm.logger.Info().Str("path", path).Msg("Attempting to load sessions from disk")
 
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil // State file doesn't exist, which is fine on first start
+			sm.logger.Info().Str("path", path).Msg("Session file does not exist, starting with no sessions.")
+			return nil
 		}
-		return fmt.Errorf("failed to read state file: %w", err)
+		return fmt.Errorf("failed to read session file: %w", err)
+	}
+
+	if len(data) == 0 || string(data) == "[]" {
+		sm.logger.Info().Msg("Session file is empty, starting with no sessions.")
+		return nil
 	}
 
 	var state StateData
 	if err := json.Unmarshal(data, &state); err != nil {
-		return fmt.Errorf("failed to unmarshal state file: %w", err)
+		sm.logger.Error().Err(err).Str("path", path).Msg("Failed to unmarshal session data. Starting with empty session list.")
+		// Return nil to allow the application to start fresh even if the session file is corrupted.
+		return nil
 	}
 
 	downtime := MonotonicTime() - state.SaveTime
+	loadedCount := 0
 
 	for _, s := range state.Sessions {
 		// Adjust timeouts
 		if s.SessionParams.SessionTimeout > 0 {
-			if s.SessionParams.SessionTimeout > downtime {
-				s.SessionParams.SessionTimeout -= downtime
-			} else {
+			if s.SessionParams.SessionTimeout <= downtime {
+				sm.logger.Debug().Str("user", s.Redir.Username).Msg("Session expired due to SessionTimeout during downtime.")
 				continue // Session expired while daemon was down
 			}
+			s.SessionParams.SessionTimeout -= downtime
 		}
 		if s.SessionParams.IdleTimeout > 0 {
-			if s.SessionParams.IdleTimeout > downtime {
-				s.SessionParams.IdleTimeout -= downtime
-			} else {
+			if s.SessionParams.IdleTimeout <= downtime {
+				sm.logger.Debug().Str("user", s.Redir.Username).Msg("Session expired due to IdleTimeout during downtime.")
 				continue // Session expired while daemon was down
 			}
+			s.SessionParams.IdleTimeout -= downtime
 		}
+
+		// Restore non-persistent fields
+		s.AuthResult = make(chan bool, 1)
+		s.StateMachine = NewSessionStateMachine()
+		// s.StateMachine.SetState(StateAuthenticated) // TODO: Need to import state machine states
 
 		// Restore monotonic timestamps relative to the new process start
 		s.StartTimeSec = MonotonicTime() - uint32(time.Since(s.StartTime).Seconds())
@@ -530,8 +658,10 @@ func (sm *SessionManager) LoadSessions(path string) error {
 		sm.sessionCountMu.Lock()
 		sm.sessionCount++
 		sm.sessionCountMu.Unlock()
+		loadedCount++
 	}
 
+	sm.logger.Info().Int("count", loadedCount).Msg("Successfully loaded and restored sessions from disk.")
 	return nil
 }
 

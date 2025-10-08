@@ -9,6 +9,7 @@ import (
 	"coovachilli-go/pkg/core"
 	"coovachilli-go/pkg/dhcp"
 	"coovachilli-go/pkg/security"
+	"github.com/rs/zerolog"
 )
 
 // TestDualStackSessionManagement tests that sessions can be created and managed
@@ -28,7 +29,8 @@ func TestDualStackSessionManagement(t *testing.T) {
 		Lease:       3600 * time.Second,
 	}
 
-	sm := core.NewSessionManager(cfg, nil)
+	logger := zerolog.Nop()
+	sm := core.NewSessionManager(cfg, nil, logger)
 
 	// Test IPv4 session
 	ipv4 := net.ParseIP("10.1.0.50")
@@ -248,7 +250,8 @@ func TestDualStackSessionAccounting(t *testing.T) {
 		IPv6Enable: true,
 	}
 
-	sm := core.NewSessionManager(cfg, nil)
+	logger := zerolog.Nop()
+	sm := core.NewSessionManager(cfg, nil, logger)
 
 	ipv4 := net.ParseIP("10.1.0.50")
 	ipv6 := net.ParseIP("2001:db8::50")
@@ -302,7 +305,8 @@ func BenchmarkDualStackSessionLookup(b *testing.B) {
 		IPv6Enable: true,
 	}
 
-	sm := core.NewSessionManager(cfg, nil)
+	logger := zerolog.Nop()
+	sm := core.NewSessionManager(cfg, nil, logger)
 
 	// Create 1000 IPv4 and 1000 IPv6 sessions
 	for i := 0; i < 1000; i++ {

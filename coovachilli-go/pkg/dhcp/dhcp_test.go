@@ -55,9 +55,9 @@ func TestHandleRequest_Renewal_AuthFailure(t *testing.T) {
 	cfg := &config.Config{
 		Lease: 1 * time.Hour,
 	}
-	sm := core.NewSessionManager(cfg, nil)
-	radiusReqChan := make(chan *core.Session, 1)
 	logger := zerolog.Nop() // Disable logging for the test
+	sm := core.NewSessionManager(cfg, nil, logger)
+	radiusReqChan := make(chan *core.Session, 1)
 
 	pool, err := NewPool(net.ParseIP("10.0.0.10"), net.ParseIP("10.0.0.20"))
 	require.NoError(t, err)
@@ -70,6 +70,7 @@ func TestHandleRequest_Renewal_AuthFailure(t *testing.T) {
 		poolV4:         pool,
 		logger:         logger,
 		recorder:       metrics.NewNoopRecorder(),
+		rateLimiter:    NewDHCPRateLimiter(logger),
 	}
 
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:01")
@@ -130,10 +131,11 @@ func TestHandleSolicit(t *testing.T) {
 
 	serverMAC, _ := net.ParseMAC("00:00:5e:00:53:ff")
 	server := &Server{
-		cfg:      cfg,
-		poolV6:   pool,
-		ifaceMAC: serverMAC,
-		logger:   logger,
+		cfg:         cfg,
+		poolV6:      pool,
+		ifaceMAC:    serverMAC,
+		logger:      logger,
+		rateLimiter: NewDHCPRateLimiter(logger),
 	}
 
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:01")
@@ -141,19 +143,18 @@ func TestHandleSolicit(t *testing.T) {
 	// Create a SOLICIT packet
 	req, err := dhcpv6.NewSolicit(clientMAC)
 	require.NoError(t, err)
-	req.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionRapidCommit})
+	// req.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionRapidCommit}) // Test standard 4-way exchange
 	reqBytes := req.ToBytes()
 
 	// Call the handler
-	respBytes, _, err := server.HandleDHCPv6(reqBytes)
+	respBytes, resp, err := server.HandleDHCPv6(reqBytes)
 	require.NoError(t, err)
+	require.NotNil(t, respBytes)
 
 	// Assert the response is an ADVERTISE
-	resp, err := dhcpv6.FromBytes(respBytes)
-	require.NoError(t, err)
-	msg, ok := resp.(*dhcpv6.Message)
+	advMsg, ok := resp.(*dhcpv6.Message)
 	require.True(t, ok)
-	require.Equal(t, dhcpv6.MessageTypeAdvertise, msg.MessageType)
+	require.Equal(t, dhcpv6.MessageTypeAdvertise, advMsg.MessageType)
 
 	// Assert the advertised IP is from the pool
 	respIana := msg.GetOneOption(dhcpv6.OptionIANA).(*dhcpv6.OptIANA)
@@ -259,11 +260,12 @@ func TestHandleRequestV6(t *testing.T) {
 	}
 
 	server := &Server{
-		cfg:      cfg,
-		poolV6:   pool,
-		leasesV6: make(map[string]*Lease),
-		ifaceMAC: serverMAC,
-		logger:   logger,
+		cfg:         cfg,
+		poolV6:      pool,
+		leasesV6:    make(map[string]*Lease),
+		ifaceMAC:    serverMAC,
+		logger:      logger,
+		rateLimiter: NewDHCPRateLimiter(logger),
 	}
 
 	clientMAC, _ := net.ParseMAC("00:00:5e:00:53:01")

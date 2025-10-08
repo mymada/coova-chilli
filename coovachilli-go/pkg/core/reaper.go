@@ -70,12 +70,12 @@ func (r *SessionReaper) reapSessions() {
 			continue
 		}
 
-		session.RLock()
+		session.mu.RLock()
 		sessionTimeout := session.SessionParams.SessionTimeout
 		idleTimeout := session.SessionParams.IdleTimeout
 		startTime := session.StartTimeSec
 		lastActivityTime := session.LastActivityTimeSec
-		session.RUnlock()
+		session.mu.RUnlock()
 
 		// Check session timeout
 		if sessionTimeout > 0 {

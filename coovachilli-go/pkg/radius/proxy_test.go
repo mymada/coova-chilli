@@ -19,7 +19,7 @@ func TestProxyServerCreation(t *testing.T) {
 		RadiusTimeout: 5 * time.Second,
 	}
 
-	sm := core.NewSessionManager(cfg, nil)
+	sm := core.NewSessionManager(cfg, nil, zerolog.Nop())
 	rc := NewClient(cfg, zerolog.Nop(), nil)
 
 	proxy := NewProxyServer(cfg, sm, rc, zerolog.Nop())
@@ -36,7 +36,7 @@ func TestProxyAddRealm(t *testing.T) {
 		ProxyPort:   1645,
 	}
 
-	sm := core.NewSessionManager(cfg, nil)
+	sm := core.NewSessionManager(cfg, nil, zerolog.Nop())
 	rc := NewClient(cfg, zerolog.Nop(), nil)
 	proxy := NewProxyServer(cfg, sm, rc, zerolog.Nop())
 
@@ -67,7 +67,7 @@ func TestProxyAddRealm(t *testing.T) {
 
 func TestExtractRealm(t *testing.T) {
 	cfg := &config.Config{}
-	sm := core.NewSessionManager(cfg, nil)
+	sm := core.NewSessionManager(cfg, nil, zerolog.Nop())
 	rc := NewClient(cfg, zerolog.Nop(), nil)
 	proxy := NewProxyServer(cfg, sm, rc, zerolog.Nop())
 
@@ -119,7 +119,7 @@ func TestSelectRoundRobin(t *testing.T) {
 	}
 
 	cfg := &config.Config{}
-	sm := core.NewSessionManager(cfg, nil)
+	sm := core.NewSessionManager(cfg, nil, zerolog.Nop())
 	rc := NewClient(cfg, zerolog.Nop(), nil)
 	proxy := NewProxyServer(cfg, sm, rc, zerolog.Nop())
 
@@ -152,7 +152,7 @@ func TestSelectFailover(t *testing.T) {
 	}
 
 	cfg := &config.Config{}
-	sm := core.NewSessionManager(cfg, nil)
+	sm := core.NewSessionManager(cfg, nil, zerolog.Nop())
 	rc := NewClient(cfg, zerolog.Nop(), nil)
 	proxy := NewProxyServer(cfg, sm, rc, zerolog.Nop())
 
@@ -176,7 +176,7 @@ func TestSelectFailoverWithInactiveServers(t *testing.T) {
 	}
 
 	cfg := &config.Config{}
-	sm := core.NewSessionManager(cfg, nil)
+	sm := core.NewSessionManager(cfg, nil, zerolog.Nop())
 	rc := NewClient(cfg, zerolog.Nop(), nil)
 	proxy := NewProxyServer(cfg, sm, rc, zerolog.Nop())
 
@@ -197,7 +197,7 @@ func TestSelectLeastLoad(t *testing.T) {
 	}
 
 	cfg := &config.Config{}
-	sm := core.NewSessionManager(cfg, nil)
+	sm := core.NewSessionManager(cfg, nil, zerolog.Nop())
 	rc := NewClient(cfg, zerolog.Nop(), nil)
 	proxy := NewProxyServer(cfg, sm, rc, zerolog.Nop())
 
@@ -212,7 +212,7 @@ func TestProxyServerStop(t *testing.T) {
 		ProxyPort:   1645,
 	}
 
-	sm := core.NewSessionManager(cfg, nil)
+	sm := core.NewSessionManager(cfg, nil, zerolog.Nop())
 	rc := NewClient(cfg, zerolog.Nop(), nil)
 	proxy := NewProxyServer(cfg, sm, rc, zerolog.Nop())
 
@@ -272,7 +272,7 @@ func TestProxyRealmNoServers(t *testing.T) {
 	}
 
 	cfg := &config.Config{}
-	sm := core.NewSessionManager(cfg, nil)
+	sm := core.NewSessionManager(cfg, nil, zerolog.Nop())
 	rc := NewClient(cfg, zerolog.Nop(), nil)
 	proxy := NewProxyServer(cfg, sm, rc, zerolog.Nop())
 
@@ -292,7 +292,7 @@ func TestProxyRealmAllInactive(t *testing.T) {
 	}
 
 	cfg := &config.Config{}
-	sm := core.NewSessionManager(cfg, nil)
+	sm := core.NewSessionManager(cfg, nil, zerolog.Nop())
 	rc := NewClient(cfg, zerolog.Nop(), nil)
 	proxy := NewProxyServer(cfg, sm, rc, zerolog.Nop())
 
@@ -303,7 +303,7 @@ func TestProxyRealmAllInactive(t *testing.T) {
 
 func BenchmarkExtractRealm(b *testing.B) {
 	cfg := &config.Config{}
-	sm := core.NewSessionManager(cfg, nil)
+	sm := core.NewSessionManager(cfg, nil, zerolog.Nop())
 	rc := NewClient(cfg, zerolog.Nop(), nil)
 	proxy := NewProxyServer(cfg, sm, rc, zerolog.Nop())
 
@@ -327,7 +327,7 @@ func BenchmarkSelectRoundRobin(b *testing.B) {
 	}
 
 	cfg := &config.Config{}
-	sm := core.NewSessionManager(cfg, nil)
+	sm := core.NewSessionManager(cfg, nil, zerolog.Nop())
 	rc := NewClient(cfg, zerolog.Nop(), nil)
 	proxy := NewProxyServer(cfg, sm, rc, zerolog.Nop())
 

@@ -95,7 +95,7 @@ func NewServer(cfg *config.Config, sm *core.SessionManager, radiusReqChan chan<-
 
 	// ✅ SECURITY FIX CVE-004: Create rate limiter
 	rl := NewDHCPRateLimiter(logger)
-	go rl.Cleanup()
+	rl.Start() // Start the cleanup goroutine
 
 	server := &Server{
 		cfg:            cfg,
@@ -387,6 +387,7 @@ func (s *Server) sendDHCPResponse(respBytes []byte, req *dhcpv4.DHCPv4) error {
 }
 
 func (s *Server) HandleDHCPv6(packet []byte) ([]byte, dhcpv6.DHCPv6, error) {
+	s.logger.Debug().Msg("--- ENTERING HandleDHCPv6 ---")
 	req, err := dhcpv6.FromBytes(packet)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse DHCPv6 request: %w", err)
@@ -429,7 +430,7 @@ func (s *Server) HandleDHCPv6(packet []byte) ([]byte, dhcpv6.DHCPv6, error) {
 		return nil, nil, nil
 	}
 
-	return resp.ToBytes(), req, nil
+	return resp.ToBytes(), resp, nil
 }
 
 func (s *Server) handleSolicit(req *dhcpv6.Message) (dhcpv6.DHCPv6, error) {
@@ -447,11 +448,24 @@ func (s *Server) handleSolicit(req *dhcpv6.Message) (dhcpv6.DHCPv6, error) {
 		return nil, fmt.Errorf("no client DUID in SOLICIT")
 	}
 
-	resp, err := dhcpv6.NewReplyFromMessage(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create DHCPv6 reply: %w", err)
+	var resp dhcpv6.DHCPv6
+
+	// RFC 8415, Section 18.2.1: A client that is ready to perform the SOLICIT-REPLY message
+	// exchange includes a Rapid Commit option in its SOLICIT message.
+	if req.GetOneOption(dhcpv6.OptionRapidCommit) != nil {
+		resp, err = dhcpv6.NewReplyFromMessage(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create DHCPv6 reply for rapid commit: %w", err)
+		}
+		// The message type is already Reply, which is correct.
+		resp.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionRapidCommit})
+	} else {
+		// Normal four-way exchange, respond with ADVERTISE
+		resp, err = dhcpv6.NewAdvertiseFromSolicit(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create DHCPv6 advertise: %w", err)
+		}
 	}
-	resp.MessageType = dhcpv6.MessageTypeAdvertise
 
 	serverDUID := &dhcpv6.DUIDLLT{
 		HWType:        iana.HWTypeEthernet,
@@ -768,10 +782,13 @@ func NewPool(start, end net.IP) (*Pool, error) {
 }
 
 func (p *Pool) getFreeIP() (net.IP, error) {
-	for ip := p.start; !ip.Equal(p.end); ip = nextIP(ip) {
+	for ip := p.start; ; ip = nextIP(ip) {
 		if !p.used[ip.String()] {
 			p.used[ip.String()] = true
 			return ip, nil
+		}
+		if ip.Equal(p.end) {
+			break
 		}
 	}
 	return nil, fmt.Errorf("no free IP addresses in the pool")

@@ -53,15 +53,16 @@ func setupTestServer(t *testing.T) (*Server, *config.Config, *core.SessionManage
 			Secret: securestore.NewSecret("test-secret-for-fas"),
 		},
 	}
-	sm := core.NewSessionManager(cfg, nil)
+	logger := zerolog.Nop()
+	sm := core.NewSessionManager(cfg, nil, logger)
 	mockDc := &mockDisconnector{}
 	mockFw := &mockFirewallManager{}
-	mockSr := script.NewRunner(zerolog.Nop(), cfg)
-	mockRc := radius.NewClient(cfg, zerolog.Nop(), nil)
+	mockSr := script.NewRunner(logger, cfg)
+	mockRc := radius.NewClient(cfg, logger, nil)
 
 	radiusReqChan := make(chan *core.Session, 1)
 
-	server, err := NewServer(cfg, sm, radiusReqChan, mockDc, zerolog.Nop(), metrics.NewNoopRecorder(), mockFw, mockSr, mockRc, nil)
+	server, err := NewServer(cfg, sm, radiusReqChan, mockDc, logger, metrics.NewNoopRecorder(), mockFw, mockSr, mockRc, nil)
 	require.NoError(t, err, "NewServer should not return an error during test setup")
 
 	return server, cfg, sm, mockDc
