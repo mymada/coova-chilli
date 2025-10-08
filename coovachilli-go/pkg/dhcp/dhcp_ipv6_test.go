@@ -199,6 +199,8 @@ func TestDHCPv6RateLimiting(t *testing.T) {
 	}
 
 	rateLimiter := NewDHCPRateLimiter(logger)
+	rateLimiter.maxPerMinute = 5 // Lower limit for testing
+	rateLimiter.Start()
 	defer rateLimiter.Stop()
 
 	server := &Server{
@@ -227,18 +229,18 @@ func TestDHCPv6RateLimiting(t *testing.T) {
 			IaId: [4]byte{0x00, 0x00, 0x00, byte(i)},
 		})
 
-		_, _, err := server.HandleDHCPv6(msg.ToBytes())
-		if err == nil {
+		respBytes, _, err := server.HandleDHCPv6(msg.ToBytes())
+		if err == nil && respBytes != nil {
 			successCount++
 		}
 	}
 
 	// Rate limiter should have blocked some requests
-	if successCount >= 15 {
-		t.Errorf("Rate limiter did not block any requests: %d/15 succeeded", successCount)
+	if successCount > rateLimiter.maxPerMinute {
+		t.Errorf("Rate limiter did not block requests: %d/%d succeeded (limit: %d)", successCount, 15, rateLimiter.maxPerMinute)
 	}
 
-	t.Logf("Rate limiter allowed %d/15 requests", successCount)
+	t.Logf("Rate limiter allowed %d/15 requests (limit: %d)", successCount, rateLimiter.maxPerMinute)
 }
 
 func BenchmarkDHCPv6Solicit(b *testing.B) {

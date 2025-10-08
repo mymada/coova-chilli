@@ -782,7 +782,7 @@ func NewPool(start, end net.IP) (*Pool, error) {
 }
 
 func (p *Pool) getFreeIP() (net.IP, error) {
-	for ip := p.start; ; ip = nextIP(ip) {
+	for ip := p.start; ; {
 		if !p.used[ip.String()] {
 			p.used[ip.String()] = true
 			return ip, nil
@@ -790,6 +790,7 @@ func (p *Pool) getFreeIP() (net.IP, error) {
 		if ip.Equal(p.end) {
 			break
 		}
+		ip = nextIP(ip)
 	}
 	return nil, fmt.Errorf("no free IP addresses in the pool")
 }

@@ -19,7 +19,14 @@
       "Bash(if [ -f coovachilli_optimized ])",
       "Bash(then ls -lh coovachilli_optimized coovachilli)",
       "Bash(fi)",
-      "Bash(test:*)"
+      "Bash(test:*)",
+      "Bash(while read f)",
+      "Bash(do echo \"=== $f ===\")",
+      "Bash(done)",
+      "Bash(for pkg in guest performance persistence roles token wispr)",
+      "Bash(do echo \"=== $pkg ===\")",
+      "Bash(for pkg in admin config disconnect gdpr guest metrics performance persistence roles script sso token vlan wispr)",
+      "Bash(do echo \"=== Checking pkg/$pkg ===\")"
     ],
     "deny": [],
     "ask": []

@@ -99,14 +99,40 @@ func (s *Session) GetIP() net.IP {
 	return s.HisIP
 }
 
+// IsAuthenticated safely checks if session is authenticated
+func (s *Session) IsAuthenticated() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Authenticated
+}
+
+// SetAuthenticated safely sets authentication status
+func (s *Session) SetAuthenticated(auth bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Authenticated = auth
+}
+
+// AddTraffic safely adds traffic statistics
+func (s *Session) AddTraffic(inputOctets, outputOctets, inputPackets, outputPackets uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.InputOctets += inputOctets
+	s.OutputOctets += outputOctets
+	s.InputPackets += inputPackets
+	s.OutputPackets += outputPackets
+}
+
+// GetTrafficStats safely retrieves traffic statistics
+func (s *Session) GetTrafficStats() (inputOctets, outputOctets, inputPackets, outputPackets uint64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.InputOctets, s.OutputOctets, s.InputPackets, s.OutputPackets
+}
+
 // GetMAC returns the client MAC address
 func (s *Session) GetMAC() net.HardwareAddr {
 	return s.HisMAC
-}
-
-// SetAuthenticated sets the authentication status
-func (s *Session) SetAuthenticated(authenticated bool) {
-	s.Authenticated = authenticated
 }
 
 // SetUsername sets the username in redir state

@@ -43,6 +43,14 @@ func TestPool(t *testing.T) {
 		t.Fatalf("getFreeIP returned wrong IP: got %s, want %s", ip2, "10.1.0.101")
 	}
 
+	ip3, err := pool.getFreeIP()
+	if err != nil {
+		t.Fatalf("getFreeIP failed: %v", err)
+	}
+	if !ip3.Equal(net.ParseIP("10.1.0.102")) {
+		t.Fatalf("getFreeIP returned wrong IP: got %s, want %s", ip3, "10.1.0.102")
+	}
+
 	// Test pool exhaustion
 	_, err = pool.getFreeIP()
 	if err == nil {
@@ -157,12 +165,12 @@ func TestHandleSolicit(t *testing.T) {
 	require.Equal(t, dhcpv6.MessageTypeAdvertise, advMsg.MessageType)
 
 	// Assert the advertised IP is from the pool
-	respIana := msg.GetOneOption(dhcpv6.OptionIANA).(*dhcpv6.OptIANA)
+	respIana := advMsg.GetOneOption(dhcpv6.OptionIANA).(*dhcpv6.OptIANA)
 	respAddr := respIana.Options.GetOne(dhcpv6.OptionIAAddr).(*dhcpv6.OptIAAddress)
 	require.True(t, respAddr.IPv6Addr.Equal(net.ParseIP("2001:db8::100")))
 
 	// Assert DNS server is set
-	dnsServers := msg.Options.DNS()
+	dnsServers := advMsg.Options.DNS()
 	require.NotNil(t, dnsServers)
 	require.Len(t, dnsServers, 1)
 	require.True(t, dnsServers[0].Equal(cfg.DNS1V6))

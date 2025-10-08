@@ -551,7 +551,7 @@ func (app *application) shutdown() {
 
 	// Disconnect all authenticated sessions
 	for _, session := range app.sessionManager.GetAllSessions() {
-		if session != nil && session.Authenticated {
+		if session != nil && session.IsAuthenticated() {
 			app.disconnectManager.Disconnect(session, "NAS-Reboot")
 		}
 	}
@@ -839,24 +839,16 @@ func (app *application) handleIPv4Packet(ipv4 *layers.IPv4, decodedLayers []gopa
 		return // No session found for this packet, drop it
 	}
 
-	session.RLock()
-	isAuthenticated := session.Authenticated
-	session.RUnlock()
-
-	if isAuthenticated {
+	if session.IsAuthenticated() {
 		if session.ShouldDropPacket(packetSize, isUplink) {
 			app.logger.Debug().Str("user", session.Redir.Username).Bool("isUplink", isUplink).Msg("Dropping packet due to bandwidth limit")
 			return
 		}
-		session.Lock()
 		if isUplink {
-			session.OutputOctets += packetSize
-			session.OutputPackets++
+			session.AddTraffic(0, packetSize, 0, 1)
 		} else {
-			session.InputOctets += packetSize
-			session.InputPackets++
+			session.AddTraffic(packetSize, 0, 1, 0)
 		}
-		session.Unlock()
 		// Authenticated traffic is forwarded by the firewall
 	} else {
 		// Handle unauthenticated traffic.
@@ -917,24 +909,16 @@ func (app *application) handleIPv6Packet(ipv6 *layers.IPv6, decodedLayers []gopa
 		return // No session found for this packet, drop it
 	}
 
-	session.RLock()
-	isAuthenticated := session.Authenticated
-	session.RUnlock()
-
-	if isAuthenticated {
+	if session.IsAuthenticated() {
 		if session.ShouldDropPacket(packetSize, isUplink) {
 			app.logger.Debug().Str("user", session.Redir.Username).Bool("isUplink", isUplink).Msg("Dropping IPv6 packet due to bandwidth limit")
 			return
 		}
-		session.Lock()
 		if isUplink {
-			session.OutputOctets += packetSize
-			session.OutputPackets++
+			session.AddTraffic(0, packetSize, 0, 1)
 		} else {
-			session.InputOctets += packetSize
-			session.InputPackets++
+			session.AddTraffic(packetSize, 0, 1, 0)
 		}
-		session.Unlock()
 		// Authenticated traffic is forwarded by the firewall
 	} else {
 		// Handle unauthenticated IPv6 traffic

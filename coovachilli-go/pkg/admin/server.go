@@ -156,7 +156,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 func (s *Server) countActiveSessions() int {
 	count := 0
 	for _, session := range s.sessionMgr.GetAllSessions() {
-		if session != nil && session.Authenticated {
+		if session != nil && session.IsAuthenticated() {
 			count++
 		}
 	}

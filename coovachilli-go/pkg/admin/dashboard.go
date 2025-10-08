@@ -135,7 +135,7 @@ func (d *Dashboard) collectStats() {
 	for _, session := range sessions {
 		session.RLock()
 
-		if session.Authenticated {
+		if session.IsAuthenticated() {
 			d.stats.AuthenticatedSessions++
 		}
 

@@ -39,7 +39,7 @@ func (a *CoreSessionAdapter) GetMAC() net.HardwareAddr {
 
 // SetAuthenticated sets authentication status
 func (a *CoreSessionAdapter) SetAuthenticated(authenticated bool) {
-	a.session.Authenticated = authenticated
+	a.session.SetAuthenticated(authenticated)
 }
 
 // SetUsername sets the username

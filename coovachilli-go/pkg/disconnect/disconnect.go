@@ -35,17 +35,14 @@ func NewManager(cfg *config.Config, sm *core.SessionManager, fw firewall.Firewal
 // Disconnect performs all the necessary steps to terminate a user's session.
 // ✅ CORRECTION: Rendu atomique avec rollback en cas d'échec
 func (m *Manager) Disconnect(session *core.Session, reason string) {
-	session.Lock()
-	if !session.Authenticated {
-		session.Unlock()
+	if !session.IsAuthenticated() {
 		m.logger.Debug().Str("mac", session.HisMAC.String()).Msg("Session already unauthenticated, skipping disconnect")
 		return
 	}
 
 	// Sauvegarder l'état pour rollback potentiel
-	wasAuthenticated := session.Authenticated
-	session.Authenticated = false
-	session.Unlock()
+	wasAuthenticated := true
+	session.SetAuthenticated(false)
 
 	m.logger.Info().
 		Str("mac", session.HisMAC.String()).
@@ -67,9 +64,7 @@ func (m *Manager) Disconnect(session *core.Session, reason string) {
 		if err != nil {
 			m.logger.Error().Err(err).Msg("Failed to send RADIUS accounting stop packet")
 			// Rollback: restaurer état authentifié
-			session.Lock()
-			session.Authenticated = wasAuthenticated
-			session.Unlock()
+			session.SetAuthenticated(wasAuthenticated)
 			m.logger.Warn().Msg("Disconnect aborted: RADIUS accounting failed, session state restored")
 			return
 		}
@@ -92,9 +87,7 @@ func (m *Manager) Disconnect(session *core.Session, reason string) {
 			// On envoie un RADIUS Interim Update pour corriger les stats
 			if radiusSent && m.radiusClient != nil {
 				m.logger.Warn().Msg("Attempting to send RADIUS Interim-Update to correct accounting")
-				session.Lock()
-				session.Authenticated = true // Temporairement pour stats correctes
-				session.Unlock()
+				session.SetAuthenticated(true) // Temporairement pour stats correctes
 				m.radiusClient.SendAccountingRequest(session, rfc2866.AcctStatusType(3)) // 3 = Interim
 			}
 

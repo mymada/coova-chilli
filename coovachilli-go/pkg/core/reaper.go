@@ -66,7 +66,7 @@ func (r *SessionReaper) reapSessions() {
 	r.logger.Debug().Int("count", len(sessions)).Msg("Reaping sessions")
 
 	for _, session := range sessions {
-		if !session.Authenticated {
+		if !session.IsAuthenticated() {
 			continue
 		}
 

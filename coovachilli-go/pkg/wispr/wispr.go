@@ -47,7 +47,7 @@ func GenerateWISPrXML(cfg *config.Config, session *core.Session, includeSessionP
 	}
 
 	// Add session-specific parameters if requested and session is authenticated
-	if includeSessionParams && session != nil && session.Authenticated {
+	if includeSessionParams && session != nil && session.IsAuthenticated() {
 		session.RLock()
 		wispr.MaxBandwidthUp = session.SessionParams.BandwidthMaxUp
 		wispr.MaxBandwidthDown = session.SessionParams.BandwidthMaxDown

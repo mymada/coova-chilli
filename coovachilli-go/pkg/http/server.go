@@ -158,7 +158,7 @@ func (s *Server) handlePortal(w http.ResponseWriter, r *http.Request) {
 	cookie, err := r.Cookie(sessionCookieName)
 	if err == nil {
 		session, ok := s.sessionManager.GetSessionByToken(cookie.Value)
-		if ok && session.Authenticated {
+		if ok && session.IsAuthenticated() {
 			s.logger.Info().Str("user", session.Redir.Username).Msg("Automatic login via cookie successful")
 			http.Redirect(w, r, "/status", http.StatusFound)
 			return
@@ -637,7 +637,7 @@ func (s *Server) handleJsonpStatus(w http.ResponseWriter, r *http.Request) {
 	session, ok := s.sessionManager.GetSessionByIP(ip)
 
 	var resp jsonpStatusResponse
-	if !ok || !session.Authenticated {
+	if !ok || !session.IsAuthenticated() {
 		resp = jsonpStatusResponse{
 			ClientState: 0, // Not authenticated
 		}
@@ -883,7 +883,7 @@ func (s *Server) handleFASAuth(w http.ResponseWriter, r *http.Request) {
 
 	// 4. Update session with parameters from FAS
 	session.Lock()
-	session.Authenticated = true
+	session.SetAuthenticated(true)
 	session.FASNonce = "" // ✅ SECURITY: Consume nonce to prevent replay
 	// The username is not provided by FAS, but we can set it to the MAC address for accounting purposes
 	if session.Redir.Username == "" {

@@ -172,7 +172,7 @@ func (h *Handler) handleRadiusChallenge(session *core.Session, radiusResp *layeh
 
 func (h *Handler) handleRadiusAccept(session *core.Session, radiusResp *layehradius.Packet, requestAuthenticator []byte) {
 	session.Lock()
-	session.Authenticated = true
+	session.SetAuthenticated(true)
 
 	var pmk []byte
 	if encryptedKey := radius.GetMSMPPERecvKey(radiusResp); encryptedKey != nil {
